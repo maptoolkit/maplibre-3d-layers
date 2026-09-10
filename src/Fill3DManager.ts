@@ -5,6 +5,9 @@ import type { ElevationCache } from './ElevationCache';
 import type { TileRequest, TileResult, FeatureSpan } from './mvt3dGeometry';
 import type { ColorEval, OpacityEval } from './paint';
 import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
+// Inlined as a base64 blob so the built bundle stays single-file — no separate
+// worker asset to host. Works for both the ESM package and the <script> build.
+import Mvt3dWorker from './mvt3dWorker.ts?worker&inline';
 
 /** Re-anchor the scene origin once the map centre drifts this far from it (metres). */
 const REBASE_DISTANCE_M = 3000;
@@ -158,9 +161,7 @@ export class Fill3DManager {
     // sRGB colour (fill-3d-color) + alpha (fill-3d-opacity) via the `color` attr.
     this.material = createFill3DMaterial(config.transparent);
 
-    this.worker = new Worker(new URL('./mvt3dWorker.ts', import.meta.url), {
-      type: 'module',
-    });
+    this.worker = new Mvt3dWorker();
     this.worker.onmessage = (e: MessageEvent<TileResult>) => this.onTileParsed(e.data);
 
     // DEM tiles stream in → re-bake feature heights against the new terrain.
@@ -235,6 +236,10 @@ export class Fill3DManager {
       tileSize: 512,
       minzoom: this.minzoom,
       maxzoom: this.maxzoom,
+      // Vector sources round the zoom (round(14.59) = 15); without this we'd floor
+      // to 14 and request tiles that don't carry the maxzoom-only buildings3d
+      // layer → empty geometry. Matches the tiles MapLibre actually shows.
+      roundZoom: true,
     })) {
       const { x, y, z } = id.canonical;
       const key = `${z}/${x}/${y}`;
