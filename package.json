@@ -1,23 +1,55 @@
 {
-  "name": "fill3d-three",
+  "name": "@maptoolkit/maplibre-3d-layers",
   "version": "0.1.0",
   "description": "Render a z-encoded MVT (maptoolkit buildings3d) as real 3D meshes via three.js, as a MapLibre GL JS custom layer.",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maptoolkit/maplibre-3d-layers.git"
+  },
+  "main": "./dist/maplibre-3d-layers.js",
+  "module": "./dist/maplibre-3d-layers.js",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/maplibre-3d-layers.js"
+    },
+    "./standalone": "./dist/maplibre-3d-layers.standalone.mjs"
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "typecheck": "tsc --noEmit"
+    "clean": "rm -rf dist",
+    "build": "npm run clean && npm run build:npm && npm run build:standalone && npm run build:types",
+    "build:npm": "BUILD_TARGET=npm vite build",
+    "build:standalone": "BUILD_TARGET=standalone vite build",
+    "build:types": "tsc -p tsconfig.build.json",
+    "build:demo": "vite build",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "maplibre-gl": ">=6.0.0",
+    "three": ">=0.160.0"
   },
   "dependencies": {
     "@maplibre/maplibre-gl-style-spec": "^26.4.1",
     "earcut": "^3.2.3",
-    "maplibre-gl": "^6.8.0",
-    "pbf": "^5.1.2",
-    "three": "^0.185.1"
+    "pbf": "^5.1.2"
   },
   "devDependencies": {
     "@types/three": "^0.185.4",
+    "maplibre-gl": "^6.8.0",
+    "three": "^0.185.1",
     "typescript": "^7.0.2",
     "vite": "^8.2.2"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

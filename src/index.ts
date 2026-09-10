@@ -4,7 +4,7 @@
 // source and fetches the ORIGINAL tiles itself (same URLs as MapLibre → deduped
 // by the browser cache) to decode the type-0 3D geometry.
 //
-//   import { Fill3DLayer } from 'fill3d-three';
+//   import { Fill3DLayer } from '@maptoolkit/maplibre-3d-layers';
 //   map.addSource('src', { type: 'vector', url: 'https://…/tiles.json?…' });
 //   // LOD1 (2D footprints) — a layer must consume the source so MapLibre fetches its tiles:
 //   map.addLayer({ id: 'lod1', type: 'fill-extrusion', source: 'src', 'source-layer': 'buildings2d', ... });

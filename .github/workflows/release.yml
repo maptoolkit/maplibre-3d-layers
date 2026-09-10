@@ -1,0 +1,33 @@
+name: Release
+
+# Triggered by pushing a version tag, e.g.:
+#   npm version patch && git push --follow-tags
+# Builds the ESM package + standalone bundle, publishes to npm (public),
+# and attaches the standalone .js to the GitHub release.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create/attach the GitHub release asset
+      id-token: write # reserved for future npm provenance (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      # publishConfig.access=public in package.json makes the scoped package public.
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Attach standalone bundle to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/maplibre-3d-layers.standalone.mjs

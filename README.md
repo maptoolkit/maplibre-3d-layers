@@ -1,4 +1,4 @@
-# fill3d-three
+# @maptoolkit/maplibre-3d-layers
 
 A [MapLibre GL JS](https://maplibre.org/) **custom layer** that renders a z-encoded
 vector tile source (maptoolkit's `buildings3d`) as **real 3D meshes** via
@@ -21,12 +21,55 @@ The `buildings3d` source is a **non-standard MVT**:
 So the tiles are decoded and triangulated in a Web Worker (`src/vectorTile3d.ts`
 + `src/mvt3dGeometry.ts`) and rendered with three.js instead of by MapLibre.
 
-## Install & run the demo
+## Install
+
+As a dependency in a bundler project (`three` + `maplibre-gl` are **peer
+dependencies** — install them alongside):
+
+```bash
+npm install @maptoolkit/maplibre-3d-layers three maplibre-gl
+```
+
+```js
+import { Fill3DLayer } from '@maptoolkit/maplibre-3d-layers';
+```
+
+The package ships a pre-built ESM bundle with the decode worker **inlined** (no
+separate worker asset to host or configure).
+
+### Use without a bundler (`<script type="module">` + import map)
+
+MapLibre GL JS 6 is **ESM-only** (there is no global `<script>` build), so the
+no-bundler path is an ES-module import map. A **self-contained** standalone build
+(`three`, `earcut`, `pbf` and the style-spec bundled in, worker inlined) is
+published inside the package, so the import map needs a **single** entry for
+`maplibre-gl`:
+
+```html
+<link href="https://cdn.jsdelivr.net/npm/maplibre-gl@6/dist/maplibre-gl.css" rel="stylesheet" />
+<script type="importmap">
+{ "imports": { "maplibre-gl": "https://cdn.jsdelivr.net/npm/maplibre-gl@6/+esm" } }
+</script>
+<script type="module">
+  import * as maplibregl from 'maplibre-gl';
+  import { Fill3DLayer } from 'https://unpkg.com/@maptoolkit/maplibre-3d-layers/dist/maplibre-3d-layers.standalone.mjs';
+
+  const map = new maplibregl.Map({ /* … */ });
+  map.on('load', () => map.addLayer(new Fill3DLayer({ /* …options… */ })));
+</script>
+```
+
+Pin exact versions in production (`maplibre-gl@6.8.0`, and the package version in
+the URL). The `standalone.mjs` bundles its own copy of three — don't also import
+three separately on the same page.
+
+### Develop / run the demo
 
 ```bash
 npm install
 npm run dev        # vite dev server → http://localhost:5173
 npm run typecheck  # tsc --noEmit
+npm run build      # dist/ : ESM + self-contained standalone.mjs + .d.ts
 ```
 
 The demo (`index.html`) loads terrain + the `buildings3d` source over Vienna. It
@@ -45,7 +88,7 @@ vector source** and fetches the original tiles itself. So:
 
 ```js
 import { Map } from 'maplibre-gl';
-import { Fill3DLayer } from 'fill3d-three';
+import { Fill3DLayer } from '@maptoolkit/maplibre-3d-layers';
 
 const TILEJSON = 'https://vtc.maptoolkit.net/buildings3d.json?api_key=iib';
 
@@ -154,5 +197,16 @@ engine. Note: `paint` and `visibility` are read **once** when the layer is added
 
 ## Requirements
 
-MapLibre GL JS **6.x**, three.js **0.185**, a bundler that handles ES-module Web
-Workers (Vite config included; `optimizeDeps.exclude: ['maplibre-gl']` is needed).
+MapLibre GL JS **≥6**, three.js **≥0.160** (both peer dependencies). The published
+package inlines the decode worker, so consumers need no special worker/bundler
+config. (Developing the demo in this repo uses Vite with
+`optimizeDeps.exclude: ['maplibre-gl']`.)
+
+## Publishing
+
+- `npm version <patch|minor|major> && git push --follow-tags` — the tag triggers
+  `.github/workflows/release.yml`, which builds and runs `npm publish` (public),
+  and attaches the standalone bundle to the GitHub release.
+- Requires an `NPM_TOKEN` repo secret (npm automation/granular-access token with
+  publish rights to the `@maptoolkit` scope). The repo can stay **private** — npm
+  publishes the built `dist/` tarball, not the source.
