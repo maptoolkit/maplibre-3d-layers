@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>fill-3d · three.js custom layer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body, #map { margin: 0; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <!--
+    Demo host page: creates the map + terrain, adds the buildings tiles as ONE
+    normal MapLibre vector source, renders LOD1 with fill-extrusion (source-layer
+    `buildings2d`), then renders the full 3D (source-layer `buildings3d`, geometry
+    type 0) with the Fill3DLayer — which self-fetches the original tiles (same URLs
+    as MapLibre → deduped by the browser cache) and decodes the type-0 geometry.
+  -->
+  <script type="module">
+    import { Map } from 'maplibre-gl';
+    import 'maplibre-gl/dist/maplibre-gl.css';
+    import { Fill3DLayer } from '/src/index.ts';
+
+    const map = new Map({
+      container: 'map',
+      center: [16.3738, 48.2082], // Vienna
+      zoom: 16.27,
+      pitch: 80,
+      maxPitch: 85,
+      bearing: -28.5,
+      canvasContextAttributes: { antialias: true },
+      style: 'https://styles.maptoolkit.org/summer.json',
+      hash: true,
+    });
+
+    map.on('load', () => {
+      // Replace the style's own OSM 3D buildings — else they z-fight our meshes.
+      for (const id of ['building_3D', 'building_3D_public']) {
+        if (map.getLayer(id)) map.removeLayer(id);
+      }
+
+      // 3D terrain (stock 'terrarium' encoding — mapterhorn tiles via maptoolkit).
+      map.addSource('mtk-terrain', {
+        type: 'raster-dem',
+        url: 'https://tiles.maptoolkit.org/terrainrgb.json',
+        encoding: 'terrarium',
+        tileSize: 512,
+      });
+      map.setTerrain({ source: 'mtk-terrain', exaggeration: 1 });
+
+      // The buildings tiles as a first-class vector source.
+      map.addSource('buildings3d', {
+        type: 'vector',
+        url: 'https://vtc.maptoolkit.net/buildings3d.json?api_key=iib',
+      });
+
+      // LOD1: native fill-extrusion on the 2D footprints — also makes MapLibre
+      // fetch the source's tiles (Fill3DLayer reuses the same URLs).
+      map.addLayer({
+        id: 'buildings-lod1',
+        type: 'fill-extrusion',
+        source: 'buildings3d',
+        'source-layer': 'buildings2d',
+        paint: {
+          'fill-extrusion-height': ['get', 'height'],
+          'fill-extrusion-color': '#fafafa',
+          'fill-extrusion-opacity': 0.9,
+        },
+      });
+
+      // Full 3D on the type-0 geometry.
+      map.addLayer(
+        new Fill3DLayer({
+          id: 'fill-3d',
+          source: 'buildings3d',
+          'source-layer': 'buildings3d',
+          paint: {
+            'fill-3d-color': ['match', ['get', 'type'], 'roof', '#b0483c', '#d9d4cc'],
+            'fill-3d-opacity': 0.9,
+          },
+        }),
+      );
+    });
+  </script>
+</body>
+</html>

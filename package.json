@@ -1,0 +1,23 @@
+{
+  "name": "fill3d-three",
+  "version": "0.1.0",
+  "description": "Render a z-encoded MVT (maptoolkit buildings3d) as real 3D meshes via three.js, as a MapLibre GL JS custom layer.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@maplibre/maplibre-gl-style-spec": "^26.4.1",
+    "earcut": "^3.2.3",
+    "maplibre-gl": "^6.8.0",
+    "pbf": "^5.1.2",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@types/three": "^0.185.4",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2"
+  }
+}

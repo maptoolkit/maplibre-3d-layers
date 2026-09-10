@@ -1,0 +1,178 @@
+import { LngLat } from 'maplibre-gl';
+import type { Map, CustomLayerInterface, CustomRenderMethodInput } from 'maplibre-gl';
+import * as THREE from 'three';
+import { ElevationCache } from './ElevationCache';
+import { Fill3DManager } from './Fill3DManager';
+import { compileColor, compileOpacity } from './paint';
+import type { PaintValue } from './paint';
+import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
+
+/** Neutral colour used when no `fill-3d-color` is given (white → material shows). */
+const NEUTRAL_COLOR: [number, number, number, number] = [1, 1, 1, 1];
+
+export interface Fill3DLayerOptions {
+  /** Layer id (required). */
+  id: string;
+  /** Id of a vector source already added to the map (required) — the tile
+   *  template + zoom range are read from it. */
+  source: string;
+  /** Vector-tile layer to read within the source (required, e.g. `buildings3d`). */
+  'source-layer': string;
+  /** MapLibre filter expression; features that fail are not rendered. */
+  filter?: FilterSpecification;
+  /** raster-dem source id for elevation; defaults to the map's active terrain. */
+  terrainSourceId?: string;
+  layout?: {
+    /** `'none'` hides the layer (and skips loading its tiles). */
+    visibility?: 'visible' | 'none';
+  };
+  paint?: {
+    /** Constant colour (`'#rgb'`, `'rgba(...)'`) or a MapLibre color expression. */
+    'fill-3d-color'?: PaintValue<string>;
+    /** Constant 0..1 or a MapLibre number expression. */
+    'fill-3d-opacity'?: PaintValue<number>;
+  };
+}
+
+/**
+ * `fill-3d`: a MapLibre custom layer that renders a z-encoded MVT source's type-0
+ * 3D features as real meshes via three.js, draped onto the map's terrain.
+ *
+ * `id`, `source` (a vector source id) and `source-layer` are required — missing
+ * ones throw. Add the vector source first, then this layer:
+ *
+ * ```js
+ * map.setTerrain({ source: 'terrain' });
+ * map.addSource('my-src', { type: 'vector', url: 'https://…/tiles.json?…' });
+ * // a layer must consume the source so MapLibre fetches its tiles, e.g. a
+ * // fill-extrusion on 'buildings2d'; Fill3DLayer reads the tiles it loads.
+ * map.addLayer(new Fill3DLayer({
+ *   id: 'fill-3d',
+ *   source: 'my-src',
+ *   'source-layer': 'buildings3d',
+ *   paint: {
+ *     'fill-3d-color': ['match', ['get', 'type'], 'roof', '#c33', '#d9d4cc'],
+ *     'fill-3d-opacity': ['interpolate', ['linear'], ['zoom'], 14, 0.4, 17, 1],
+ *   },
+ * }));
+ * ```
+ *
+ * `fill-3d-color` / `fill-3d-opacity` are evaluated per feature (against its
+ * feature properties + zoom) into per-vertex colours. Note: `visibility` and the
+ * paint values are read once when the layer is added (no live `setPaintProperty`).
+ */
+export class Fill3DLayer implements CustomLayerInterface {
+  readonly id: string;
+  readonly type = 'custom' as const;
+  readonly renderingMode = '3d' as const;
+
+  private readonly terrainSourceIdOption?: string;
+  private readonly sourceId: string;
+  private readonly sourceLayer: string;
+  private readonly filter?: FilterSpecification;
+  private readonly visible: boolean;
+  private readonly colorEval: ReturnType<typeof compileColor>;
+  private readonly opacityEval: ReturnType<typeof compileOpacity>;
+  private readonly transparent: boolean;
+
+  private map!: Map;
+  private camera!: THREE.Camera;
+  private scene!: THREE.Scene;
+  private renderer!: THREE.WebGLRenderer;
+  private elevation?: ElevationCache;
+  private manager?: Fill3DManager;
+
+  // Reused every frame to avoid per-frame allocations.
+  private readonly mainMat = new THREE.Matrix4();
+  private readonly originMat = new THREE.Matrix4();
+  private readonly originScale = new THREE.Vector3();
+
+  constructor(options: Fill3DLayerOptions) {
+    if (!options?.id) throw new Error('Fill3DLayer: `id` is required');
+    if (!options.source) throw new Error('Fill3DLayer: `source` (a vector source id) is required');
+    if (!options['source-layer']) throw new Error('Fill3DLayer: `source-layer` is required');
+
+    this.id = options.id;
+    this.terrainSourceIdOption = options.terrainSourceId;
+    this.sourceId = options.source;
+    this.sourceLayer = options['source-layer'];
+    this.filter = options.filter;
+    this.visible = options.layout?.visibility !== 'none';
+
+    const paint = options.paint ?? {};
+    this.colorEval = compileColor(paint['fill-3d-color'], NEUTRAL_COLOR);
+    this.opacityEval = compileOpacity(paint['fill-3d-opacity'], 1);
+    // A transparent material is only needed if opacity may drop below 1.
+    this.transparent = 'fill-3d-opacity' in paint;
+  }
+
+  onAdd(map: Map, gl: WebGL2RenderingContext) {
+    this.map = map;
+    // Use the explicit terrain source, else the map's active terrain, else none.
+    const terrainSourceId = this.terrainSourceIdOption ?? map.getTerrain()?.source ?? '';
+
+    this.camera = new THREE.Camera();
+    this.scene = new THREE.Scene();
+    // three.js is y-up / z-toward-viewer; rotate + mirror so the scene frame is
+    // (x=east, y=up, z=north) to match maplibre. The two flips preserve winding.
+    this.scene.rotateX(Math.PI / 2);
+    this.scene.scale.multiply(new THREE.Vector3(1, 1, -1));
+    // No scene lights: the meshes use a custom shader that replicates MapLibre's
+    // fill-extrusion directional lighting (see Fill3DManager).
+
+    this.renderer = new THREE.WebGLRenderer({
+      canvas: map.getCanvas(),
+      context: gl,
+      antialias: true,
+    });
+    this.renderer.autoClear = false;
+
+    this.elevation = new ElevationCache(map, terrainSourceId);
+    this.manager = new Fill3DManager(
+      map,
+      this.scene,
+      LngLat.convert(map.getCenter()), // initial anchor; re-anchors itself on pan
+      this.elevation,
+      terrainSourceId,
+      {
+        color: this.colorEval,
+        opacity: this.opacityEval,
+        transparent: this.transparent,
+        sourceId: this.sourceId,
+        sourceLayer: this.sourceLayer,
+        filter: this.filter,
+      },
+    );
+    if (this.visible) this.manager.update();
+  }
+
+  render(_gl: WebGL2RenderingContext, args: CustomRenderMethodInput) {
+    if (!this.visible) return; // hidden → don't draw, don't keep repainting
+
+    // Fold the (possibly re-anchored) scene origin into the camera projection so
+    // mesh vertices stay in small local metres. Origin is at sea level; meshes
+    // carry their absolute elevation in Y.
+    const o = this.manager!.origin;
+    this.mainMat.fromArray(args.defaultProjectionData.mainMatrix as unknown as number[]);
+    this.originMat
+      .makeTranslation(o.x, o.y, o.z)
+      .scale(this.originScale.set(o.s, -o.s, o.s));
+
+    this.manager!.syncLight(); // match fill-extrusion shading (light follows bearing)
+    this.camera.projectionMatrix.multiplyMatrices(this.mainMat, this.originMat);
+    this.renderer.resetState();
+    // Depth pre-pass then colour pass: only the frontmost surface blends, so
+    // semi-transparent buildings don't show their interior/back walls.
+    this.manager!.setPass('depth');
+    this.renderer.render(this.scene, this.camera);
+    this.manager!.setPass('color');
+    this.renderer.render(this.scene, this.camera);
+    this.map.triggerRepaint();
+  }
+
+  onRemove() {
+    this.manager?.dispose();
+    this.elevation?.dispose();
+    this.renderer?.dispose();
+  }
+}
