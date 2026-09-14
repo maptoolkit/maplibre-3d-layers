@@ -13,10 +13,6 @@ MapLibre fork required, just a custom layer you add on top of a normal map.
 The `buildings3d` source is a **non-standard MVT**:
 
 - geometry features are **type 0** (`Unknown`) — MapLibre's renderer ignores them;
-- each vertex carries a **third zig-zag varint** (Z / height, in decimetres) that
-  the standard 2-coordinate MVT reader can't parse;
-- the first polygon of each feature is a **bounding box** (base Z + centroid), not
-  real geometry.
 
 So the tiles are decoded and triangulated in a Web Worker (`src/vectorTile3d.ts`
 + `src/mvt3dGeometry.ts`) and rendered with three.js instead of by MapLibre.
@@ -46,9 +42,9 @@ published inside the package, so the import map needs a **single** entry for
 `maplibre-gl`:
 
 ```html
-<link href="https://cdn.jsdelivr.net/npm/maplibre-gl@6/dist/maplibre-gl.css" rel="stylesheet" />
+<link href="https://cdn.jsdelivr.net/npm/maplibre-gl@6.8.0/dist/maplibre-gl.css" rel="stylesheet" />
 <script type="importmap">
-{ "imports": { "maplibre-gl": "https://cdn.jsdelivr.net/npm/maplibre-gl@6/+esm" } }
+{ "imports": { "maplibre-gl": "https://cdn.jsdelivr.net/npm/maplibre-gl@6.8.0/dist/maplibre-gl.mjs" } }
 </script>
 <script type="module">
   import * as maplibregl from 'maplibre-gl';
@@ -59,9 +55,11 @@ published inside the package, so the import map needs a **single** entry for
 </script>
 ```
 
-Pin exact versions in production (`maplibre-gl@6.8.0`, and the package version in
-the URL). The `standalone.mjs` bundles its own copy of three — don't also import
-three separately on the same page.
+Use maplibre-gl's **raw dist path** (`/dist/maplibre-gl.mjs`), not jsdelivr's
+`+esm` — the latter re-bundles maplibre-gl and breaks its code-split web-worker
+chunk. Pin exact versions in production (`maplibre-gl@6.8.0`, and the package
+version in the URL). The `standalone.mjs` bundles its own copy of three — don't
+also import three separately on the same page.
 
 ### Develop / run the demo
 
@@ -73,7 +71,7 @@ npm run build      # dist/ : ESM + self-contained standalone.mjs + .d.ts
 ```
 
 The demo (`index.html`) loads terrain + the `buildings3d` source over Vienna. It
-uses maptoolkit endpoints (`?api_key=iib`).
+uses maptoolkit endpoints.
 
 ## Usage
 
@@ -90,7 +88,7 @@ vector source** and fetches the original tiles itself. So:
 import { Map } from 'maplibre-gl';
 import { Fill3DLayer } from '@maptoolkit/maplibre-3d-layers';
 
-const TILEJSON = 'https://vtc.maptoolkit.net/buildings3d.json?api_key=iib';
+const TILEJSON = 'https://vtc.maptoolkit.net/buildings3d.json';
 
 map.on('load', () => {
   // Terrain (Fill3DLayer drapes the meshes onto it and picks it up automatically).
