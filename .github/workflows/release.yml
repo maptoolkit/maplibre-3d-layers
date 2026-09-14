@@ -23,6 +23,26 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      # Guard: the package must ship ONLY the built bundles (+ .d.ts types) — never
+      # source files or sourcemaps. Fails the release before publishing if it would.
+      - name: Verify package contents (no source, no .map)
+        run: |
+          node -e '
+            const { execSync } = require("node:child_process");
+            const meta = JSON.parse(execSync("npm pack --dry-run --json"));
+            const files = meta[0].files.map((f) => f.path);
+            console.log("Tarball files:\n" + files.map((f) => "  " + f).join("\n"));
+            const bad = files.filter((f) =>
+              f.endsWith(".map") ||           // sourcemaps
+              /(^|\/)src\//.test(f) ||        // source tree
+              (f.endsWith(".ts") && !f.endsWith(".d.ts")) // raw TS source
+            );
+            if (bad.length) {
+              console.error("::error::package would ship disallowed files:\n" + bad.join("\n"));
+              process.exit(1);
+            }
+            console.log("OK — only built bundles + type declarations.");
+          '
       # publishConfig.access=public in package.json makes the scoped package public.
       - run: npm publish
         env:

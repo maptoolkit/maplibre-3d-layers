@@ -24,6 +24,7 @@ export default defineConfig(() => {
       ...common,
       build: {
         emptyOutDir: true,
+        sourcemap: false, // ship only the bundle — no .map files in the package
         lib: { entry, formats: ['es' as const], fileName: () => 'maplibre-3d-layers.js' },
         rollupOptions: { external: isExternal },
       },
@@ -35,6 +36,7 @@ export default defineConfig(() => {
       ...common,
       build: {
         emptyOutDir: false, // runs after the npm build — keep its output
+        sourcemap: false, // ship only the bundle — no .map files in the package
         lib: {
           entry,
           formats: ['es' as const],
