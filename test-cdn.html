@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>fill-3d · packaged libs (no bundler)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- maplibre-gl's stylesheet, straight from the npm package on the CDN. -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@6.8.0/dist/maplibre-gl.css" />
+  <style>
+    html, body, #map { margin: 0; height: 100%; }
+  </style>
+
+  <!--
+    No bundler: the browser resolves bare module names via this import map.
+    maplibre-gl v6 is ESM-only (no UMD/global), so it is imported as a module too.
+    We use the RAW dist path (not jsdelivr's `+esm`) so maplibre-gl's code-split
+    web worker chunk keeps resolving as a sibling file.
+
+    @maptoolkit/maplibre-3d-layers/standalone is the self-contained build: three,
+    earcut, pbf and the decode worker are bundled in, so ONLY maplibre-gl stays
+    external — hence this one-entry import map.
+
+    Local run: build the standalone once (`npm run build:standalone`, which emits
+    dist/maplibre-3d-layers.standalone.mjs — it is git-ignored), then serve this
+    file over http (e.g. `python3 -m http.server`) and open it. Or skip the build
+    and point the import map at the CDN once published (see below).
+  -->
+  <script type="importmap">
+  {
+    "imports": {
+      "maplibre-gl": "https://cdn.jsdelivr.net/npm/maplibre-gl@6.8.0/dist/maplibre-gl.mjs",
+      "@maptoolkit/maplibre-3d-layers/standalone": "./dist/maplibre-3d-layers.standalone.mjs"
+    }
+  }
+  </script>
+  <!--
+    Once the package is published to npm, swap the local path above for the CDN:
+      "@maptoolkit/maplibre-3d-layers/standalone":
+        "https://cdn.jsdelivr.net/npm/@maptoolkit/maplibre-3d-layers/dist/maplibre-3d-layers.standalone.mjs"
+    …and nothing else changes.
+  -->
+</head>
+<body>
+  <div id="map"></div>
+
+  <script type="module">
+    import { Map } from 'maplibre-gl';
+    import { Fill3DLayer } from '@maptoolkit/maplibre-3d-layers/standalone';
+
+    const map = window.map = new Map({
+      container: 'map',
+      center: [16.3738, 48.2082], // Vienna
+      zoom: 16.27,
+      pitch: 80,          // oblique view
+      maxPitch: 85,
+      bearing: -28.5,
+      canvasContextAttributes: { antialias: true },
+      style: 'https://styles.maptoolkit.org/summer.json',
+      hash: true,
+    });
+
+    map.on('load', () => {
+      // Replace the style's own OSM 3D buildings — else they z-fight our meshes.
+      for (const id of ['building_3D', 'building_3D_public']) {
+        if (map.getLayer(id)) map.removeLayer(id);
+      }
+
+      // 3D terrain (terrarium-encoded mapterhorn tiles via maptoolkit).
+      map.addSource('mtk-terrain', {
+        type: 'raster-dem',
+        url: 'https://tiles.maptoolkit.org/terrainrgb.json',
+        encoding: 'terrarium',
+        tileSize: 512,
+      });
+      map.setTerrain({ source: 'mtk-terrain', exaggeration: 1 });
+
+      // The buildings tiles as a first-class vector source.
+      map.addSource('buildings3d', {
+        type: 'vector',
+        url: 'https://vtc.maptoolkit.net/buildings3d.json?api_key=iib',
+      });
+
+      // LOD1: native fill-extrusion on the 2D footprints — also makes MapLibre
+      // fetch the source's tiles (Fill3DLayer reuses the same URLs).
+      map.addLayer({
+        id: 'buildings-lod1',
+        type: 'fill-extrusion',
+        source: 'buildings3d',
+        'source-layer': 'buildings2d',
+        paint: {
+          'fill-extrusion-height': ['get', 'height'],
+          'fill-extrusion-color': '#fafafa',
+          'fill-extrusion-opacity': 0.8,
+        },
+      });
+
+      // Full 3D on the type-0 geometry — the packaged custom layer.
+      map.addLayer(
+        new Fill3DLayer({
+          id: 'fill-3d',
+          source: 'buildings3d',
+          'source-layer': 'buildings3d',
+          paint: {
+            'fill-3d-color': '#fafafa',
+            'fill-3d-opacity': 0.8,
+          },
+        }),
+      );
+    });
+  </script>
+</body>
+</html>
