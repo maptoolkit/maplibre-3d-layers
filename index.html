@@ -23,7 +23,7 @@
     import 'maplibre-gl/dist/maplibre-gl.css';
     import { Fill3DLayer } from '/src/index.ts';
 
-    const map = new Map({
+    const map = window.map = new Map({
       container: 'map',
       center: [16.3738, 48.2082], // Vienna
       zoom: 16.27,
@@ -66,7 +66,7 @@
         paint: {
           'fill-extrusion-height': ['get', 'height'],
           'fill-extrusion-color': '#fafafa',
-          'fill-extrusion-opacity': 0.9,
+          'fill-extrusion-opacity': 0.8,
         },
       });
 
@@ -77,8 +77,8 @@
           source: 'buildings3d',
           'source-layer': 'buildings3d',
           paint: {
-            'fill-3d-color': ['match', ['get', 'type'], 'roof', '#b0483c', '#d9d4cc'],
-            'fill-3d-opacity': 0.9,
+            'fill-3d-color': '#fafafa',
+            'fill-3d-opacity': 0.8,
           },
         }),
       );

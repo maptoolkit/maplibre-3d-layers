@@ -97,6 +97,18 @@ export function buildTile(
       const baseZ = bboxRing[0].z;
       const cx = (bboxRing[0].x + bboxRing[1].x) / 2;
       const cy = (bboxRing[0].y + bboxRing[1].y) / 2;
+
+      // De-dupe across tile boundaries. The source emits each building WHOLE into
+      // every tile its geometry overlaps (geometry overhangs a tile edge by
+      // hundreds of extent units), and feature ids are renumbered per tile, so at
+      // shared edges/corners the same building sits in 2–4 tiles. Drawing every
+      // copy double-draws coplanar walls → z-fighting/flicker. Render a building
+      // only in the tile whose bounds contain its (tile-stable) bbox centroid.
+      // Half-open [0, extent) → an exact partition (verified: 0 buildings owned by
+      // >1 tile across a 2×2 z15 block); also drops ~¼ of features as duplicates.
+      const ext = feature.extent;
+      if (cx < 0 || cx >= ext || cy < 0 || cy >= ext) continue;
+
       const [lng, lat] = mercToLngLat(
         (tx + cx / feature.extent) / pow,
         (ty + cy / feature.extent) / pow,

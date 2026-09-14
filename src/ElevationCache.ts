@@ -80,8 +80,15 @@ export class ElevationCache {
   }
 }
 
+export interface GeoBounds {
+  west: number;
+  east: number;
+  north: number;
+  south: number;
+}
+
 /** Geographic bounds of a standard web-mercator (slippy) tile. */
-function tileBounds(x: number, y: number, z: number) {
+export function tileBounds(x: number, y: number, z: number): GeoBounds {
   const n = 2 ** z;
   const lngOf = (xx: number) => (xx / n) * 360 - 180;
   const latOf = (yy: number) =>

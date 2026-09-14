@@ -1,7 +1,9 @@
 import { MercatorCoordinate, LngLat } from 'maplibre-gl';
-import type { Map } from 'maplibre-gl';
+import type { CoveringTilesOptions, Map } from 'maplibre-gl';
 import * as THREE from 'three';
 import type { ElevationCache } from './ElevationCache';
+import { tileBounds } from './ElevationCache';
+import type { GeoBounds } from './ElevationCache';
 import type { TileRequest, TileResult, FeatureSpan } from './mvt3dGeometry';
 import type { ColorEval, OpacityEval } from './paint';
 import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
@@ -96,6 +98,9 @@ interface TileEntry {
   tileMy: number;
   /** meterInMercatorCoordinateUnits at the tile latitude (set once parsed). */
   tileScale?: number;
+  /** Geographic bounds of the tile — used to rebake only tiles a changed DEM
+   *  tile actually overlaps. */
+  bounds: GeoBounds;
   mesh?: THREE.Mesh;
   geometry?: THREE.BufferGeometry;
   /** Worker positions with y = height above the feature base (no terrain yet). */
@@ -134,6 +139,12 @@ export class Fill3DManager {
   private readonly onMoveEnd: () => void;
   private onSourceData?: (ev: unknown) => void;
 
+  // Terrain DEM tiles stream in as a burst of `data` events. Instead of a full
+  // rebake per event, we accumulate the changed tiles' bounds and flush ONE
+  // rebake on the next animation frame, touching only overlapping building tiles.
+  private pendingDemRegions: GeoBounds[] = [];
+  private rebakeRafId?: number;
+
   // Read from the MapLibre vector source once its TileJSON has loaded.
   private tileTemplate?: string;
   private minzoom?: number;
@@ -166,8 +177,16 @@ export class Fill3DManager {
 
     // DEM tiles stream in → re-bake feature heights against the new terrain.
     this.onData = (ev) => {
-      const e = ev as { sourceId?: string; tile?: unknown };
-      if (e.sourceId === this.terrainSourceId && e.tile) this.rebakeAll();
+      const e = ev as {
+        sourceId?: string;
+        tile?: { tileID?: { canonical?: { x: number; y: number; z: number } } };
+      };
+      if (e.sourceId === this.terrainSourceId && e.tile) {
+        const c = e.tile.tileID?.canonical;
+        if (!c) return;
+        this.pendingDemRegions.push(tileBounds(c.x, c.y, c.z));
+        this.scheduleRebake();
+      }
     };
     this.onMoveEnd = () => {
       this.maybeRebase();
@@ -236,11 +255,9 @@ export class Fill3DManager {
       tileSize: 512,
       minzoom: this.minzoom,
       maxzoom: this.maxzoom,
-      // Vector sources round the zoom (round(14.59) = 15); without this we'd floor
-      // to 14 and request tiles that don't carry the maxzoom-only buildings3d
-      // layer → empty geometry. Matches the tiles MapLibre actually shows.
-      roundZoom: true,
-    })) {
+      roundZoom: false,
+      terrain: this.map.terrain,
+    } as CoveringTilesOptions)) {
       const { x, y, z } = id.canonical;
       const key = `${z}/${x}/${y}`;
       wanted.add(key);
@@ -259,7 +276,12 @@ export class Fill3DManager {
   /** Fetch a canonical tile's original pbf and hand it to the worker. */
   private loadTile(key: string, x: number, y: number, z: number) {
     const pow = 2 ** z;
-    this.tiles.set(key, { state: 'loading', tileMx: x / pow, tileMy: y / pow });
+    this.tiles.set(key, {
+      state: 'loading',
+      tileMx: x / pow,
+      tileMy: y / pow,
+      bounds: tileBounds(x, y, z),
+    });
 
     const url = this.tileTemplate!
       .replace('{z}', String(z))
@@ -269,7 +291,8 @@ export class Fill3DManager {
     fetch(url)
       .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
       .then((buffer) => {
-        if (this.tiles.get(key)?.state !== 'loading') return; // evicted mid-flight
+        const e = this.tiles.get(key);
+        if (e?.state !== 'loading') return; // evicted mid-flight
         const req: TileRequest = {
           key,
           x,
@@ -436,13 +459,27 @@ export class Fill3DManager {
     entry.geometry.computeBoundingSphere();
   }
 
-  private rebakeAll() {
-    let changed = false;
+  /** Coalesce a burst of DEM `data` events into one rebake on the next frame. */
+  private scheduleRebake() {
+    if (this.rebakeRafId !== undefined) return;
+    this.rebakeRafId = requestAnimationFrame(() => {
+      this.rebakeRafId = undefined;
+      this.flushRebake();
+    });
+  }
+
+  /** Rebake only the ready tiles that overlap a DEM tile changed this frame. */
+  private flushRebake() {
+    const regions = this.pendingDemRegions;
+    this.pendingDemRegions = [];
+    if (regions.length === 0) return;
+
+    let changed = 0;
     for (const entry of this.tiles.values()) {
-      if (entry.state === 'ready') {
-        this.bake(entry);
-        changed = true;
-      }
+      if (entry.state !== 'ready') continue;
+      if (!regions.some((r) => overlaps(r, entry.bounds))) continue;
+      this.bake(entry);
+      changed++;
     }
     if (changed) this.map.triggerRepaint();
   }
@@ -452,6 +489,7 @@ export class Fill3DManager {
     this.map.off('data', this.onData);
     this.map.off('moveend', this.onMoveEnd);
     if (this.onSourceData) this.map.off('sourcedata', this.onSourceData);
+    if (this.rebakeRafId !== undefined) cancelAnimationFrame(this.rebakeRafId);
     this.worker.terminate();
     for (const entry of this.tiles.values()) {
       if (entry.mesh) this.group.remove(entry.mesh);
@@ -466,4 +504,9 @@ export class Fill3DManager {
 function toOrigin(lngLat: LngLat): SceneOrigin {
   const om = MercatorCoordinate.fromLngLat(lngLat, 0);
   return { x: om.x, y: om.y, z: om.z, s: om.meterInMercatorCoordinateUnits() };
+}
+
+/** Do two geographic bounding boxes intersect? (edge-touching counts.) */
+function overlaps(a: GeoBounds, b: GeoBounds): boolean {
+  return a.west <= b.east && a.east >= b.west && a.south <= b.north && a.north >= b.south;
 }
