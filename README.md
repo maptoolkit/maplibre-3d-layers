@@ -1,45 +1,35 @@
 # @maptoolkit/maplibre-3d-layers
 
-A [MapLibre GL JS](https://maplibre.org/) **custom layer** that renders a z-encoded
-vector tile source (maptoolkit's `buildings3d`) as **real 3D meshes** via
-[three.js](https://threejs.org/), draped onto the map's terrain and shaded to
-match MapLibre's native `fill-extrusion`.
+Custom layers for [MapLibre GL JS](https://maplibre.org/) that render real 3D
+geometry on top of a normal map, draped onto its terrain. No MapLibre fork — you
+add them like any other layer.
 
-It is an external re-implementation of a forked MapLibre `fill-3d` layer type — no
-MapLibre fork required, just a custom layer you add on top of a normal map.
+| layer | renders |
+|-------|---------|
+| [`Fill3DLayer`](#fill3dlayer) | maptoolkit's `buildings3d` vector source as full 3D building meshes, shaded to match MapLibre's native `fill-extrusion` |
+| [`GltfLayer`](#gltflayer) | a source's features as **glTF models** — one per point, spaced along lines, or scattered across polygons |
 
-## Why a custom decoder
-
-The `buildings3d` source is a **non-standard MVT**:
-
-- geometry features are **type 0** (`Unknown`) — MapLibre's renderer ignores them;
-
-So the tiles are decoded and triangulated in a Web Worker (`src/vectorTile3d.ts`
-+ `src/mvt3dGeometry.ts`) and rendered with three.js instead of by MapLibre.
+Both are configured in MapLibre style-spec shape (`source`, `filter`, `layout`,
+`paint`) and evaluate their properties per feature with MapLibre's own expression
+engine, so everything you already know about expressions applies.
 
 ## Install
 
-As a dependency in a bundler project (`three` + `maplibre-gl` are **peer
-dependencies** — install them alongside):
+`three` and `maplibre-gl` are **peer dependencies** — install them alongside:
 
 ```bash
 npm install @maptoolkit/maplibre-3d-layers three maplibre-gl
 ```
 
 ```js
-import { Fill3DLayer } from '@maptoolkit/maplibre-3d-layers';
+import { Fill3DLayer, GltfLayer } from '@maptoolkit/maplibre-3d-layers';
 ```
 
-The package ships a pre-built ESM bundle with the decode worker **inlined** (no
-separate worker asset to host or configure).
+### Without a bundler
 
-### Use without a bundler (`<script type="module">` + import map)
-
-MapLibre GL JS 6 is **ESM-only** (there is no global `<script>` build), so the
-no-bundler path is an ES-module import map. A **self-contained** standalone build
-(`three`, `earcut`, `pbf` and the style-spec bundled in, worker inlined) is
-published inside the package, so the import map needs a **single** entry for
-`maplibre-gl`:
+MapLibre GL JS 6 is ESM-only, so the no-bundler path is an ES-module import map.
+A self-contained standalone build ships inside the package, so the import map
+needs a **single** entry for `maplibre-gl`:
 
 ```html
 <link href="https://cdn.jsdelivr.net/npm/maplibre-gl@6.8.0/dist/maplibre-gl.css" rel="stylesheet" />
@@ -48,50 +38,38 @@ published inside the package, so the import map needs a **single** entry for
 </script>
 <script type="module">
   import * as maplibregl from 'maplibre-gl';
-  import { Fill3DLayer } from 'https://unpkg.com/@maptoolkit/maplibre-3d-layers/dist/maplibre-3d-layers.standalone.mjs';
+  import { GltfLayer } from 'https://unpkg.com/@maptoolkit/maplibre-3d-layers/dist/maplibre-3d-layers.standalone.mjs';
 
   const map = new maplibregl.Map({ /* … */ });
-  map.on('load', () => map.addLayer(new Fill3DLayer({ /* …options… */ })));
+  map.on('load', () => map.addLayer(new GltfLayer({ /* …options… */ })));
 </script>
 ```
 
-Use maplibre-gl's **raw dist path** (`/dist/maplibre-gl.mjs`), not jsdelivr's
-`+esm` — the latter re-bundles maplibre-gl and breaks its code-split web-worker
-chunk. Pin exact versions in production (`maplibre-gl@6.8.0`, and the package
-version in the URL). The `standalone.mjs` bundles its own copy of three — don't
-also import three separately on the same page.
+Two things to watch: use maplibre-gl's **raw dist path**
+(`/dist/maplibre-gl.mjs`), not jsdelivr's `+esm` — the latter re-bundles
+maplibre-gl and breaks it. And the standalone build carries its own copy of
+three, so don't import three separately on the same page. Pin exact versions in
+production.
 
-### Develop / run the demo
+---
 
-```bash
-npm install
-npm run dev        # vite dev server → http://localhost:5173
-npm run typecheck  # tsc --noEmit
-npm run build      # dist/ : ESM + self-contained standalone.mjs + .d.ts
-```
+## `Fill3DLayer`
 
-The demo (`index.html`) loads terrain + the `buildings3d` source over Vienna. It
-uses maptoolkit endpoints.
+Renders the `buildings3d` vector source as full 3D meshes.
 
-## Usage
+Set it up in three steps:
 
-`Fill3DLayer` reads its tile template + zoom range from an **existing MapLibre
-vector source** and fetches the original tiles itself. So:
-
-1. add the vector source (via its TileJSON `url`),
-2. add a layer that **consumes** the source so MapLibre actually fetches its tiles
-   — e.g. a `fill-extrusion` on the 2D footprints (`buildings2d`), which also
-   gives you a LOD1 fallback at low zoom,
-3. add the `Fill3DLayer` on the `buildings3d` source-layer.
+1. add the vector source,
+2. add a normal style layer that **consumes** that source, so MapLibre loads its
+   tiles — a `fill-extrusion` on the 2D footprints (`buildings2d`) does the job
+   and gives you a simple fallback at low zoom,
+3. add `Fill3DLayer` on the `buildings3d` source-layer.
 
 ```js
-import { Map } from 'maplibre-gl';
 import { Fill3DLayer } from '@maptoolkit/maplibre-3d-layers';
 
-const TILEJSON = 'https://vtc.maptoolkit.net/buildings3d.json';
-
 map.on('load', () => {
-  // Terrain (Fill3DLayer drapes the meshes onto it and picks it up automatically).
+  // Terrain is optional; the layer picks it up on its own and drapes onto it.
   map.addSource('mtk-terrain', {
     type: 'raster-dem',
     url: 'https://tiles.maptoolkit.org/terrainrgb.json',
@@ -100,10 +78,12 @@ map.on('load', () => {
   });
   map.setTerrain({ source: 'mtk-terrain' });
 
-  // One vector source for both LOD1 and 3D.
-  map.addSource('buildings3d', { type: 'vector', url: TILEJSON });
+  map.addSource('buildings3d', {
+    type: 'vector',
+    url: 'https://vtc.maptoolkit.net/buildings3d.json',
+  });
 
-  // LOD1: native fill-extrusion on the 2D footprints (and it drives the fetch).
+  // Footprints — also what makes MapLibre load the source's tiles.
   map.addLayer({
     id: 'buildings-lod1',
     type: 'fill-extrusion',
@@ -117,94 +97,307 @@ map.on('load', () => {
   });
 
   // Full 3D.
-  map.addLayer(
-    new Fill3DLayer({
-      id: 'fill-3d',
-      source: 'buildings3d',       // the vector source id above
-      'source-layer': 'buildings3d',
-      paint: {
-        'fill-3d-color': ['match', ['get', 'type'], 'roof', '#b0483c', '#d9d4cc'],
-        'fill-3d-opacity': 0.9,
-      },
-    }),
-  );
+  map.addLayer(new Fill3DLayer({
+    id: 'fill-3d',
+    source: 'buildings3d',
+    'source-layer': 'buildings3d',
+    paint: {
+      'fill-3d-color': ['match', ['get', 'type'], 'roof', '#b0483c', '#d9d4cc'],
+      'fill-3d-opacity': 0.9,
+    },
+  }));
 });
 ```
 
-> The same tile URLs are requested by both MapLibre (for LOD1) and the layer, so
-> the browser HTTP cache de-dupes them — effectively a single network fetch.
+> Put the `fill-extrusion` on `buildings2d`, **never** on `buildings3d` — a
+> native style layer cannot render the 3D source-layer and will produce garbage.
 
 ### Options
 
-| option           | required | description |
-|------------------|----------|-------------|
-| `id`             | ✅       | MapLibre layer id |
-| `source`         | ✅       | id of a vector source already added to the map |
-| `source-layer`   | ✅       | vector-tile layer to read (e.g. `buildings3d`) |
-| `terrainSourceId`| —        | raster-dem source for elevation; defaults to the map's active terrain |
-| `filter`         | —        | MapLibre filter expression; features that fail are dropped |
-| `layout.visibility` | —     | `'visible'` (default) / `'none'` (hides the layer & skips tile loading) |
-| `paint['fill-3d-color']`   | — | constant colour or a MapLibre **color expression** (default white) |
-| `paint['fill-3d-opacity']` | — | constant `0..1` or a MapLibre **number expression** (default `1`) |
+| option | required | description |
+|---|---|---|
+| `id` | ✅ | MapLibre layer id |
+| `source` | ✅ | id of a vector source already added to the map |
+| `source-layer` | ✅ | vector-tile layer to read (e.g. `buildings3d`) |
+| `filter` | — | MapLibre filter expression; features that fail are dropped |
+| `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's active terrain |
+| `layout.visibility` | — | `'visible'` (default) / `'none'` |
+| `paint['fill-3d-color']` | — | colour, constant or expression (default white) |
+| `paint['fill-3d-opacity']` | — | `0..1`, constant or expression (default `1`) |
 
-`fill-3d-color` / `fill-3d-opacity` are evaluated **per feature** (against its
-properties + zoom) into per-vertex colours, using MapLibre's own expression
-engine. Note: `paint` and `visibility` are read **once** when the layer is added
-(custom layers have no `setPaintProperty`).
+Colour and opacity are evaluated per feature against its properties and the
+current zoom.
 
-## How it works
+---
 
-- **Decode off-thread** — `map.coveringTiles()` picks the tiles; each original
-  `.pbf` is fetched and decoded + triangulated (earcut, per-ring Newell normals)
-  in a Web Worker into one merged `BufferGeometry` per tile.
-- **Worldwide float precision** — geometry is stored in metres relative to each
-  tile's own corner; a single scene origin is folded into the camera projection
-  matrix and **re-anchored** as you pan, so vertices stay small (no z-fighting,
-  works flying e.g. Vienna → Berlin).
-- **Terrain** — each feature's base height is baked from
-  `map.queryTerrainElevation` at its centroid and re-baked as DEM tiles stream in.
-- **Looks like fill-extrusion** — a small custom shader replicates MapLibre's
-  fill-extrusion directional lighting (in sRGB, using the style `light` + bearing);
-  backface culling + a depth pre-pass keep semi-transparent buildings from showing
-  their interior walls.
+## `GltfLayer`
 
-### Module overview
+Renders features as glTF models. Point features get one model each; lines get
+models spaced along them; polygons get models scattered across them.
 
-| file | role |
-|------|------|
-| `src/Fill3DLayer.ts`   | the `CustomLayerInterface` — scene/camera/renderer, options, per-frame render |
-| `src/Fill3DManager.ts` | tile lifecycle, meshes, material/shader, terrain baking, origin rebasing |
-| `src/mvt3dWorker.ts`   | thin Web Worker wrapper |
-| `src/mvt3dGeometry.ts` | pure decode + triangulate → tile-local metre geometry |
-| `src/vectorTile3d.ts`  | z-encoded MVT reader |
-| `src/paint.ts`         | compile `fill-3d-*` constants/expressions via the style-spec |
-| `src/ElevationCache.ts`| cached `queryTerrainElevation`, invalidated per DEM tile |
-| `src/index.ts`         | public entry (`Fill3DLayer`, `Fill3DLayerOptions`) |
+```js
+import { GltfLayer } from '@maptoolkit/maplibre-3d-layers';
 
-## Limitations
+map.on('load', () => {
+  map.addSource('vehicles', { type: 'geojson', data: feed });
 
-- The `buildings3d` source-layer must **not** be consumed by a native style layer
-  — MapLibre would mis-parse the type-0/z geometry (and above `maxzoom` its
-  client-side overzoom re-encodes tiles and drops the layer). Put `fill-extrusion`
-  on `buildings2d`, not `buildings3d`.
-- No real terrain-depth **occlusion** of meshes behind hills (the fork sampled an
-  internal depth texture; not exposed via the public API).
-- On a strongly pitched map, foreground tiles one zoom deeper than the map zoom
-  may not yet render 3D — a known LOD gap.
-- `paint` / `visibility` are static after `addLayer`.
+  map.addLayer(new GltfLayer({
+    id: 'vehicles-3d',
+    source: 'vehicles',
+    models: {
+      bus:  'https://example.com/models/bus.glb',
+      tram: 'https://example.com/models/tram.glb',
+    },
+    filter: ['==', ['get', 'in_service'], true],
+    layout: {
+      'model-id': ['match', ['get', 'route_type'], 0, 'tram', 'bus'],
+    },
+    paint: {
+      'model-rotation': [0, 0, ['get', 'bearing']],   // heading, cw from north
+      'model-scale': [1, 1, 1],
+      'model-color': ['case', ['get', 'delayed'], '#ff5a3c', '#ffffff'],
+      'model-opacity': ['interpolate', ['linear'], ['zoom'], 12, 0.25, 15, 1],
+    },
+  }));
+});
+
+// Live data: just push new positions, the layer follows.
+setInterval(async () => map.getSource('vehicles').setData(await fetchFeed()), 2000);
+```
+
+It also works directly off a basemap's **own** vector source — no extra source,
+just a filter. This plants a 3D tree on every `natural=tree` point, spaces trees
+along every `tree_row`, and scatters them across every `wood` polygon:
+
+```js
+const MODELS = { leafy: '/models/tree1.glb', bushy: '/models/tree2.glb' };
+
+// Vary every tree a little, so a row isn't a line of identical clones.
+const SIZE = ['+', 0.7, ['/', ['%', ['id'], 9], 12]];   // 0.70 .. 1.37
+const LOOK = {
+  'model-scale': [SIZE, SIZE, SIZE],
+  'model-rotation': [0, 0, ['%', ['id'], 360]],
+};
+
+// Single trees — Point geometry, one model each.
+map.addLayer(new GltfLayer({
+  id: 'trees-single',
+  source: 'mtk',                     // the style's own vector source
+  'source-layer': 'poi_label',
+  filter: ['==', ['get', 'type'], 'tree'],
+  minzoom: 15,
+  models: MODELS,
+  layout: { 'model-id': ['case', ['==', ['%', ['id'], 3], 0], 'bushy', 'leafy'] },
+  paint: LOOK,
+}));
+
+// Tree rows (lines) AND woods (polygons) in ONE layer: 'model-placement'
+// defaults to 'auto', so each feature is handled by its geometry type.
+map.addLayer(new GltfLayer({
+  id: 'trees-vegetation',
+  source: 'mtk',
+  'source-layer': 'natural',
+  filter: ['in', ['get', 'type'], ['literal', ['tree_row', 'wood']]],
+  minzoom: 15,
+  models: MODELS,
+  layout: {
+    'model-id': ['case', ['==', ['%', ['id'], 3], 0], 'bushy', 'leafy'],
+    'model-spacing': ['match', ['get', 'type'],
+      'tree_row', 9,                                            // metres
+      ['interpolate', ['linear'], ['zoom'], 15, 34, 17, 14],    // thin out when far
+    ],
+  },
+  paint: LOOK,
+}));
+```
+
+### Options
+
+| option | required | description |
+|---|---|---|
+| `id` | ✅ | MapLibre layer id |
+| `source` | ✅ | id of a source already added to the map (`geojson` or `vector`) |
+| `models` | ✅ | `{ id: url }` map of glTF/glb files; `layout['model-id']` picks one |
+| `source-layer` | — | vector-tile layer to read; **required for vector sources** |
+| `filter` | — | MapLibre filter expression; features that fail are dropped |
+| `minzoom` / `maxzoom` | — | hidden below `minzoom` and at/above `maxzoom`; outside the range the layer costs nothing |
+| `maxInstances` | — | instance budget (default `15000`); denser data is thinned out, see [Density and budget](#density-and-budget) |
+| `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's active terrain |
+| `lighting` | — | `{ ambient, directional, environment }`, see [Lighting](#lighting) |
+| `layout.visibility` | — | `'visible'` (default) / `'none'` |
+| `layout['model-id']` | — | which entry of `models` a feature uses; defaults to the only model |
+| `layout['model-placement']` | — | `'auto'` (default) / `'point'` / `'line'` / `'fill'`, see [Placement](#placement) |
+| `layout['model-spacing']` | — | metres between models on lines and in polygons (default `25`) |
+| `paint['model-scale']` | — | `[x, y, z]` factor on the model's own size (default `[1,1,1]`) |
+| `paint['model-rotation']` | — | `[x, y, z]` degrees around `[east, north, up]`; `z` is a compass heading |
+| `paint['model-translation']` | — | `[x, y, z]` metres along `[east, north, up]` (default `[0,0,0]`) |
+| `paint['model-color']` | — | multiplied onto the model's own material colour (default: untinted) |
+| `paint['model-opacity']` | — | multiplied onto the model's own alpha (default `1`) |
+
+### Expressions
+
+Every `layout` and `paint` value accepts a constant or a MapLibre expression over
+`['zoom']`, the feature's properties and `['id']`. The three-component properties
+additionally accept **per-component** expressions, which is the only way to build
+a vector out of values — the style spec itself has no syntax for it:
+
+```js
+'model-rotation': [0, 0, 90]                    // constant
+'model-rotation': ['literal', [0, 0, 90]]       // an expression returning a 3-array
+'model-rotation': [0, 0, ['get', 'bearing']]    // per-component
+'model-scale': ['match', ['get', 'kind'],
+   'tram', ['literal', [1, 1, 1]], ['literal', [2, 2, 2]]]
+```
+
+Properties are re-evaluated whenever the layer refreshes (see
+[When instances update](#when-instances-update)), so zoom-driven values step at
+the end of a zoom rather than continuously.
+
+### Sizing and orientation
+
+`model-scale` is a **factor on the model's own size**, not an absolute size, and
+its three components are `[width, height, length]` in the model's own frame.
+Well-made glTF assets are modelled at real-world scale, so a 9 m tree at factor
+`1` is 9 m tall, and the factor you want is `desired height / model height`:
+
+```js
+'model-scale': [1, 1, 1]       // as authored
+'model-scale': 2.15            // shorthand: uniform on all three axes
+'model-scale': [0.8, 1.6, 0.8] // slimmer and taller
+```
+
+A single number is shorthand for all three components, which is what you want
+for plain "make it bigger".
+
+Like everything else it can be data- or zoom-driven:
+
+```js
+'model-scale': (s => [s, s, s])(
+  ['match', ['get', 'type'], 'tree_row', 1.3, 0.9]
+)
+```
+
+Orientation follows the glTF convention that assets face **+Z**, which the layer
+maps to north. So `model-rotation: [0, 0, 0]` points a model north, and
+`[0, 0, ['get', 'bearing']]` takes a plain compass bearing with no offset.
+`model-translation` is applied after rotation and scale — use its third component
+to lift a model whose origin sits in its middle rather than at its feet.
+
+### Placement
+
+`layout['model-placement']` decides how a feature turns into models. `'auto'`,
+the default, picks by geometry type — so **one layer can serve mixed geometry**
+from the same source-layer:
+
+| geometry | mode | result |
+|---|---|---|
+| `Point` / `MultiPoint` | `point` | one model per point; `model-spacing` unused |
+| `LineString` / `MultiLineString` | `line` | a model every `model-spacing` metres along the line |
+| `Polygon` / `MultiPolygon` | `fill` | models scattered across the area, holes left empty |
+
+Setting it explicitly restricts the layer to that one mode; features whose
+geometry doesn't match are skipped with a warning.
+
+Models generated for lines and polygons are **stable**: they keep their exact
+positions while you pan and zoom, and scattered models are irregular rather than
+laid out on a visible grid. Along a polygon's edge a model may overhang by up to
+half the spacing, which keeps the boundary looking natural rather than cut.
+
+Each generated model gets its **own stable `id`**, so `['%', ['id'], 9]` and
+friends vary per model rather than per source feature — that is what keeps a tree
+row from becoming a line of identical clones. Point features keep the id they
+have in the source, so `['id']` still addresses the original feature there.
+
+### Density and budget
+
+`model-spacing` is in metres and can be data- and zoom-driven — that is the knob
+you should reach for first:
+
+```js
+'model-spacing': ['match', ['get', 'type'],
+  'tree_row', 9,                                           // avenue: tight
+  ['interpolate', ['linear'], ['zoom'], 15, 34, 17, 14],   // forest: thin out when far
+]
+```
+
+Rendering cost is **triangles × models**, not feature count. A single forest
+polygon can easily be tens of thousands of models, so prefer low-poly assets: a
+thousand copies of a 3.6k-triangle model render at 60 fps, a thousand copies of a
+109k-triangle showcase asset drop to 6 fps.
+
+As a safety net, a refresh that would exceed `maxInstances` automatically widens
+the spacing until it fits, and warns once with the effective spacing. Coverage
+stays even — the area is thinned out, never cut off halfway.
+
+### Data sources
+
+- **`geojson`** — the whole dataset is used, then narrowed to what's in view. No
+  other layer is required, and the layer follows `setData()` / `updateData()`.
+- **`vector`** — only features from tiles MapLibre has actually loaded are
+  available, so **a normal style layer must consume the source**; otherwise the
+  layer warns and stays empty. Pass `source-layer`.
+
+### When instances update
+
+The layer refreshes when the map stops moving and when the source's data changes.
+Positions jump straight to their new location — there is no interpolation between
+updates. `paint`, `layout` and `visibility` are read once when the layer is added;
+custom layers have no `setPaintProperty`.
+
+### Lighting
+
+Direction and colour follow the style's `light` property (including
+`anchor: 'viewport'`, which rotates with the bearing). The `lighting` option only
+scales the magnitudes:
+
+```js
+lighting: { ambient: 1.5, directional: 2.5, environment: 0.7 }  // defaults
+```
+
+`environment` adds a soft all-round light that metallic and glossy materials need
+in order to show anything at all; set it to `0` to switch it off.
+
+---
 
 ## Requirements
 
-MapLibre GL JS **≥6**, three.js **≥0.160** (both peer dependencies). The published
-package inlines the decode worker, so consumers need no special worker/bundler
-config. (Developing the demo in this repo uses Vite with
-`optimizeDeps.exclude: ['maplibre-gl']`.)
+MapLibre GL JS **≥6** and three.js **≥0.160**, both peer dependencies. No special
+bundler or worker configuration is needed.
 
-## Publishing
+## Limitations
 
-- `npm version <patch|minor|major> && git push --follow-tags` — the tag triggers
-  `.github/workflows/release.yml`, which builds and runs `npm publish` (public),
-  and attaches the standalone bundle to the GitHub release.
-- Requires an `NPM_TOKEN` repo secret (npm automation/granular-access token with
-  publish rights to the `@maptoolkit` scope). The repo can stay **private** — npm
-  publishes the built `dist/` tarball, not the source.
+**`Fill3DLayer`**
+
+- The `buildings3d` source-layer must not be consumed by a native style layer —
+  put `fill-extrusion` on `buildings2d`.
+- Meshes are not occluded by terrain in front of them.
+- On a strongly pitched map, the nearest foreground may briefly stay flat.
+
+**`GltfLayer`**
+
+- No skinned meshes and no animations — skinned meshes are skipped with a warning.
+- Spacing along a line can vary slightly where the line crosses a tile boundary.
+- Draco- and KTX2-compressed glTF files are not supported yet.
+- No interpolation between source updates.
+
+**Both**
+
+- `paint`, `layout` and `visibility` are fixed once the layer has been added.
+
+## Development
+
+```bash
+npm install
+npm run dev        # dev server with both demos
+npm run typecheck
+npm run build
+```
+
+`/` renders the `buildings3d` source over Vienna; `/gltf.html` plants 3D trees on
+the maptoolkit basemap's own vegetation data. Both use maptoolkit endpoints; the
+demo tree models come from [BabylonJS/Assets](https://github.com/BabylonJS/Assets)
+(CC-BY-4.0).
+
+## License
+
+MIT

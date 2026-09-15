@@ -28,7 +28,7 @@
     "build": "npm run clean && npm run build:npm && npm run build:standalone && npm run build:types",
     "build:npm": "BUILD_TARGET=npm vite build",
     "build:standalone": "BUILD_TARGET=standalone vite build",
-    "build:types": "tsc -p tsconfig.build.json",
+    "build:types": "tsc -p tsconfig.build.json && node scripts/prune-types.mjs",
     "build:demo": "vite build",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"
