@@ -298,10 +298,14 @@ from the same source-layer:
 Setting it explicitly restricts the layer to that one mode; features whose
 geometry doesn't match are skipped with a warning.
 
-Models generated for lines and polygons are **stable**: they keep their exact
-positions while you pan and zoom, and scattered models are irregular rather than
-laid out on a visible grid. Along a polygon's edge a model may overhang by up to
-half the spacing, which keeps the boundary looking natural rather than cut.
+Models scattered across a polygon are **stable**: they keep their exact positions
+while you pan and zoom, and they are irregular rather than laid out on a visible
+grid. Along the edge a model may overhang by up to half the spacing, which keeps
+the boundary looking natural rather than cut.
+
+Models along a **line** hold their positions for as long as the source serves the
+same geometry. If it hands over a more generalised version of the line at another
+zoom, they are placed along the line it actually gets, and can shift.
 
 Each generated model gets its **own stable `id`**, so `['%', ['id'], 9]` and
 friends vary per model rather than per source feature — that is what keeps a tree
@@ -325,9 +329,11 @@ polygon can easily be tens of thousands of models, so prefer low-poly assets: a
 thousand copies of a 3.6k-triangle model render at 60 fps, a thousand copies of a
 109k-triangle showcase asset drop to 6 fps.
 
-As a safety net, a refresh that would exceed `maxInstances` automatically widens
-the spacing until it fits, and warns once with the effective spacing. Coverage
-stays even — the area is thinned out, never cut off halfway.
+As a safety net, a refresh that would exceed `maxInstances` keeps only a share of
+the models and warns once. The ones that remain sit exactly where they would have
+at full density, so crossing the budget — by zooming, or by resizing the window —
+adds and removes models instead of rearranging them. Coverage stays even; the
+area is never cut off halfway.
 
 ### Data sources
 
@@ -376,7 +382,8 @@ bundler or worker configuration is needed.
 **`GltfLayer`**
 
 - No skinned meshes and no animations — skinned meshes are skipped with a warning.
-- Spacing along a line can vary slightly where the line crosses a tile boundary.
+- Models on a line can shift if the source serves a differently generalised
+  version of that line at another zoom. Models in a polygon are unaffected.
 - Draco- and KTX2-compressed glTF files are not supported yet.
 - No interpolation between source updates.
 

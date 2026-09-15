@@ -41,6 +41,14 @@ export interface MercBounds {
 /** Receives each placed point; return `false` to stop placing (budget spent). */
 export type Emit = (point: PlacedPoint) => boolean;
 
+/**
+ * Fraction of candidates to keep, 0..1. Thinning DROPS candidates instead of
+ * widening the grid: the survivors keep the exact positions they would have had
+ * at full density, so a viewport that crosses the budget only adds or removes
+ * models — it never re-lays-out the ones already on screen.
+ */
+export type Keep = number;
+
 /** Flat `[x0, y0, x1, y1, …]` in mercator metres. */
 export type MercRing = number[];
 
@@ -53,17 +61,29 @@ export const fromMercX = (x: number): number => x / R / D2R;
 export const fromMercY = (y: number): number =>
   (2 * Math.atan(Math.exp(y / R)) - Math.PI / 2) / D2R;
 
-/**
- * Mercator metres per real metre at a latitude, quantised to 0.05° bands.
- *
- * Spacing is specified in real metres but the grid lives in mercator metres, and
- * the two differ by 1/cos(lat) — 1.5x at Vienna. Quantising keeps the factor a
- * pure function of position (so the grid stays global and stable) at the cost of
- * a <0.1% spacing step between bands, which is invisible.
- */
+/** Mercator metres per real metre at a latitude. */
 export function mercatorScale(lat: number): number {
-  const band = Math.round(lat / 0.05) * 0.05;
-  return 1 / Math.cos(band * D2R);
+  return 1 / Math.cos(lat * D2R);
+}
+
+/**
+ * Height of a grid band in mercator metres.
+ *
+ * Spacing is given in real metres but the grid lives in mercator metres, and the
+ * two differ by 1/cos(lat). That factor therefore has to come from the POSITION
+ * being filled — deriving it from the feature would make the grid depend on how
+ * the source happened to clip that feature, and because the grid is anchored at
+ * the mercator origin, even a 0.1% difference in cell size shifts rows by
+ * kilometres this far north. So the world is cut into fixed horizontal bands,
+ * each with its own cell size and its own row ladder starting at its lower edge.
+ */
+const BAND_H = 65536;
+
+/** The band a mercator y falls into, and that band's grid geometry. */
+function bandAt(mercY: number, spacing: number): { index: number; start: number; cell: number } {
+  const index = Math.floor(mercY / BAND_H);
+  const start = index * BAND_H;
+  return { index, start, cell: spacing * mercatorScale(fromMercY(start + BAND_H / 2)) };
 }
 
 /** Convert a GeoJSON ring/line to a flat mercator array. */
@@ -107,15 +127,17 @@ function emitAt(px: number, py: number, seen: Set<number>, emit: Emit): boolean 
 // --------------------------------------------------------------------- line
 
 /**
- * Walk each line by arc length and place a point every `cell` mercator metres.
+ * Place a model every `spacing` metres along each line, measured as arc length
+ * so the spacing carries evenly across corners.
  *
  * The starting phase is hashed from the line's first vertex rather than being
- * zero, so parallel rows of hedges don't line up with each other. Returns false
- * if `emit` asked to stop.
+ * zero, so parallel rows of hedges don't line up with each other.
+ *
+ * Returns false if `emit` asked to stop.
  */
 export function placeAlongLine(
   lines: number[][][],
-  cell: number,
+  spacing: number,
   clip: MercBounds,
   seen: Set<number>,
   emit: Emit,
@@ -123,13 +145,15 @@ export function placeAlongLine(
   for (const line of lines) {
     if (line.length < 2) continue;
     const m = toMerc(line);
-    const h = hash32(Math.round(m[0] / cell), Math.round(m[1] / cell));
-    let next = ((h & 0xffff) / 65536) * cell;
+    const cell0 = bandAt(m[1], spacing).cell;
+    const h = hash32(Math.round(m[0] / cell0), Math.round(m[1] / cell0));
+    let next = ((h & 0xffff) / 65536) * cell0;
     let travelled = 0;
 
     for (let i = 2; i < m.length; i += 2) {
       const ax = m[i - 2];
       const ay = m[i - 1];
+      const cell = bandAt(ay, spacing).cell;
       const segment = Math.hypot(m[i] - ax, m[i + 1] - ay);
       if (segment === 0) continue;
       while (next <= travelled + segment) {
@@ -165,10 +189,11 @@ export function placeAlongLine(
  */
 export function scatterInPolygon(
   polygons: number[][][][],
-  cell: number,
+  spacing: number,
   clip: MercBounds,
   seen: Set<number>,
   emit: Emit,
+  keep: Keep = 1,
 ): boolean {
   const crossings: number[] = [];
 
@@ -186,31 +211,45 @@ export function scatterInPolygon(
     maxY = Math.min(maxY, clip.maxY);
     if (minY > maxY) continue;
 
-    for (let iy = Math.floor(minY / cell); iy <= Math.floor(maxY / cell); iy++) {
-      const rowY = (iy + 0.5) * cell;
-      crossings.length = 0;
-      for (const ring of merc) {
-        for (let i = 0, j = ring.length - 2; i < ring.length; j = i, i += 2) {
-          const ay = ring[j + 1];
-          const by = ring[i + 1];
-          if (ay > rowY === by > rowY) continue; // edge doesn't straddle the row
-          crossings.push(ring[j] + ((rowY - ay) / (by - ay)) * (ring[i] - ring[j]));
-        }
-      }
-      if (crossings.length < 2) continue;
-      crossings.sort((a, b) => a - b);
+    const firstBand = Math.floor(minY / BAND_H);
+    const lastBand = Math.floor(maxY / BAND_H);
 
-      for (let k = 0; k + 1 < crossings.length; k += 2) {
-        const x0 = Math.max(crossings[k], clip.minX);
-        const x1 = Math.min(crossings[k + 1], clip.maxX);
-        if (x0 > x1) continue;
-        // Cells whose CENTRE falls inside the span.
-        const ix1 = Math.floor(x1 / cell - 0.5);
-        for (let ix = Math.ceil(x0 / cell - 0.5); ix <= ix1; ix++) {
-          const h = hash32(ix, iy);
-          const px = (ix + (h & 0xffff) / 65536) * cell;
-          const py = (iy + ((h >>> 16) & 0xffff) / 65536) * cell;
-          if (!emitAt(px, py, seen, emit)) return false;
+    for (let b = firstBand; b <= lastBand; b++) {
+      const { start, cell } = bandAt(b * BAND_H, spacing);
+      const rows = Math.floor(BAND_H / cell); // whole rows the band holds
+      const from = Math.max(0, Math.ceil((minY - start) / cell - 0.5));
+      const to = Math.min(rows - 1, Math.floor((maxY - start) / cell - 0.5));
+
+      for (let n = from; n <= to; n++) {
+        const rowY = start + (n + 0.5) * cell;
+        crossings.length = 0;
+        for (const ring of merc) {
+          for (let i = 0, k = ring.length - 2; i < ring.length; k = i, i += 2) {
+            const ay = ring[k + 1];
+            const by = ring[i + 1];
+            if (ay > rowY === by > rowY) continue; // edge doesn't straddle the row
+            crossings.push(ring[k] + ((rowY - ay) / (by - ay)) * (ring[i] - ring[k]));
+          }
+        }
+        if (crossings.length < 2) continue;
+        crossings.sort((p, q) => p - q);
+
+        const row = hash32(b, n);
+        for (let c = 0; c + 1 < crossings.length; c += 2) {
+          const x0 = Math.max(crossings[c], clip.minX);
+          const x1 = Math.min(crossings[c + 1], clip.maxX);
+          if (x0 > x1) continue;
+          // Cells whose CENTRE falls inside the span.
+          const ix1 = Math.floor(x1 / cell - 0.5);
+          for (let ix = Math.ceil(x0 / cell - 0.5); ix <= ix1; ix++) {
+            const h = hash32(ix, row);
+            // Thin on a SECOND, independent hash so dropping doesn't bias where
+            // the survivors sit inside their cells.
+            if (keep < 1 && hash32(h, 0x9e37) / 4294967296 >= keep) continue;
+            const px = (ix + (h & 0xffff) / 65536) * cell;
+            const py = start + (n + ((h >>> 16) & 0xffff) / 65536) * cell;
+            if (!emitAt(px, py, seen, emit)) return false;
+          }
         }
       }
     }

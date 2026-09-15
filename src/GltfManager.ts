@@ -410,7 +410,7 @@ export class GltfManager {
     };
 
     const visible = this.features.filter((f) => overlaps(view, f.bbox));
-    const cells = this.planCells(visible, zoom);
+    const { cells, keep } = this.planCells(visible, zoom);
 
     // One position grid for the whole build: it resolves duplicates between
     // overlapping tile pieces AND between features that place on the same spot.
@@ -460,7 +460,7 @@ export class GltfManager {
 
     outer: for (let i = 0; i < visible.length; i++) {
       const f = visible[i];
-      const cell = cells[i];
+      const spacing = cells[i];
       switch (this.placementFor(f)) {
         case 'point':
           for (const [lng, lat] of pointsOf(f.geometry)) {
@@ -473,12 +473,12 @@ export class GltfManager {
           }
           break;
         case 'line':
-          if (!placeAlongLine(linesOf(f.geometry), cell, clip, seen, (pt) => add(f, pt))) {
+          if (!placeAlongLine(linesOf(f.geometry), spacing, clip, seen, (pt) => add(f, pt))) {
             break outer;
           }
           break;
         case 'fill':
-          if (!scatterInPolygon(polysOf(f.geometry), cell, clip, seen, (pt) => add(f, pt))) {
+          if (!scatterInPolygon(polysOf(f.geometry), spacing, clip, seen, (pt) => add(f, pt), keep)) {
             break outer;
           }
           break;
@@ -531,14 +531,18 @@ export class GltfManager {
   }
 
   /**
-   * Grid cell size (mercator metres) per visible feature, thinned as a whole if
-   * the data would blow the instance budget.
+   * Spacing in real metres per visible feature, plus the fraction of
+   * candidates to keep if the data would blow the instance budget.
    *
-   * Thinning scales the spacing rather than truncating the output, so a forest
-   * stays evenly covered instead of ending in a straight edge halfway through.
-   * A doubling of spacing quarters the count, hence the square root.
+   * Thinning drops candidates and leaves the grid alone, so the models that
+   * survive keep the positions they would have had at full density. Widening
+   * the grid instead would move every single one whenever the viewport crossed
+   * the budget — the thing this whole placement scheme exists to avoid.
    */
-  private planCells(visible: RawFeature[], zoom: number): number[] {
+  private planCells(
+    visible: RawFeature[],
+    zoom: number,
+  ): { cells: number[]; keep: number } {
     const cells = new Array<number>(visible.length);
     let estimate = 0;
 
@@ -555,9 +559,9 @@ export class GltfManager {
         continue;
       }
       const spacing = Math.max(MIN_SPACING_M, this.config.spacing(zoom, f.props, f.id));
-      const lat = (f.bbox.south + f.bbox.north) / 2;
-      const cell = spacing * mercatorScale(lat);
-      cells[i] = cell;
+      cells[i] = spacing;
+      // Estimate only — the real grid is banded, this just sizes the budget.
+      const cell = spacing * mercatorScale((f.bbox.south + f.bbox.north) / 2);
       estimate +=
         mode === 'fill'
           ? (polygonArea(polysOf(f.geometry)) / (cell * cell)) * this.inView(f.bbox)
@@ -565,16 +569,16 @@ export class GltfManager {
     }
 
     const max = this.config.maxInstances;
-    if (estimate <= max) return cells;
+    if (estimate <= max) return { cells, keep: 1 };
 
-    const thin = Math.sqrt(estimate / max);
-    for (let i = 0; i < cells.length; i++) cells[i] *= thin;
+    const keep = max / estimate;
     this.warnOnce(
       'budget',
       `GltfLayer: ~${Math.round(estimate)} instances exceeds maxInstances (${max}) — ` +
-        `model-spacing thinned by ${thin.toFixed(1)}x for this view`,
+        `keeping ${(keep * 100).toFixed(0)}% of them; raise maxInstances or use a ` +
+        `zoom-driven model-spacing`,
     );
-    return cells;
+    return { cells, keep };
   }
 
   /** Fraction of a feature's bbox that the padded viewport covers (0..1). */
