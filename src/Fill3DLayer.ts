@@ -35,8 +35,8 @@ export interface Fill3DLayerOptions {
 }
 
 /**
- * `fill-3d`: a MapLibre custom layer that renders a z-encoded MVT source's type-0
- * 3D features as real meshes via three.js, draped onto the map's terrain.
+ * A MapLibre custom layer that renders maptoolkit's `buildings3d` vector source
+ * as full 3D building meshes, draped onto the map's terrain.
  *
  * `id`, `source` (a vector source id) and `source-layer` are required — missing
  * ones throw. Add the vector source first, then this layer:
@@ -44,8 +44,8 @@ export interface Fill3DLayerOptions {
  * ```js
  * map.setTerrain({ source: 'terrain' });
  * map.addSource('my-src', { type: 'vector', url: 'https://…/tiles.json?…' });
- * // a layer must consume the source so MapLibre fetches its tiles, e.g. a
- * // fill-extrusion on 'buildings2d'; Fill3DLayer reads the tiles it loads.
+ * // a normal style layer must consume the source so MapLibre loads its tiles,
+ * // e.g. a fill-extrusion on the 2D footprints in 'buildings2d'.
  * map.addLayer(new Fill3DLayer({
  *   id: 'fill-3d',
  *   source: 'my-src',

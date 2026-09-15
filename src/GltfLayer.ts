@@ -1,0 +1,310 @@
+import { LngLat } from 'maplibre-gl';
+import type { Map, CustomLayerInterface, CustomRenderMethodInput } from 'maplibre-gl';
+import * as THREE from 'three';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { GltfManager } from './GltfManager';
+import { compileColor, compileNumber, compileString, compileVec3 } from './expression';
+import type { StyleValue, Vec3 } from './expression';
+import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
+
+/** How a feature turns into models. `'auto'` picks by geometry type. */
+export type Placement = 'auto' | 'point' | 'line' | 'fill';
+
+/** Point features evaluate `['geometry-type']` as Point. */
+const POINT = 1 as const;
+
+const DEFAULT_LIGHTING = { ambient: 1.5, directional: 2.5, environment: 0.7 };
+
+/** Metres between generated instances when `model-spacing` is not given. */
+const DEFAULT_SPACING = 25;
+
+/**
+ * Instances per build before the layer thins itself out. The real cost is
+ * triangles x instances, so this default is sized for a ~1k-triangle model
+ * (~25M triangles). Raise it for very low-poly models, lower it for heavy ones.
+ */
+const DEFAULT_MAX_INSTANCES = 15000;
+
+const PLACEMENTS: readonly Placement[] = ['auto', 'point', 'line', 'fill'];
+
+export interface GltfLayerOptions {
+  /** Layer id (required). */
+  id: string;
+  /** Id of a source already added to the map (required) — `geojson` or `vector`. */
+  source: string;
+  /** Vector-tile layer to read within the source; required for vector sources. */
+  'source-layer'?: string;
+  /** Model id → glTF/glb URL (required, at least one). `layout['model-id']` picks. */
+  models: Record<string, string>;
+  /** MapLibre filter expression; features that fail are not rendered. */
+  filter?: FilterSpecification;
+  /** Hide the layer below this zoom. */
+  minzoom?: number;
+  /** Hide the layer at and above this zoom. */
+  maxzoom?: number;
+  /** raster-dem source id for elevation; defaults to the map's active terrain. */
+  terrainSourceId?: string;
+  /**
+   * Upper bound on instances per rebuild (default `15000`). Data denser than
+   * this is thinned by scaling `model-spacing` up, so coverage stays even.
+   * Budget by triangles: instances x the model's triangle count is the real cost.
+   */
+  maxInstances?: number;
+  /**
+   * Light magnitudes. Direction and colour come from the style's `light`
+   * property; these only scale it.
+   */
+  lighting?: {
+    /** Ambient fill light (default `1.5`). */
+    ambient?: number;
+    /** Directional sun light (default `2.5`). */
+    directional?: number;
+    /** Soft all-round light that glossy and metallic materials need (default `0.7`; `0` = off). */
+    environment?: number;
+  };
+  layout?: {
+    /** `'none'` hides the layer. */
+    visibility?: 'visible' | 'none';
+    /** Which entry of `models` a feature uses. Defaults to the only model. */
+    'model-id'?: StyleValue<string>;
+    /**
+     * How features become instances (default `'auto'`): one model per point,
+     * spaced along a line, or scattered inside a polygon. `'auto'` picks by
+     * geometry type, so one layer can serve all three. Constant per layer.
+     */
+    'model-placement'?: Placement;
+    /**
+     * Metres between generated instances on lines and in polygons (default
+     * `25`). Ignored for point placement. Data-driven and zoom-driven.
+     */
+    'model-spacing'?: StyleValue<number>;
+  };
+  paint?: {
+    /** Multiplied onto the model's own alpha. Constant, or a zoom/data expression. */
+    'model-opacity'?: StyleValue<number>;
+    /** Multiplied onto the model's own material colour (default: untinted). */
+    'model-color'?: StyleValue<string>;
+    /** Degrees around `[east, north, up]` — `[2]` is a compass heading. */
+    'model-rotation'?: StyleValue<Vec3> | unknown[];
+    /** Per-axis factor on the model's own size. */
+    'model-scale'?: StyleValue<Vec3> | unknown[];
+    /** Metres along `[east, north, up]`, applied after rotation/scale. */
+    'model-translation'?: StyleValue<Vec3> | unknown[];
+  };
+}
+
+/**
+ * A MapLibre custom layer that renders a source's features as glTF models,
+ * placed on the map's terrain: one model per point, models spaced along lines,
+ * or models scattered across polygons.
+ *
+ * Features come from a source already added to the map. A `geojson` source works
+ * on its own; a `vector` source additionally needs a normal style layer
+ * consuming it, so that MapLibre loads its tiles.
+ *
+ * ```js
+ * map.setTerrain({ source: 'terrain' });
+ * map.addSource('vehicles', { type: 'geojson', data: feed });
+ * map.addLayer(new GltfLayer({
+ *   id: 'vehicles-3d',
+ *   source: 'vehicles',
+ *   models: { bus: '/models/bus.glb', tram: '/models/tram.glb' },
+ *   filter: ['==', ['get', 'active'], true],
+ *   layout: { 'model-id': ['match', ['get', 'mode'], 'tram', 'tram', 'bus'] },
+ *   paint: {
+ *     'model-rotation': [0, 0, ['get', 'bearing']],
+ *     'model-scale': [1, 1, 1],
+ *     'model-opacity': ['interpolate', ['linear'], ['zoom'], 14, 0, 16, 1],
+ *   },
+ * }));
+ * ```
+ *
+ * Paint and layout values are evaluated per feature (its properties plus the
+ * current zoom) whenever the layer refreshes: when the map stops moving, and
+ * when the source's data changes. Custom layers have no `setPaintProperty`, so
+ * the options themselves are read once when the layer is added.
+ */
+export class GltfLayer implements CustomLayerInterface {
+  readonly id: string;
+  readonly type = 'custom' as const;
+  readonly renderingMode = '3d' as const;
+  readonly minzoom?: number;
+  readonly maxzoom?: number;
+
+  private readonly options: GltfLayerOptions;
+  private readonly visible: boolean;
+  private readonly placement: Placement;
+  private readonly lighting: Required<NonNullable<GltfLayerOptions['lighting']>>;
+
+  private map!: Map;
+  private camera!: THREE.Camera;
+  private scene!: THREE.Scene;
+  private renderer!: THREE.WebGLRenderer;
+  private ambient!: THREE.HemisphereLight;
+  private sun!: THREE.DirectionalLight;
+  private manager?: GltfManager;
+  private environmentDone = false;
+
+  // Reused every frame to avoid per-frame allocations.
+  private readonly mainMat = new THREE.Matrix4();
+  private readonly originMat = new THREE.Matrix4();
+  private readonly originScale = new THREE.Vector3();
+  private readonly sunColor = new THREE.Color();
+
+  constructor(options: GltfLayerOptions) {
+    if (!options?.id) throw new Error('GltfLayer: `id` is required');
+    if (!options.source) throw new Error('GltfLayer: `source` (a source id) is required');
+    if (!options.models || Object.keys(options.models).length === 0) {
+      throw new Error('GltfLayer: `models` must hold at least one { id: url } entry');
+    }
+
+    this.id = options.id;
+    this.minzoom = options.minzoom;
+    this.maxzoom = options.maxzoom;
+    this.options = options;
+    this.visible = options.layout?.visibility !== 'none';
+    this.lighting = { ...DEFAULT_LIGHTING, ...options.lighting };
+
+    const placement = options.layout?.['model-placement'] ?? 'auto';
+    if (!PLACEMENTS.includes(placement)) {
+      throw new Error(
+        `GltfLayer: model-placement must be one of ${PLACEMENTS.join(', ')} — got '${placement}'`,
+      );
+    }
+    this.placement = placement;
+  }
+
+  onAdd(map: Map, gl: WebGL2RenderingContext) {
+    this.map = map;
+    const terrainSourceId = this.options.terrainSourceId ?? map.getTerrain()?.source ?? '';
+
+    this.camera = new THREE.Camera();
+    this.scene = new THREE.Scene();
+    // three.js is y-up / z-toward-viewer; rotate + mirror so the scene frame is
+    // (x=east, y=up, z=north) to match maplibre. The two flips preserve winding
+    // (three flips the front face itself for negative-determinant matrices).
+    this.scene.rotateX(Math.PI / 2);
+    this.scene.scale.multiply(new THREE.Vector3(1, 1, -1));
+
+    // glTF ships PBR materials, so unlike fill-3d this layer uses real lights.
+    this.ambient = new THREE.HemisphereLight(0xffffff, 0x9a9a9a, this.lighting.ambient);
+    this.sun = new THREE.DirectionalLight(0xffffff, this.lighting.directional);
+    this.scene.add(this.ambient, this.sun, this.sun.target);
+
+    this.renderer = new THREE.WebGLRenderer({
+      canvas: map.getCanvas(),
+      context: gl,
+      antialias: true,
+    });
+    this.renderer.autoClear = false;
+
+    const paint = this.options.paint ?? {};
+    const layout = this.options.layout ?? {};
+    const modelIds = Object.keys(this.options.models);
+
+    this.manager = new GltfManager(
+      map,
+      this.scene,
+      LngLat.convert(map.getCenter()), // initial anchor; re-anchors itself on move
+      terrainSourceId,
+      {
+        sourceId: this.options.source,
+        sourceLayer: this.options['source-layer'],
+        filter: this.options.filter,
+        minzoom: this.options.minzoom,
+        maxzoom: this.options.maxzoom,
+        models: this.options.models,
+        // With a single model, `model-id` is redundant — default to it.
+        modelId: compileString(layout['model-id'], 'model-id', modelIds[0], POINT),
+        placement: this.placement,
+        spacing: compileNumber(layout['model-spacing'], 'model-spacing', DEFAULT_SPACING, POINT),
+        maxInstances: this.options.maxInstances ?? DEFAULT_MAX_INSTANCES,
+        rotation: compileVec3(paint['model-rotation'], 'model-rotation', [0, 0, 0], POINT),
+        scale: compileVec3(paint['model-scale'], 'model-scale', [1, 1, 1], POINT),
+        translation: compileVec3(paint['model-translation'], 'model-translation', [0, 0, 0], POINT),
+        color:
+          paint['model-color'] === undefined
+            ? undefined
+            : compileColor(paint['model-color'], 'model-color', [1, 1, 1, 1], POINT),
+        opacity:
+          paint['model-opacity'] === undefined
+            ? undefined
+            : compileNumber(paint['model-opacity'], 'model-opacity', 1, POINT),
+      },
+    );
+  }
+
+  render(_gl: WebGL2RenderingContext, args: CustomRenderMethodInput) {
+    if (!this.visible) return; // hidden → don't draw, don't keep repainting
+
+    // Fold the (re-anchored) scene origin into the camera projection so instance
+    // matrices stay in small local metres. Origin is at sea level; instances
+    // carry their absolute terrain elevation in Y.
+    const o = this.manager!.origin;
+    this.mainMat.fromArray(args.defaultProjectionData.mainMatrix as unknown as number[]);
+    this.originMat
+      .makeTranslation(o.x, o.y, o.z)
+      .scale(this.originScale.set(o.s, -o.s, o.s));
+    this.camera.projectionMatrix.multiplyMatrices(this.mainMat, this.originMat);
+
+    this.syncLight();
+    this.renderer.resetState();
+    // Built on the live context, so it has to happen inside a render tick —
+    // resetState() above already ran, and the render below re-syncs three's state.
+    if (!this.environmentDone) this.buildEnvironment();
+    this.renderer.render(this.scene, this.camera);
+    this.map.triggerRepaint();
+  }
+
+  /**
+   * Point the sun the way MapLibre's own `light` does (call each frame): the
+   * style position is spherical in (east, south, up), rotated by the bearing for
+   * anchor `viewport`, then mapped into our (east, up, north) frame → (x, z, -y).
+   */
+  private syncLight() {
+    const light = this.map.getLight() as {
+      anchor?: 'map' | 'viewport';
+      position?: [number, number, number];
+      color?: string;
+      intensity?: number;
+    };
+    const [r, az, polar] = light.position ?? [1.15, 210, 30];
+    const a = ((az + 90) * Math.PI) / 180;
+    const p = (polar * Math.PI) / 180;
+    let east = r * Math.cos(a) * Math.sin(p);
+    let south = r * Math.sin(a) * Math.sin(p);
+    const up = r * Math.cos(p);
+
+    if ((light.anchor ?? 'viewport') === 'viewport') {
+      const b = (this.map.getBearing() * Math.PI) / 180;
+      const c = Math.cos(b);
+      const s = Math.sin(b);
+      [east, south] = [east * c - south * s, east * s + south * c];
+    }
+
+    // DirectionalLight shines from its position toward its target (the origin).
+    this.sun.position.set(east, up, -south).normalize().multiplyScalar(1000);
+    this.sunColor.setStyle(light.color ?? '#ffffff', THREE.SRGBColorSpace);
+    this.sun.color.copy(this.sunColor);
+    this.ambient.color.copy(this.sunColor);
+  }
+
+  /** Synthetic IBL — without one, metallic glTF materials render near-black. */
+  private buildEnvironment() {
+    this.environmentDone = true;
+    if (this.lighting.environment <= 0) return;
+    const pmrem = new THREE.PMREMGenerator(this.renderer);
+    const room = new RoomEnvironment();
+    this.scene.environment = pmrem.fromScene(room, 0.04).texture;
+    this.scene.environmentIntensity = this.lighting.environment;
+    room.dispose();
+    pmrem.dispose();
+    this.renderer.resetState(); // PMREM rendered into the shared context
+  }
+
+  onRemove() {
+    this.manager?.dispose();
+    this.scene?.environment?.dispose();
+    this.renderer?.dispose();
+  }
+}

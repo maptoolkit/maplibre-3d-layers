@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>gltf · trees from vector tiles</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body, #map { margin: 0; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <!--
+    Demo host page: plants 3D trees on the maptoolkit basemap's own vegetation
+    data. No extra source is added — both layers read the style's `mtk` vector
+    source and just filter it differently:
+
+      poi_label / type=tree      -> Point       -> one model per tree
+      natural   / type=tree_row  -> LineString  -> models spaced along the line
+      natural   / type=wood      -> Polygon     -> models scattered in the area
+
+    The second layer leaves `model-placement` at 'auto', so the same layer
+    handles both the lines and the polygons.
+
+    Tree models: BabylonJS/Assets (CC-BY-4.0) — https://github.com/BabylonJS/Assets
+  -->
+  <script type="module">
+    import { Map } from 'maplibre-gl';
+    import 'maplibre-gl/dist/maplibre-gl.css';
+    import { GltfLayer } from '/src/index.ts';
+
+    const ASSETS = 'https://cdn.jsdelivr.net/gh/BabylonJS/Assets@8be9384c7f8728cb45d27975ac92a412f97a98dd/meshes/villagePack/';
+
+    const MODELS = {
+      leafy: ASSETS + 'tree1/tree1.glb',   // 1084 triangles, ~9.3 m
+      bushy: ASSETS + 'tree2/tree2.glb',   //  362 triangles, ~8.7 m
+    };
+
+    // Vary every tree off its feature id. For generated instances that id is
+    // synthesised from the world position, so it differs per tree and stays put
+    // across rebuilds — which is also why the style spec's missing random() is
+    // no problem here.
+    const SIZE = ['+', 0.7, ['/', ['%', ['id'], 9], 12]];   // 0.70 .. 1.37
+
+    const look = {
+      'model-scale': [SIZE, SIZE, SIZE],
+      'model-rotation': [0, 0, ['%', ['id'], 360]],
+      'model-opacity': ['interpolate', ['linear'], ['zoom'], 15, 0, 15.8, 1],
+    };
+
+    const map = window.map = new Map({
+      container: 'map',
+      center: [16.3980, 48.2010], // Prater, Vienna — forest, avenues, street trees
+      zoom: 16.4,
+      pitch: 68,
+      maxPitch: 85,
+      bearing: -28.5,
+      canvasContextAttributes: { antialias: true },
+      style: 'https://styles.maptoolkit.org/summer.json',
+      hash: true,
+    });
+
+    map.on('load', () => {
+      map.addSource('mtk-terrain', {
+        type: 'raster-dem',
+        url: 'https://tiles.maptoolkit.org/terrainrgb.json',
+        encoding: 'terrarium',
+        tileSize: 512,
+      });
+      map.setTerrain({ source: 'mtk-terrain', exaggeration: 1 });
+
+      // Single trees (natural=tree) — point placement, one model per feature.
+      map.addLayer(new GltfLayer({
+        id: 'trees-single',
+        source: 'mtk',
+        'source-layer': 'poi_label',
+        filter: ['==', ['get', 'type'], 'tree'],
+        minzoom: 15,
+        models: MODELS,
+        layout: { 'model-id': ['case', ['==', ['%', ['id'], 3], 0], 'bushy', 'leafy'] },
+        paint: look,
+      }));
+
+      // Tree rows (lines) and woods (polygons) in ONE layer: 'model-placement'
+      // stays 'auto', so each feature is handled by its geometry type.
+      map.addLayer(new GltfLayer({
+        id: 'trees-vegetation',
+        source: 'mtk',
+        'source-layer': 'natural',
+        filter: ['in', ['get', 'type'], ['literal', ['tree_row', 'wood']]],
+        minzoom: 15,
+        models: MODELS,
+        layout: {
+          'model-id': ['case', ['==', ['%', ['id'], 3], 0], 'bushy', 'leafy'],
+          // Metres. An avenue is planted tighter than a forest, and the forest
+          // thins out as you zoom away — a whole Wienerwald at 14 m would be
+          // ~80M triangles. Cost is triangles x instances, so spend them close up.
+          'model-spacing': 9,
+        },
+        paint: look,
+      }));
+    });
+  </script>
+</body>
+</html>
