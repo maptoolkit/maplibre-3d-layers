@@ -447,9 +447,10 @@ export class Fill3DManager {
     const attr = entry.geometry.getAttribute('position') as THREE.BufferAttribute;
     const pos = attr.array as Float32Array;
     const base = entry.positionBase;
+    const elevationAt = this.elevation.batch();
 
     for (const b of entry.features) {
-      const ele = this.elevation.get(new LngLat(b.lng, b.lat));
+      const ele = elevationAt(new LngLat(b.lng, b.lat));
       const end = b.start + b.count;
       for (let v = b.start; v < end; v++) {
         pos[v * 3 + 1] = base[v * 3 + 1] + ele;

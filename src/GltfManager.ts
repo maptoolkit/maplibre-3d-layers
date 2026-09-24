@@ -4,7 +4,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { featureFilter } from '@maplibre/maplibre-gl-style-spec';
 import type { FilterSpecification, GlobalProperties } from '@maplibre/maplibre-gl-style-spec';
-import { tileBounds } from './ElevationCache';
+import { createElevationSampler, tileBounds } from './ElevationCache';
 import type { GeoBounds } from './ElevationCache';
 import type { Evaluator, Rgba, Vec3 } from './expression';
 import type { Placement } from './GltfLayer';
@@ -639,11 +639,12 @@ export class GltfManager {
   /** (Re)compute a batch's instance matrices (and colours) against current terrain. */
   private writeInstances(batch: Batch, colors?: Rgba[], alphas?: number[]) {
     const n = batch.recs.length;
+    const elevationAt = createElevationSampler(this.map);
     for (let i = 0; i < n; i++) {
       const rec = batch.recs[i];
       // Sampled per build rather than cached: point features move, so a cache
       // keyed by position would grow without bound.
-      const ele = this.map.queryTerrainElevation(this.point(rec.lng, rec.lat)) ?? 0;
+      const ele = elevationAt(rec.lng, rec.lat);
       // Scene frame is (x=east, y=up, z=north); style vectors are [east, north, up].
       this.sPos.set(rec.east + rec.tr[0], ele + rec.tr[2], rec.north + rec.tr[1]);
       // rot = [around east, around north, around up]; order YXZ applies roll,

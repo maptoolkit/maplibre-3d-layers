@@ -6,6 +6,87 @@ interface Entry {
   elevation: number;
 }
 
+/** Terrain elevation (m) at a point. */
+export type ElevationSampler = (lng: number, lat: number) => number;
+
+/** The bits of MapLibre's (internal) `Terrain` the sampler needs. */
+interface TerrainInternals {
+  exaggeration: number;
+  tileManager: { minzoom: number; maxzoom: number };
+  /** MapLibre >= 6.6: the rendered DEM tiles, keyed `wrap/z/x/y`, highest zoom first. */
+  getCoverageIndex?: () => {
+    zooms: number[];
+    samplerPerTile: globalThis.Map<string, ((x: number, y: number, extent: number) => number) | null>;
+  } | null;
+  getElevationForLngLatZoom?: (lngLat: LngLat, zoom: number) => number;
+}
+
+const EXTENT = 8192;
+const MAX_TILE_COORD = EXTENT * (1 - 1e-12);
+
+/**
+ * Elevation lookup for many points under ONE camera state — the same result as
+ * `map.queryTerrainElevation`, without its per-call cost.
+ *
+ * MapLibre samples the rendered DEM tile when a point lies on one; otherwise
+ * (DEM not loaded yet, point off the rendered tiles, or always before 6.6) it
+ * runs `coveringTiles()` over the whole view on EVERY call. At high pitch that
+ * is ~0.5 ms — seconds for a few thousand trees. Here that fallback zoom is
+ * resolved once per sampler, so create one per pass and drop it afterwards.
+ *
+ * Mirrors MapLibre internals (`Terrain.getElevationForLngLat`); falls back to
+ * `queryTerrainElevation` when they are missing.
+ */
+export function createElevationSampler(map: Map): ElevationSampler {
+  const terrain = map.terrain as unknown as TerrainInternals | null | undefined;
+  if (!terrain) return () => 0;
+  const byZoom = terrain.getElevationForLngLatZoom?.bind(terrain);
+  if (!byZoom) return (lng, lat) => map.queryTerrainElevation([lng, lat]) ?? 0;
+
+  const index = terrain.getCoverageIndex?.() ?? null;
+  let fallbackZoom: number | undefined;
+
+  return (lng, lat) => {
+    if (index) {
+      const mx = (180 + lng) / 360;
+      const my = (180 - (180 / Math.PI) * Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360))) / 360;
+      if (my >= 0 && my < 1) {
+        const wrap = Math.floor(mx);
+        for (const z of index.zooms) {
+          const scale = 1 << z;
+          const sx = (mx - wrap) * scale;
+          const sy = my * scale;
+          const tx = Math.floor(sx);
+          const ty = Math.floor(sy);
+          const key = `${wrap}/${z}/${tx}/${ty}`;
+          if (!index.samplerPerTile.has(key)) continue;
+          const sample = index.samplerPerTile.get(key);
+          if (sample) {
+            return sample(
+              Math.min((sx - tx) * EXTENT, MAX_TILE_COORD),
+              Math.min((sy - ty) * EXTENT, MAX_TILE_COORD),
+              EXTENT,
+            ) * terrain.exaggeration;
+          }
+          break; // covered, but its DEM isn't loaded → fallback
+        }
+      }
+    }
+    if (fallbackZoom === undefined) {
+      fallbackZoom = 0;
+      for (const id of map.coveringTiles({
+        tileSize: 512,
+        minzoom: terrain.tileManager.minzoom,
+        maxzoom: terrain.tileManager.maxzoom,
+        terrain: map.terrain,
+      } as Parameters<Map['coveringTiles']>[0])) {
+        if (id.canonical.z > fallbackZoom) fallbackZoom = Math.min(id.canonical.z, terrain.tileManager.maxzoom);
+      }
+    }
+    return byZoom(new LngLat(lng, lat), fallbackZoom);
+  };
+}
+
 /**
  * Caches `map.queryTerrainElevation` results per sample point so the render loop
  * doesn't re-query every frame.
@@ -56,6 +137,24 @@ export class ElevationCache {
     const elevation = this.map.queryTerrainElevation(lngLat) ?? 0;
     this.entries.set(key, { lngLat, elevation });
     return elevation;
+  }
+
+  /**
+   * Like {@link get}, for many points in one synchronous pass: misses share one
+   * {@link createElevationSampler}. Drop the returned function after the pass.
+   */
+  batch(): (lngLat: LngLat) => number {
+    let sample: ElevationSampler | undefined;
+    return (lngLat) => {
+      const key = ElevationCache.key(lngLat.lng, lngLat.lat);
+      const hit = this.entries.get(key);
+      if (hit) return hit.elevation;
+
+      sample ??= createElevationSampler(this.map);
+      const elevation = sample(lngLat.lng, lngLat.lat);
+      this.entries.set(key, { lngLat, elevation });
+      return elevation;
+    };
   }
 
   /** Drop cached samples inside the given tile's bounds so they re-query. */
