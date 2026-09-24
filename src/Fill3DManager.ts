@@ -30,7 +30,12 @@ const FILL3D_VERTEX = /* glsl */ `
     vec3 base = color.rgb + 0.03; // MapLibre adds a small ambient
     // Our (east, up, north) frame is left-handed, so Newell normals come out
     // inward-facing — negate to get outward normals (roofs → up → lit like MapLibre).
-    float directional = clamp(dot(normalize(-normal), u_lightpos), 0.0, 1.0);
+    vec3 n = normalize(-normal);
+    // fill-extrusion's wall normals point INTO the building (perp of the edge in
+    // y-down tile space), so its walls are lit from the far side of the light.
+    // Mirror the horizontal part to match; roofs (pointing up) are unaffected.
+    n.xz = -n.xz;
+    float directional = clamp(dot(n, u_lightpos), 0.0, 1.0);
     directional = mix(1.0 - u_lightintensity, max(1.0 - luminance + u_lightintensity, 1.0), directional);
     vec3 lit = clamp(
       base * directional * u_lightcolor,
