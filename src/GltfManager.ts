@@ -69,6 +69,8 @@ export interface GltfConfig {
   spacing: Evaluator<number>;
   /** Full-density radius around the camera, in metres (`layout['model-thinning-distance']`). */
   thinningDistance: Evaluator<number>;
+  /** Metres from the camera beyond which models draw as billboards (`layout['model-impostor-distance']`). */
+  impostorDistance: Evaluator<number>;
   /** Upper bound on instances per build; denser data is thinned to fit. */
   maxInstances: number;
   /** Override the models' `doubleSided` flag; undefined keeps it. */
@@ -116,7 +118,60 @@ interface ModelEntry {
   url: string;
   state: 'loading' | 'ready' | 'error';
   protos: Proto[];
+  /** An impostor's baked texture (its only proto is the billboard quad). */
+  target?: THREE.WebGLRenderTarget;
 }
+
+/** Light for baking impostors, in the bake frame (x=east, y=up, z=toward the viewer). */
+export interface ImpostorLight {
+  direction: THREE.Vector3;
+  color: THREE.Color;
+  ambient: number;
+  directional: number;
+  environment: THREE.Texture | null;
+  environmentIntensity: number;
+}
+
+/** Key of a model's impostor in `models` — can't collide with a user model id. */
+const impostorKey = (modelId: string) => `\u0000impostor:${modelId}`;
+
+/** Impostor texture width in pixels; the height follows the model's aspect. */
+const IMPOSTOR_RES = 128;
+
+// The bake is cleared to transparent black, so edge texels (and every mip
+// level) hold colour x coverage. Undo that, or distant, heavily minified
+// impostors darken toward black.
+const IMPOSTOR_MAP_FRAGMENT = /* glsl */ `
+#include <map_fragment>
+#ifdef USE_MAP
+  diffuseColor.rgb /= max( sampledDiffuseColor.a, 0.0001 );
+#endif
+`;
+
+/** Degrees above the horizon that impostors are baked from. */
+const IMPOSTOR_ELEVATION = 20;
+
+// Cylindrical billboard: the quad turns about the vertical axis to face the
+// camera (mtkRight = the view's horizontal right vector, in the instance frame)
+// and keeps its base on the ground. Only the instance's position and per-axis
+// scale are used, so the instance matrix can stay the full-model one.
+const IMPOSTOR_PARS_VERTEX = /* glsl */ `
+uniform vec3 mtkRight;
+#include <common>
+`;
+const IMPOSTOR_PROJECT_VERTEX = /* glsl */ `
+vec4 mvPosition = vec4( transformed, 1.0 );
+#ifdef USE_INSTANCING
+  mvPosition = vec4(
+    instanceMatrix[ 3 ].xyz
+      + mtkRight * transformed.x * length( instanceMatrix[ 0 ].xyz )
+      + vec3( 0.0, transformed.y * length( instanceMatrix[ 1 ].xyz ), 0.0 ),
+    1.0
+  );
+#endif
+mvPosition = modelViewMatrix * mvPosition;
+gl_Position = projectionMatrix * mvPosition;
+`;
 
 /**
  * A source feature kept in its ORIGINAL geometry. Expansion into instances
@@ -228,6 +283,8 @@ export class GltfManager {
   private readonly warned = new Set<string>();
   /** glTF files share one material across meshes — patch each exactly once. */
   private readonly patched = new WeakSet<THREE.Material>();
+  /** View's horizontal right vector in the instance frame, shared by all impostor shaders. */
+  private readonly impostorRight = { value: new THREE.Vector3(1, 0, 0) };
   /** The distance-thinning scale the last build fitted; seeds the next one's cutoff. */
   private lastThinScale = 1;
   /** Whether a material was transparent as authored (e.g. glTF alphaMode BLEND). */
@@ -455,6 +512,9 @@ export class GltfManager {
     const thin = this.config.thinningDistance(zoom, {});
     const cam = Number.isFinite(thin) && thin > 0 ? cameraGround(this.map) : undefined;
     const maxMerc = cam ? thin * (1 + THIN_HALVINGS) * cam.s : Infinity;
+    // `model-impostor-distance`: beyond it, draw the model's billboard instead.
+    const impostorDistance = this.config.impostorDistance(zoom, {});
+    const impostorCam = Number.isFinite(impostorDistance) ? (cam ?? cameraGround(this.map)) : undefined;
     if (cam) {
       const nw = new MercatorCoordinate(cam.x - maxMerc, cam.y - maxMerc).toLngLat();
       const se = new MercatorCoordinate(cam.x + maxMerc, cam.y + maxMerc).toLngLat();
@@ -526,10 +586,16 @@ export class GltfManager {
       }
       if (model.state !== 'ready') return true; // rebuilds once it has loaded
 
-      let g = groups.get(modelId);
+      // Far away, the impostor (once baked) stands in for the model.
+      const far =
+        impostorCam !== undefined &&
+        Math.hypot(x - impostorCam.x, y - impostorCam.y) / impostorCam.s >= impostorDistance;
+      const key = far && this.models.get(impostorKey(modelId))?.state === 'ready' ? impostorKey(modelId) : modelId;
+
+      let g = groups.get(key);
       if (!g) {
         groups.set(
-          modelId,
+          key,
           (g = {
             recs: [],
             colors: this.config.color ? [] : undefined,
@@ -846,6 +912,147 @@ export class GltfManager {
     return protos;
   }
 
+  // ---------------------------------------------------------------- impostors
+
+  /** Face the impostors toward a camera with this bearing (degrees, call each frame). */
+  setViewBearing(bearing: number) {
+    const b = (bearing * Math.PI) / 180;
+    // Viewer looks along (sin b, cos b) in (east, north); its right is (cos b, -sin b).
+    this.impostorRight.value.set(Math.cos(b), 0, -Math.sin(b));
+  }
+
+  /** Whether a loaded model still lacks its impostor (bake inside a render tick). */
+  needsImpostors(): boolean {
+    if (!Number.isFinite(this.config.impostorDistance(this.map.getZoom(), {}))) return false;
+    for (const [id, model] of this.models) {
+      if (model.state === 'ready' && !id.startsWith('\u0000') && !this.models.has(impostorKey(id))) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Render each loaded model once, from the side, into a small texture and
+   * register a billboard quad showing it as the model's impostor. Uses the
+   * renderer's live context — call from the layer's render(), then resetState().
+   */
+  bakeImpostors(renderer: THREE.WebGLRenderer, light: ImpostorLight) {
+    for (const [id, model] of [...this.models]) {
+      if (model.state !== 'ready' || id.startsWith('\u0000') || this.models.has(impostorKey(id))) continue;
+      this.models.set(impostorKey(id), this.bakeImpostor(renderer, model, light));
+    }
+    this.schedule(false, true); // far instances can switch over now
+  }
+
+  private bakeImpostor(renderer: THREE.WebGLRenderer, model: ModelEntry, light: ImpostorLight): ModelEntry {
+    // Bake frame: x=east, y=up, z=south — so a default camera (looking down -z)
+    // looks north, with east to its right, like a map at bearing 0.
+    const scene = new THREE.Scene();
+    const group = new THREE.Group();
+    group.scale.set(1, 1, -1);
+    scene.add(group);
+
+    const box = new THREE.Box3();
+    const clones: THREE.Material[] = [];
+    for (const proto of model.protos) {
+      // Plain copies: the instancing patch isn't copied, and nothing fades here.
+      const own = Array.isArray(proto.material) ? proto.material : [proto.material];
+      const copies = own.map((m) => {
+        const c = m.clone();
+        if (c.defines) delete c.defines.MTK_INSTANCE_ALPHA;
+        c.transparent = this.ownTransparent.get(m) ?? false;
+        clones.push(c);
+        return c;
+      });
+      const mesh = new THREE.Mesh(proto.geometry, Array.isArray(proto.material) ? copies : copies[0]);
+      mesh.matrixAutoUpdate = false;
+      mesh.matrix.copy(proto.matrix);
+      group.add(mesh);
+      proto.geometry.computeBoundingBox();
+      box.union(proto.geometry.boundingBox!.clone().applyMatrix4(proto.matrix));
+    }
+
+    // Seen slightly from above, like a pitched map sees its distant models.
+    // Square footprint: instances turn about the vertical axis, so the
+    // silhouette can have any horizontal extent of the model.
+    const center = box.getCenter(new THREE.Vector3());
+    const half = Math.max(box.max.x - box.min.x, box.max.z - box.min.z) / 2 || 0.5;
+    const e = (IMPOSTOR_ELEVATION * Math.PI) / 180;
+    const radius = half * 2 + (box.max.y - box.min.y) + 10;
+    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, radius * 2);
+    camera.position.set(center.x, center.y + Math.sin(e) * radius, Math.cos(e) * radius);
+    camera.lookAt(center.x, center.y, 0);
+    camera.updateMatrixWorld();
+    // Frame the footprint cylinder (as a box) plus full height, in view space.
+    const view = new THREE.Box3();
+    const corner = new THREE.Vector3();
+    for (const cx of [center.x - half, center.x + half]) {
+      for (const cy of [box.min.y, box.max.y]) {
+        for (const cz of [-half, half]) {
+          view.expandByPoint(corner.set(cx, cy, cz).applyMatrix4(camera.matrixWorldInverse));
+        }
+      }
+    }
+    camera.left = view.min.x;
+    camera.right = view.max.x;
+    camera.bottom = view.min.y;
+    camera.top = view.max.y;
+    camera.updateProjectionMatrix();
+    const width = view.max.x - view.min.x;
+    const height = view.max.y - view.min.y;
+    // Where the model's base (its origin) lands in the image, from the bottom.
+    const baseY = new THREE.Vector3(center.x, 0, 0).applyMatrix4(camera.matrixWorldInverse).y - view.min.y;
+
+    scene.add(new THREE.HemisphereLight(light.color, 0x9a9a9a, light.ambient));
+    const sun = new THREE.DirectionalLight(light.color, light.directional);
+    sun.position.copy(light.direction).normalize().multiplyScalar(1000);
+    scene.add(sun, sun.target);
+    scene.environment = light.environment;
+    scene.environmentIntensity = light.environmentIntensity;
+
+    const target = new THREE.WebGLRenderTarget(
+      IMPOSTOR_RES,
+      Math.max(1, Math.round((IMPOSTOR_RES * height) / width)),
+      { samples: 4, colorSpace: THREE.LinearSRGBColorSpace },
+    );
+    target.texture.generateMipmaps = true;
+    target.texture.minFilter = THREE.LinearMipmapLinearFilter;
+    const clearColor = renderer.getClearColor(new THREE.Color());
+    const clearAlpha = renderer.getClearAlpha();
+    renderer.setRenderTarget(target);
+    renderer.setClearColor(0x000000, 0);
+    renderer.clear();
+    renderer.render(scene, camera);
+    renderer.setRenderTarget(null);
+    renderer.setClearColor(clearColor, clearAlpha);
+    for (const c of clones) c.dispose();
+
+    // The quad: image-sized, the model's origin on the ground, facing the viewer.
+    const geometry = new THREE.PlaneGeometry(width, height);
+    geometry.translate(center.x, height / 2 - baseY, 0);
+    const material = new THREE.MeshBasicMaterial({ map: target.texture, alphaTest: 0.5 });
+    material.alphaToCoverage = true; // soft edges with the map's MSAA
+    material.onBeforeCompile = (shader) => {
+      shader.uniforms.mtkRight = this.impostorRight;
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', IMPOSTOR_PARS_VERTEX)
+        .replace('#include <project_vertex>', IMPOSTOR_PROJECT_VERTEX);
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <map_fragment>',
+        IMPOSTOR_MAP_FRAGMENT,
+      );
+    };
+    this.patchMaterial(material); // per-instance colour/alpha, on top of the billboard
+    material.side = THREE.DoubleSide; // the quad turns; never cull it
+    material.customProgramCacheKey = () => `mtk-impostor-${this.config.opacity ? 'a' : ''}`;
+
+    return {
+      url: model.url,
+      state: 'ready',
+      protos: [{ geometry, material, matrix: new THREE.Matrix4() }],
+      target,
+    };
+  }
+
   /**
    * Blend only while some instance is below full opacity (e.g. a zoom fade-in).
    * Opaque drawing lets the depth test skip hidden models' fragments, which in
@@ -916,6 +1123,7 @@ export class GltfManager {
           m.dispose();
         }
       }
+      model.target?.dispose();
     }
     this.models.clear();
     this.scene.remove(this.group);

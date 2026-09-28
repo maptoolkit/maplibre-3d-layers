@@ -229,6 +229,7 @@ map.addLayer(new GltfLayer({
 | `layout['model-id']` | — | which entry of `models` a feature uses; defaults to the only model |
 | `layout['model-placement']` | — | `'auto'` (default) / `'point'` / `'line'` / `'fill'`, see [Placement](#placement) |
 | `layout['model-spacing']` | — | metres between models on lines and in polygons (default `25`) |
+| `layout['model-impostor-distance']` | — | metres from the camera beyond which models draw as billboards (default: off), see [Density and budget](#density-and-budget) |
 | `layout['model-thinning-distance']` | — | metres from the camera with full density; beyond, density halves every further such distance (default: off), see [Density and budget](#density-and-budget) |
 | `paint['model-scale']` | — | `[x, y, z]` factor on the model's own size (default `[1,1,1]`) |
 | `paint['model-rotation']` | — | `[x, y, z]` degrees around `[east, north, up]`; `z` is a compass heading |
@@ -351,6 +352,20 @@ models keep their full density, beyond it the density halves every further
 
 Models outside the frame are never placed (only a margin at the sides and
 bottom), so the budget goes to what is on screen.
+
+Far away a model is only a few pixels tall, yet drawing its full mesh there is
+where most of the GPU time goes. `model-impostor-distance` swaps it for a
+billboard beyond that distance: each model is rendered once, slightly from
+above, into a small texture, and distant instances show it on a camera-facing
+quad of two triangles. In a dense forest at 72° pitch that took 20k trees from
+30 to 60 fps on a MacBook Air:
+
+```js
+'model-impostor-distance': ['interpolate', ['exponential', 0.5], ['zoom'], 15, 1600, 18, 200],
+```
+
+Billboards keep instance colour and opacity, but not view-dependent shading
+(gloss, reflections) — keep the distance where models are ~20–30 px tall.
 
 ### Data sources
 

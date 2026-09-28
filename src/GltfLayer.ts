@@ -3,6 +3,7 @@ import type { Map, CustomLayerInterface, CustomRenderMethodInput } from 'maplibr
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { GltfManager } from './GltfManager';
+import type { ImpostorLight } from './GltfManager';
 import { compileColor, compileNumber, compileString, compileVec3 } from './expression';
 import type { StyleValue, Vec3 } from './expression';
 import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
@@ -93,6 +94,14 @@ export interface GltfLayerOptions {
      * data-driven.
      */
     'model-thinning-distance'?: StyleValue<number>;
+    /**
+     * Metres from the camera's ground position beyond which models draw as
+     * billboards (default: off). Each model is rendered once from the side into
+     * a small texture; far instances show it on a camera-facing quad of two
+     * triangles instead of the full mesh — a few pixels tall at that distance,
+     * but otherwise the bulk of the cost. Zoom-driven, not data-driven.
+     */
+    'model-impostor-distance'?: StyleValue<number>;
   };
   paint?: {
     /** Multiplied onto the model's own alpha. Constant, or a zoom/data expression. */
@@ -234,6 +243,7 @@ export class GltfLayer implements CustomLayerInterface {
         placement: this.placement,
         spacing: compileNumber(layout['model-spacing'], 'model-spacing', DEFAULT_SPACING, POINT),
         thinningDistance: compileNumber(layout['model-thinning-distance'], 'model-thinning-distance', Infinity, POINT),
+        impostorDistance: compileNumber(layout['model-impostor-distance'], 'model-impostor-distance', Infinity, POINT),
         maxInstances: this.options.maxInstances ?? DEFAULT_MAX_INSTANCES,
         doubleSided: this.options.doubleSided,
         rotation: compileVec3(paint['model-rotation'], 'model-rotation', [0, 0, 0], POINT),
@@ -269,6 +279,12 @@ export class GltfLayer implements CustomLayerInterface {
     // Built on the live context, so it has to happen inside a render tick —
     // resetState() above already ran, and the render below re-syncs three's state.
     if (!this.environmentDone) this.buildEnvironment();
+    // Same for impostors, which also want the environment built above.
+    if (this.manager!.needsImpostors()) {
+      this.manager!.bakeImpostors(this.renderer, this.impostorLight());
+      this.renderer.resetState();
+    }
+    this.manager!.setViewBearing(this.map.getBearing());
     this.renderer.render(this.scene, this.camera);
     // No triggerRepaint() here: that re-renders the map every frame even when
     // nothing changes. Builds, model loads and DEM updates request their own.
@@ -305,6 +321,30 @@ export class GltfLayer implements CustomLayerInterface {
     this.sunColor.setStyle(light.color ?? '#ffffff', THREE.SRGBColorSpace);
     this.sun.color.copy(this.sunColor);
     this.ambient.color.copy(this.sunColor);
+  }
+
+  /**
+   * The style light as the viewer sees it, for baking impostors. With anchor
+   * `viewport` it stays put relative to the camera, so a bake from the camera's
+   * side matches at any bearing; the bake frame is (east, up, toward viewer).
+   */
+  private impostorLight(): ImpostorLight {
+    const light = this.map.getLight() as { position?: [number, number, number] };
+    const [r, az, polar] = light.position ?? [1.15, 210, 30];
+    const a = ((az + 90) * Math.PI) / 180;
+    const p = (polar * Math.PI) / 180;
+    return {
+      direction: new THREE.Vector3(
+        r * Math.cos(a) * Math.sin(p), // east
+        r * Math.cos(p), // up
+        r * Math.sin(a) * Math.sin(p), // south = toward the viewer
+      ),
+      color: this.sunColor.clone(),
+      ambient: this.lighting.ambient,
+      directional: this.lighting.directional,
+      environment: this.scene.environment,
+      environmentIntensity: this.scene.environmentIntensity,
+    };
   }
 
   /** Synthetic IBL — without one, metallic glTF materials render near-black. */
