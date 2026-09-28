@@ -21,7 +21,9 @@ for (const file of files) {
 let stripped = 0;
 for (const file of keep) {
   const source = await readFile(join(DIST, file), 'utf8');
-  const cleaned = source.replace(/[ \t]*\/\*\*[\s\S]*?\*\/\n(?=[ \t]*private\s)/g, () => {
+  // The comment body must not contain `*/`: a lazy `[\s\S]*?` would start at the
+  // first doc comment in the file and swallow everything up to the next private.
+  const cleaned = source.replace(/[ \t]*\/\*\*(?:(?!\*\/)[\s\S])*\*\/\n(?=[ \t]*private\s)/g, () => {
     stripped++;
     return '';
   });
