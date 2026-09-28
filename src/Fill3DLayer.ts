@@ -75,7 +75,6 @@ export class Fill3DLayer implements CustomLayerInterface {
   private readonly opacityEval: ReturnType<typeof compileOpacity>;
   private readonly transparent: boolean;
 
-  private map!: Map;
   private camera!: THREE.Camera;
   private scene!: THREE.Scene;
   private renderer!: THREE.WebGLRenderer;
@@ -107,7 +106,6 @@ export class Fill3DLayer implements CustomLayerInterface {
   }
 
   onAdd(map: Map, gl: WebGL2RenderingContext) {
-    this.map = map;
     // Use the explicit terrain source, else the map's active terrain, else none.
     const terrainSourceId = this.terrainSourceIdOption ?? map.getTerrain()?.source ?? '';
 
@@ -167,7 +165,8 @@ export class Fill3DLayer implements CustomLayerInterface {
     this.renderer.render(this.scene, this.camera);
     this.manager!.setPass('color');
     this.renderer.render(this.scene, this.camera);
-    this.map.triggerRepaint();
+    // No triggerRepaint() here: that re-renders the map every frame even when
+    // nothing changes. Tile loads and DEM rebakes request their own.
   }
 
   onRemove() {

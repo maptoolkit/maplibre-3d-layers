@@ -223,11 +223,13 @@ map.addLayer(new GltfLayer({
 | `minzoom` / `maxzoom` | — | hidden below `minzoom` and at/above `maxzoom`; outside the range the layer costs nothing |
 | `maxInstances` | — | instance budget (default `15000`); denser data is thinned out, see [Density and budget](#density-and-budget) |
 | `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's active terrain |
+| `doubleSided` | — | `false` draws front faces only (cheaper for closed models), `true` both; default: as authored in the glTF |
 | `lighting` | — | `{ ambient, directional, environment }`, see [Lighting](#lighting) |
 | `layout.visibility` | — | `'visible'` (default) / `'none'` |
 | `layout['model-id']` | — | which entry of `models` a feature uses; defaults to the only model |
 | `layout['model-placement']` | — | `'auto'` (default) / `'point'` / `'line'` / `'fill'`, see [Placement](#placement) |
 | `layout['model-spacing']` | — | metres between models on lines and in polygons (default `25`) |
+| `layout['model-thinning-distance']` | — | metres from the camera with full density; beyond, density halves every further such distance (default: off), see [Density and budget](#density-and-budget) |
 | `paint['model-scale']` | — | `[x, y, z]` factor on the model's own size (default `[1,1,1]`) |
 | `paint['model-rotation']` | — | `[x, y, z]` degrees around `[east, north, up]`; `z` is a compass heading |
 | `paint['model-translation']` | — | `[x, y, z]` metres along `[east, north, up]` (default `[0,0,0]`) |
@@ -334,6 +336,21 @@ the models and warns once. The ones that remain sit exactly where they would hav
 at full density, so crossing the budget — by zooming, or by resizing the window —
 adds and removes models instead of rearranging them. Coverage stays even; the
 area is never cut off halfway.
+
+That share applies to the whole view, foreground included. A strongly pitched
+map sees up to the horizon, so tilting it spreads the budget over kilometres of
+distant, pixel-sized trees and thins out the ones right in front of the camera.
+`model-thinning-distance` fixes that: up to that many metres from the camera
+models keep their full density, beyond it the density halves every further
+`model-thinning-distance` metres — no hard edge. If the view still exceeds
+`maxInstances`, that distance shrinks, so the far models go first:
+
+```js
+'model-thinning-distance': ['interpolate', ['exponential', 0.5], ['zoom'], 15, 5000, 18, 625],
+```
+
+Models outside the frame are never placed (only a margin at the sides and
+bottom), so the budget goes to what is on screen.
 
 ### Data sources
 

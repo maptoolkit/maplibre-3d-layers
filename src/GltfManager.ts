@@ -9,6 +9,7 @@ import type { GeoBounds } from './ElevationCache';
 import type { Evaluator, Rgba, Vec3 } from './expression';
 import type { Placement } from './GltfLayer';
 import {
+  hash32,
   lineLength,
   mercatorScale,
   placeAlongLine,
@@ -24,6 +25,14 @@ const D2R = Math.PI / 180;
 
 /** Viewport padding (fraction of the view size) when culling source features. */
 const CULL_PAD = 0.25;
+
+/**
+ * Screen margin (fraction of the size) for the on-screen test, so panning and
+ * rotating don't pop models at the edges. None at the top: on a pitched map
+ * the top edge already looks toward the horizon, and a margin there reaches
+ * kilometres further — it held ~40% of the models in a 60° test view.
+ */
+const FRAME_PAD = 0.1;
 
 /** Smallest instance capacity to allocate — avoids churn on tiny feature sets. */
 const MIN_CAPACITY = 16;
@@ -54,8 +63,12 @@ export interface GltfConfig {
   placement: Placement;
   /** Metres between generated instances (`layout['model-spacing']`). */
   spacing: Evaluator<number>;
+  /** Full-density radius around the camera, in metres (`layout['model-thinning-distance']`). */
+  thinningDistance: Evaluator<number>;
   /** Upper bound on instances per build; denser data is thinned to fit. */
   maxInstances: number;
+  /** Override the models' `doubleSided` flag; undefined keeps it. */
+  doubleSided?: boolean;
   /** Layer is hidden below this zoom (MapLibre semantics). */
   minzoom?: number;
   /** Layer is hidden at and above this zoom (MapLibre semantics). */
@@ -67,6 +80,12 @@ const MIN_SPACING_M = 1;
 
 /** Safety net if the pre-pass estimate was too optimistic. */
 const HARD_STOP_FACTOR = 1.2;
+
+/** Beyond this many halvings (density < 1/256) distance thinning places nothing. */
+const THIN_HALVINGS = 8;
+
+/** Collect up to this many x `maxInstances` candidates before selecting. */
+const CANDIDATE_FACTOR = 20;
 
 /** Scene anchor in mercator + the metric at its latitude. */
 export interface SceneOrigin {
@@ -199,6 +218,8 @@ export class GltfManager {
   private readonly warned = new Set<string>();
   /** glTF files share one material across meshes — patch each exactly once. */
   private readonly patched = new WeakSet<THREE.Material>();
+  /** Whether a material was transparent as authored (e.g. glTF alphaMode BLEND). */
+  private readonly ownTransparent = new WeakMap<THREE.Material, boolean>();
 
   /** Cached source features; re-read on source data, re-culled on move. */
   private features: RawFeature[] = [];
@@ -401,7 +422,24 @@ export class GltfManager {
     const om = MercatorCoordinate.fromLngLat(this.map.getCenter(), 0);
     this.origin = { x: om.x, y: om.y, z: om.z, s: om.meterInMercatorCoordinateUnits() };
 
-    const view = paddedBounds(this.map);
+    let view = paddedBounds(this.map);
+    // `model-thinning-distance`: full density up to it, halving every further
+    // `thin` metres. Candidates are collected first and selected at the end, so
+    // an over-budget view shrinks that distance instead of thinning everything.
+    // The view is clipped to where density has fallen below ~1/256.
+    const thin = this.config.thinningDistance(zoom, {});
+    const cam = Number.isFinite(thin) && thin > 0 ? cameraGround(this.map) : undefined;
+    if (cam) {
+      const maxMerc = thin * (1 + THIN_HALVINGS) * cam.s;
+      const nw = new MercatorCoordinate(cam.x - maxMerc, cam.y - maxMerc).toLngLat();
+      const se = new MercatorCoordinate(cam.x + maxMerc, cam.y + maxMerc).toLngLat();
+      view = {
+        west: Math.max(view.west, nw.lng),
+        east: Math.min(view.east, se.lng),
+        north: Math.min(view.north, nw.lat),
+        south: Math.max(view.south, se.lat),
+      };
+    }
     const clip: MercBounds = {
       minX: toMercX(view.west),
       minY: toMercY(view.south),
@@ -410,16 +448,30 @@ export class GltfManager {
     };
 
     const visible = this.features.filter((f) => overlaps(view, f.bbox));
-    const { cells, keep } = this.planCells(visible, zoom);
+    // The budget is enforced on the collected on-screen candidates at the end;
+    // the bbox-based pre-thinning only guards against runaway candidate counts.
+    const max = this.config.maxInstances;
+    const budget = max * CANDIDATE_FACTOR;
+    const { cells, keep } = this.planCells(visible, zoom, view, budget);
+    const inFrame = frameTest(this.map, FRAME_PAD);
 
     // One position grid for the whole build: it resolves duplicates between
     // overlapping tile pieces AND between features that place on the same spot.
     const seen = new Set<number>();
     const limit = Math.round(this.config.maxInstances * HARD_STOP_FACTOR);
     let placed = 0;
+    const candidates: { f: RawFeature; point: PlacedPoint; fm: MercatorCoordinate; d: number }[] = [];
 
     const groups = new globalThis.Map<string, { recs: Rec[]; colors?: Rgba[]; alphas?: number[] }>();
     const add = (f: RawFeature, point: PlacedPoint): boolean => {
+      const fm = MercatorCoordinate.fromLngLat(this.point(point.lng, point.lat), 0);
+      // A pitched, rotated view's lng/lat bbox is mostly off-screen — don't
+      // spend the budget there.
+      if (inFrame && !inFrame(fm.x, fm.y)) return true;
+      candidates.push({ f, point, fm, d: cam ? Math.hypot(fm.x - cam.x, fm.y - cam.y) / cam.s : 0 });
+      return candidates.length < budget;
+    };
+    const place = (f: RawFeature, point: PlacedPoint, fm: MercatorCoordinate): boolean => {
       const id = point.id;
       const modelId = this.config.modelId(zoom, f.props, id);
       const model = this.models.get(modelId);
@@ -443,7 +495,6 @@ export class GltfManager {
           }),
         );
       }
-      const fm = MercatorCoordinate.fromLngLat(this.point(point.lng, point.lat), 0);
       g.recs.push({
         lng: point.lng,
         lat: point.lat,
@@ -487,9 +538,33 @@ export class GltfManager {
       }
     }
 
+    if (candidates.length) {
+      // Survival is decided by a hash of the position, so the models that remain
+      // sit where they would at full density and never flicker between rebuilds.
+      // Over budget: with distance thinning its distance shrinks (far models go
+      // first), without it every candidate gets the same share.
+      const u = candidates.map((c) => hash32(c.point.id | 0, 0x51ed) / 4294967296);
+      const scale = cam ? fitThinning(candidates, u, thin, max) : 1;
+      const share = cam ? 1 : Math.min(1, max / candidates.length);
+      if (share < 1) {
+        this.warnOnce(
+          'budget',
+          `GltfLayer: ${candidates.length} instances in view exceed maxInstances (${max}) — ` +
+            `keeping ${(share * 100).toFixed(0)}% of them; raise maxInstances, use a ` +
+            `zoom-driven model-spacing or set model-thinning-distance`,
+        );
+      }
+      for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i];
+        if (u[i] >= (cam ? thinningWeight(c.d, thin * scale) : share)) continue;
+        if (!place(c.f, c.point, c.fm)) break;
+      }
+    }
+
     for (const [modelId, batch] of this.batches) {
       if (!groups.has(modelId)) this.disposeBatch(modelId, batch);
     }
+    this.setFading([...groups.values()].some((g) => g.alphas?.some((a) => a < 1)));
     for (const [modelId, g] of groups) {
       const batch = this.batchFor(modelId, g.recs.length);
       batch.recs = g.recs;
@@ -542,6 +617,8 @@ export class GltfManager {
   private planCells(
     visible: RawFeature[],
     zoom: number,
+    view: GeoBounds,
+    max: number,
   ): { cells: number[]; keep: number } {
     const cells = new Array<number>(visible.length);
     let estimate = 0;
@@ -564,31 +641,19 @@ export class GltfManager {
       const cell = spacing * mercatorScale((f.bbox.south + f.bbox.north) / 2);
       estimate +=
         mode === 'fill'
-          ? (polygonArea(polysOf(f.geometry)) / (cell * cell)) * this.inView(f.bbox)
+          ? (polygonArea(polysOf(f.geometry)) / (cell * cell)) * inView(f.bbox, view)
           : lineLength(linesOf(f.geometry)) / cell;
     }
 
-    const max = this.config.maxInstances;
     if (estimate <= max) return { cells, keep: 1 };
 
     const keep = max / estimate;
     this.warnOnce(
-      'budget',
-      `GltfLayer: ~${Math.round(estimate)} instances exceeds maxInstances (${max}) — ` +
-        `keeping ${(keep * 100).toFixed(0)}% of them; raise maxInstances or use a ` +
-        `zoom-driven model-spacing`,
+      'candidates',
+      `GltfLayer: ~${Math.round(estimate)} candidate instances around the view — ` +
+        `pre-thinning to ${(keep * 100).toFixed(0)}%; use a zoom-driven model-spacing`,
     );
     return { cells, keep };
-  }
-
-  /** Fraction of a feature's bbox that the padded viewport covers (0..1). */
-  private inView(bbox: GeoBounds): number {
-    const view = paddedBounds(this.map);
-    const w = Math.min(bbox.east, view.east) - Math.max(bbox.west, view.west);
-    const h = Math.min(bbox.north, view.north) - Math.max(bbox.south, view.south);
-    if (w <= 0 || h <= 0) return 0;
-    const full = (bbox.east - bbox.west) * (bbox.north - bbox.south);
-    return full > 0 ? Math.min(1, (w * h) / full) : 1;
   }
 
   /** An existing batch if its buffers still fit, else a freshly sized one. */
@@ -731,13 +796,37 @@ export class GltfManager {
     return protos;
   }
 
+  /**
+   * Blend only while some instance is below full opacity (e.g. a zoom fade-in).
+   * Opaque drawing lets the depth test skip hidden models' fragments, which in
+   * a dense, low-angle forest is most of them.
+   */
+  private setFading(fading: boolean) {
+    for (const model of this.models.values()) {
+      for (const proto of model.protos) {
+        const materials = Array.isArray(proto.material) ? proto.material : [proto.material];
+        for (const m of materials) {
+          const transparent = fading || (this.ownTransparent.get(m) ?? false);
+          if (m.transparent === transparent) continue;
+          m.transparent = transparent;
+          m.needsUpdate = true;
+        }
+      }
+    }
+  }
+
   /** Make a stock three material honour `instanceColor` and our `instanceAlpha`. */
   private patchMaterial(material: THREE.Material) {
     if (this.patched.has(material)) return; // shared by several meshes
     this.patched.add(material);
+    this.ownTransparent.set(material, material.transparent);
+    if (this.config.doubleSided !== undefined) {
+      material.side = this.config.doubleSided ? THREE.DoubleSide : THREE.FrontSide;
+    }
     if (this.config.opacity) {
       material.defines = { ...material.defines, MTK_INSTANCE_ALPHA: '' };
-      material.transparent = true;
+      // Transparency is switched on per build, only while some instance is
+      // actually below full opacity (see setFading) — blending costs a lot.
       // Solid objects with a uniform alpha read better with depth writes on —
       // without them every back face of the model shows through.
       material.depthWrite = true;
@@ -886,6 +975,82 @@ function paddedBounds(map: Map): GeoBounds {
     south: b.getSouth() - dLat,
     north: b.getNorth() + dLat,
   };
+}
+
+/** Share of models kept at `d` metres: 1 up to `full`, then halving every `full`. */
+function thinningWeight(d: number, full: number): number {
+  return d <= full ? 1 : 2 ** (-(d - full) / full);
+}
+
+/**
+ * Largest factor (<= 1) on the full-density distance that keeps the survivors
+ * within `max` — so an over-budget view loses its far models first.
+ */
+function fitThinning(cands: { d: number }[], u: number[], full: number, max: number): number {
+  const count = (scale: number) => {
+    let n = 0;
+    for (let i = 0; i < cands.length; i++) if (u[i] < thinningWeight(cands[i].d, full * scale)) n++;
+    return n;
+  };
+  if (count(1) <= max) return 1;
+  let lo = 0;
+  let hi = 1;
+  for (let i = 0; i < 16; i++) {
+    const mid = (lo + hi) / 2;
+    if (count(mid) <= max) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * Is a mercator point within the screen, grown by `pad` of its size at the
+ * sides and bottom (not the top, see FRAME_PAD)?
+ * Projects onto flat ground at the centre's elevation (terrain relief only
+ * shifts points a little, which the padding absorbs), with MapLibre's
+ * (internal) pixel matrix; undefined when that isn't available.
+ */
+function frameTest(map: Map, pad: number): ((x: number, y: number) => boolean) | undefined {
+  type T = { worldSize: number; width: number; height: number; elevation?: number;
+    _pixelMatrix?: ArrayLike<number>; _pixelMatrix3D?: ArrayLike<number> };
+  const m = map as unknown as { transform?: T; _camera?: { transform?: T } };
+  const t = m.transform ?? m._camera?.transform;
+  const M = map.terrain ? t?._pixelMatrix3D : t?._pixelMatrix;
+  if (!t || !M || !t.worldSize) return undefined;
+  const z = map.terrain ? (t.elevation ?? 0) : 0;
+  const ws = t.worldSize;
+  const px = t.width * pad;
+  const py = t.height * pad;
+  return (x, y) => {
+    const X = x * ws;
+    const Y = y * ws;
+    const w = M[3] * X + M[7] * Y + M[11] * z + M[15];
+    if (w <= 0) return false; // behind the camera
+    const sx = (M[0] * X + M[4] * Y + M[8] * z + M[12]) / w;
+    const sy = (M[1] * X + M[5] * Y + M[9] * z + M[13]) / w;
+    return sx >= -px && sx <= t.width + px && sy >= 0 && sy <= t.height + py;
+  };
+}
+
+/** Fraction of a feature's bbox that the (clipped, padded) view covers (0..1). */
+function inView(bbox: GeoBounds, view: GeoBounds): number {
+  const w = Math.min(bbox.east, view.east) - Math.max(bbox.west, view.west);
+  const h = Math.min(bbox.north, view.north) - Math.max(bbox.south, view.south);
+  if (w <= 0 || h <= 0) return 0;
+  const full = (bbox.east - bbox.west) * (bbox.north - bbox.south);
+  return full > 0 ? Math.min(1, (w * h) / full) : 1;
+}
+
+/**
+ * The camera's ground position in mercator units, plus mercator units per metre
+ * there. Reads MapLibre's (internal) transform; falls back to the map centre.
+ */
+function cameraGround(map: Map): { x: number; y: number; s: number } {
+  type T = { getCameraLngLat?: () => LngLat };
+  const m = map as unknown as { transform?: T; _camera?: { transform?: T } };
+  const lngLat = (m.transform ?? m._camera?.transform)?.getCameraLngLat?.() ?? map.getCenter();
+  const c = MercatorCoordinate.fromLngLat(lngLat, 0);
+  return { x: c.x, y: c.y, s: c.meterInMercatorCoordinateUnits() };
 }
 
 function recBounds(recs: Rec[]): GeoBounds {

@@ -51,6 +51,13 @@ export interface GltfLayerOptions {
    */
   maxInstances?: number;
   /**
+   * Override the models' own `doubleSided` flag: `false` draws front faces only
+   * (cheaper — back faces of closed models are hidden anyway), `true` both.
+   * Default: as authored in the glTF. Keep it for models with open, single-sheet
+   * faces such as leaf cards.
+   */
+  doubleSided?: boolean;
+  /**
    * Light magnitudes. Direction and colour come from the style's `light`
    * property; these only scale it.
    */
@@ -78,6 +85,14 @@ export interface GltfLayerOptions {
      * `25`). Ignored for point placement. Data-driven and zoom-driven.
      */
     'model-spacing'?: StyleValue<number>;
+    /**
+     * Metres from the camera's ground position up to which instances are placed
+     * at full density (default: off). Beyond it, density halves every further
+     * `model-thinning-distance` metres, and when `maxInstances` is exceeded this
+     * distance shrinks instead of thinning the foreground. Zoom-driven, not
+     * data-driven.
+     */
+    'model-thinning-distance'?: StyleValue<number>;
   };
   paint?: {
     /** Multiplied onto the model's own alpha. Constant, or a zoom/data expression. */
@@ -218,7 +233,9 @@ export class GltfLayer implements CustomLayerInterface {
         modelId: compileString(layout['model-id'], 'model-id', modelIds[0], POINT),
         placement: this.placement,
         spacing: compileNumber(layout['model-spacing'], 'model-spacing', DEFAULT_SPACING, POINT),
+        thinningDistance: compileNumber(layout['model-thinning-distance'], 'model-thinning-distance', Infinity, POINT),
         maxInstances: this.options.maxInstances ?? DEFAULT_MAX_INSTANCES,
+        doubleSided: this.options.doubleSided,
         rotation: compileVec3(paint['model-rotation'], 'model-rotation', [0, 0, 0], POINT),
         scale: compileVec3(paint['model-scale'], 'model-scale', [1, 1, 1], POINT),
         translation: compileVec3(paint['model-translation'], 'model-translation', [0, 0, 0], POINT),
@@ -253,7 +270,8 @@ export class GltfLayer implements CustomLayerInterface {
     // resetState() above already ran, and the render below re-syncs three's state.
     if (!this.environmentDone) this.buildEnvironment();
     this.renderer.render(this.scene, this.camera);
-    this.map.triggerRepaint();
+    // No triggerRepaint() here: that re-renders the map every frame even when
+    // nothing changes. Builds, model loads and DEM updates request their own.
   }
 
   /**
