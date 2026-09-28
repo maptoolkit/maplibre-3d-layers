@@ -1,5 +1,5 @@
 import { LngLat, MercatorCoordinate } from 'maplibre-gl';
-import type { LngLatLike, Map } from 'maplibre-gl';
+import type { Map } from 'maplibre-gl';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { featureFilter } from '@maplibre/maplibre-gl-style-spec';
@@ -9,6 +9,8 @@ import type { GeoBounds } from './ElevationCache';
 import type { Evaluator, Rgba, Vec3 } from './expression';
 import type { Placement } from './GltfLayer';
 import {
+  fromUnitX,
+  fromUnitY,
   hash32,
   lineLength,
   mercatorScale,
@@ -18,8 +20,10 @@ import {
   scatterInPolygon,
   toMercX,
   toMercY,
+  unitX,
+  unitY,
 } from './placement';
-import type { MercBounds, PlacedPoint } from './placement';
+import type { Accept, MercBounds, PlacedPoint, RowSpan } from './placement';
 
 const D2R = Math.PI / 180;
 
@@ -81,8 +85,14 @@ const MIN_SPACING_M = 1;
 /** Safety net if the pre-pass estimate was too optimistic. */
 const HARD_STOP_FACTOR = 1.2;
 
-/** Beyond this many halvings (density < 1/256) distance thinning places nothing. */
-const THIN_HALVINGS = 8;
+/** Beyond this many halvings (density < 1/64) distance thinning places nothing. */
+const THIN_HALVINGS = 6;
+
+/** Quiet time (ms) after the last source tile before a data-driven rebuild. */
+const DATA_SETTLE_MS = 150;
+
+/** Headroom on the last build's thinning scale when pre-filtering candidates. */
+const THIN_HINT_SLACK = 1.5;
 
 /** Collect up to this many x `maxInstances` candidates before selecting. */
 const CANDIDATE_FACTOR = 20;
@@ -218,6 +228,8 @@ export class GltfManager {
   private readonly warned = new Set<string>();
   /** glTF files share one material across meshes — patch each exactly once. */
   private readonly patched = new WeakSet<THREE.Material>();
+  /** The distance-thinning scale the last build fitted; seeds the next one's cutoff. */
+  private lastThinScale = 1;
   /** Whether a material was transparent as authored (e.g. glTF alphaMode BLEND). */
   private readonly ownTransparent = new WeakMap<THREE.Material, boolean>();
 
@@ -232,6 +244,7 @@ export class GltfManager {
   private needsBuild = false;
   private pendingDemRegions: GeoBounds[] = [];
   private rafId?: number;
+  private settleTimer?: ReturnType<typeof setTimeout>;
   private disposed = false;
 
   // Scratch objects reused while writing instance matrices.
@@ -242,8 +255,6 @@ export class GltfManager {
   private readonly sBase = new THREE.Matrix4();
   private readonly sMat = new THREE.Matrix4();
   private readonly sColor = new THREE.Color();
-  /** Mutable LngLatLike reused for terrain/mercator lookups. */
-  private readonly sPoint = { lng: 0, lat: 0 } as LngLatLike & { lng: number; lat: number };
 
   constructor(
     map: Map,
@@ -280,7 +291,7 @@ export class GltfManager {
         this.pendingDemRegions.push(tileBounds(c.x, c.y, c.z));
         this.schedule();
       } else if (e.sourceId === this.config.sourceId) {
-        this.refresh();
+        this.refreshSoon();
       }
     };
     // A whole-dataset source only needs re-culling when the view moves; a tiled
@@ -290,6 +301,20 @@ export class GltfManager {
     map.on('moveend', this.onMoveEnd);
 
     this.refresh();
+  }
+
+  /**
+   * Refresh for new source data. Tiles arrive spread over many frames, and a
+   * rebuild per tile costs about as much as one for all of them — so let a
+   * burst settle first, and don't rebuild mid-move (moveend refreshes anyway).
+   */
+  private refreshSoon() {
+    if (this.disposed) return;
+    if (this.settleTimer !== undefined) clearTimeout(this.settleTimer);
+    this.settleTimer = setTimeout(() => {
+      this.settleTimer = undefined;
+      if (!this.map.isMoving()) this.refresh();
+    }, DATA_SETTLE_MS);
   }
 
   /** Re-read the source and rebuild all instances (coalesced to one frame). */
@@ -426,11 +451,11 @@ export class GltfManager {
     // `model-thinning-distance`: full density up to it, halving every further
     // `thin` metres. Candidates are collected first and selected at the end, so
     // an over-budget view shrinks that distance instead of thinning everything.
-    // The view is clipped to where density has fallen below ~1/256.
+    // The view is clipped to where density has fallen below ~1/64.
     const thin = this.config.thinningDistance(zoom, {});
     const cam = Number.isFinite(thin) && thin > 0 ? cameraGround(this.map) : undefined;
+    const maxMerc = cam ? thin * (1 + THIN_HALVINGS) * cam.s : Infinity;
     if (cam) {
-      const maxMerc = thin * (1 + THIN_HALVINGS) * cam.s;
       const nw = new MercatorCoordinate(cam.x - maxMerc, cam.y - maxMerc).toLngLat();
       const se = new MercatorCoordinate(cam.x + maxMerc, cam.y + maxMerc).toLngLat();
       view = {
@@ -454,24 +479,41 @@ export class GltfManager {
     const budget = max * CANDIDATE_FACTOR;
     const { cells, keep } = this.planCells(visible, zoom, view, budget);
     const inFrame = frameTest(this.map, FRAME_PAD);
+    // Scan only the grid cells where the screen meets the ground.
+    const rowSpan = frameGround(this.map, FRAME_PAD, cam, maxMerc);
+    // Candidates whose survival scale reaches `cutoff` are vetoed before they
+    // are built — most of a distant forest. The fitted scale never exceeds 1,
+    // and it rarely moves much between builds, so start from the last one; if
+    // that proves too tight (fewer candidates than the budget) the collection
+    // reruns with 1. Either way the selected models are the same.
+    let cutoff = cam ? Math.min(1, this.lastThinScale * THIN_HINT_SLACK) : 1;
+    const accept: Accept | undefined = cam
+      ? (px, py, id) =>
+          survivalScale(Math.hypot(unitX(px) - cam.x, unitY(py) - cam.y) / cam.s, thin, id) < cutoff
+      : undefined;
 
     // One position grid for the whole build: it resolves duplicates between
     // overlapping tile pieces AND between features that place on the same spot.
     const seen = new Set<number>();
     const limit = Math.round(this.config.maxInstances * HARD_STOP_FACTOR);
     let placed = 0;
-    const candidates: { f: RawFeature; point: PlacedPoint; fm: MercatorCoordinate; d: number }[] = [];
+    // Per candidate: `need` is the smallest factor on the thinning distance at
+    // which it survives (0 without distance thinning); see survivalScale().
+    const candidates: { f: RawFeature; point: PlacedPoint; x: number; y: number; need: number }[] = [];
 
     const groups = new globalThis.Map<string, { recs: Rec[]; colors?: Rgba[]; alphas?: number[] }>();
     const add = (f: RawFeature, point: PlacedPoint): boolean => {
-      const fm = MercatorCoordinate.fromLngLat(this.point(point.lng, point.lat), 0);
+      const x = point.x !== undefined ? unitX(point.x) : mercX(point.lng);
+      const y = point.y !== undefined ? unitY(point.y) : mercY(point.lat);
       // A pitched, rotated view's lng/lat bbox is mostly off-screen — don't
       // spend the budget there.
-      if (inFrame && !inFrame(fm.x, fm.y)) return true;
-      candidates.push({ f, point, fm, d: cam ? Math.hypot(fm.x - cam.x, fm.y - cam.y) / cam.s : 0 });
+      if (inFrame && !inFrame(x, y)) return true;
+      const need = cam ? survivalScale(Math.hypot(x - cam.x, y - cam.y) / cam.s, thin, point.id) : 0;
+      if (need >= cutoff) return true;
+      candidates.push({ f, point, x, y, need });
       return candidates.length < budget;
     };
-    const place = (f: RawFeature, point: PlacedPoint, fm: MercatorCoordinate): boolean => {
+    const place = (f: RawFeature, point: PlacedPoint, x: number, y: number): boolean => {
       const id = point.id;
       const modelId = this.config.modelId(zoom, f.props, id);
       const model = this.models.get(modelId);
@@ -498,8 +540,8 @@ export class GltfManager {
       g.recs.push({
         lng: point.lng,
         lat: point.lat,
-        east: (fm.x - this.origin.x) / this.origin.s,
-        north: (this.origin.y - fm.y) / this.origin.s,
+        east: (x - this.origin.x) / this.origin.s,
+        north: (this.origin.y - y) / this.origin.s,
         rot: [...this.config.rotation(zoom, f.props, id)] as Vec3,
         scl: [...this.config.scale(zoom, f.props, id)] as Vec3,
         tr: [...this.config.translation(zoom, f.props, id)] as Vec3,
@@ -509,33 +551,42 @@ export class GltfManager {
       return ++placed < limit;
     };
 
-    outer: for (let i = 0; i < visible.length; i++) {
-      const f = visible[i];
-      const spacing = cells[i];
-      switch (this.placementFor(f)) {
-        case 'point':
-          for (const [lng, lat] of pointsOf(f.geometry)) {
-            // Points keep their SOURCE id, so `['id']` still addresses the OSM
-            // feature; generated instances get a synthetic one instead.
-            const key = positionKey(toMercX(lng), toMercY(lat));
-            if (seen.has(key)) continue;
-            seen.add(key);
-            if (!add(f, { lng, lat, id: f.id as number })) break outer;
-          }
-          break;
-        case 'line':
-          if (!placeAlongLine(linesOf(f.geometry), spacing, clip, seen, (pt) => add(f, pt))) {
-            break outer;
-          }
-          break;
-        case 'fill':
-          if (!scatterInPolygon(polysOf(f.geometry), spacing, clip, seen, (pt) => add(f, pt), keep)) {
-            break outer;
-          }
-          break;
-        default:
-          break;
+    const collect = () => {
+      seen.clear();
+      candidates.length = 0;
+      outer: for (let i = 0; i < visible.length; i++) {
+        const f = visible[i];
+        const spacing = cells[i];
+        switch (this.placementFor(f)) {
+          case 'point':
+            for (const [lng, lat] of pointsOf(f.geometry)) {
+              // Points keep their SOURCE id, so `['id']` still addresses the OSM
+              // feature; generated instances get a synthetic one instead.
+              const key = positionKey(toMercX(lng), toMercY(lat));
+              if (seen.has(key)) continue;
+              seen.add(key);
+              if (!add(f, { lng, lat, id: f.id as number })) break outer;
+            }
+            break;
+          case 'line':
+            if (!placeAlongLine(linesOf(f.geometry), spacing, clip, seen, (pt) => add(f, pt))) {
+              break outer;
+            }
+            break;
+          case 'fill':
+            if (!scatterInPolygon(polysOf(f.geometry), spacing, clip, seen, (pt) => add(f, pt), keep, rowSpan, accept)) {
+              break outer;
+            }
+            break;
+          default:
+            break;
+        }
       }
+    };
+    collect();
+    if (cutoff < 1 && candidates.length <= max) {
+      cutoff = 1;
+      collect();
     }
 
     if (candidates.length) {
@@ -543,8 +594,8 @@ export class GltfManager {
       // sit where they would at full density and never flicker between rebuilds.
       // Over budget: with distance thinning its distance shrinks (far models go
       // first), without it every candidate gets the same share.
-      const u = candidates.map((c) => hash32(c.point.id | 0, 0x51ed) / 4294967296);
-      const scale = cam ? fitThinning(candidates, u, thin, max) : 1;
+      const scale = cam ? fitThinning(candidates, max) : 1;
+      if (cam) this.lastThinScale = scale;
       const share = cam ? 1 : Math.min(1, max / candidates.length);
       if (share < 1) {
         this.warnOnce(
@@ -554,10 +605,9 @@ export class GltfManager {
             `zoom-driven model-spacing or set model-thinning-distance`,
         );
       }
-      for (let i = 0; i < candidates.length; i++) {
-        const c = candidates[i];
-        if (u[i] >= (cam ? thinningWeight(c.d, thin * scale) : share)) continue;
-        if (!place(c.f, c.point, c.fm)) break;
+      for (const c of candidates) {
+        if (cam ? c.need >= scale : survivalHash(c.point.id) >= share) continue;
+        if (!place(c.f, c.point, c.x, c.y)) break;
       }
     }
 
@@ -845,12 +895,6 @@ export class GltfManager {
     material.needsUpdate = true;
   }
 
-  private point(lng: number, lat: number): LngLatLike {
-    this.sPoint.lng = lng;
-    this.sPoint.lat = lat;
-    return this.sPoint;
-  }
-
   private warnOnce(key: string, ...message: unknown[]) {
     if (this.warned.has(key)) return;
     this.warned.add(key);
@@ -863,6 +907,7 @@ export class GltfManager {
     this.map.off('data', this.onData);
     this.map.off('moveend', this.onMoveEnd);
     if (this.rafId !== undefined) cancelAnimationFrame(this.rafId);
+    if (this.settleTimer !== undefined) clearTimeout(this.settleTimer);
     for (const [modelId, batch] of this.batches) this.disposeBatch(modelId, batch);
     for (const model of this.models.values()) {
       for (const proto of model.protos) {
@@ -977,30 +1022,45 @@ function paddedBounds(map: Map): GeoBounds {
   };
 }
 
-/** Share of models kept at `d` metres: 1 up to `full`, then halving every `full`. */
-function thinningWeight(d: number, full: number): number {
-  return d <= full ? 1 : 2 ** (-(d - full) / full);
+/** Stable pseudo-random 0..1 per instance: decides which ones a thinning keeps. */
+function survivalHash(id: number): number {
+  return hash32(id | 0, 0x51ed) / 4294967296;
+}
+
+/**
+ * Distance thinning keeps a model at `d` metres with probability 1 up to
+ * `full`, then 2^-((d - full) / full). With a stable u = survivalHash(id) that
+ * is: kept iff u < 2^(1 - d / full), i.e. iff the full-density distance is at
+ * least d / (1 - log2 u). Returned as a factor on `full`: the model survives
+ * every scale above this value.
+ */
+function survivalScale(d: number, full: number, id: number): number {
+  return d / (full * (1 - Math.log2(survivalHash(id))));
 }
 
 /**
  * Largest factor (<= 1) on the full-density distance that keeps the survivors
- * within `max` — so an over-budget view loses its far models first.
+ * within `max` — so an over-budget view loses its far models first. Exact: the
+ * max-th smallest survival scale.
  */
-function fitThinning(cands: { d: number }[], u: number[], full: number, max: number): number {
-  const count = (scale: number) => {
-    let n = 0;
-    for (let i = 0; i < cands.length; i++) if (u[i] < thinningWeight(cands[i].d, full * scale)) n++;
-    return n;
-  };
-  if (count(1) <= max) return 1;
-  let lo = 0;
-  let hi = 1;
-  for (let i = 0; i < 16; i++) {
-    const mid = (lo + hi) / 2;
-    if (count(mid) <= max) lo = mid;
-    else hi = mid;
-  }
-  return lo;
+function fitThinning(cands: { need: number }[], max: number): number {
+  let within = 0;
+  for (const c of cands) if (c.need < 1) within++;
+  if (within <= max) return 1;
+  const needs = new Float64Array(cands.length);
+  for (let i = 0; i < cands.length; i++) needs[i] = cands[i].need;
+  needs.sort();
+  return needs[max];
+}
+
+/** Web-mercator x (0..1) of a longitude — same as MercatorCoordinate.fromLngLat. */
+function mercX(lng: number): number {
+  return (180 + lng) / 360;
+}
+
+/** Web-mercator y (0..1) of a latitude — same as MercatorCoordinate.fromLngLat. */
+function mercY(lat: number): number {
+  return (180 - (180 / Math.PI) * Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360))) / 360;
 }
 
 /**
@@ -1029,6 +1089,95 @@ function frameTest(map: Map, pad: number): ((x: number, y: number) => boolean) |
     const sx = (M[0] * X + M[4] * Y + M[8] * z + M[12]) / w;
     const sy = (M[1] * X + M[5] * Y + M[9] * z + M[13]) / w;
     return sx >= -px && sx <= t.width + px && sy >= 0 && sy <= t.height + py;
+  };
+}
+
+/**
+ * Where the screen meets flat ground at the centre's elevation, as a row
+ * pre-filter for grid placement: the screen corners (margin as in frameTest)
+ * are cast as rays onto that plane. Rays above the horizon, and ground more
+ * than `maxUnits` (mercator units) from the camera, end at that distance.
+ * Undefined when MapLibre's internals are missing, or the view reaches the
+ * horizon with no distance limit.
+ */
+function frameGround(
+  map: Map,
+  pad: number,
+  cam: { x: number; y: number } | undefined,
+  maxUnits: number,
+): RowSpan | undefined {
+  type T = { worldSize: number; width: number; height: number; elevation?: number;
+    _pixelMatrix?: ArrayLike<number>; _pixelMatrix3D?: ArrayLike<number> };
+  const m = map as unknown as { transform?: T; _camera?: { transform?: T } };
+  const t = m.transform ?? m._camera?.transform;
+  const M = map.terrain ? t?._pixelMatrix3D : t?._pixelMatrix;
+  if (!t || !M || !t.worldSize) return undefined;
+  const inv = new THREE.Matrix4().fromArray(Array.from(M)).invert();
+  const z = map.terrain ? (t.elevation ?? 0) : 0;
+  const ws = t.worldSize;
+  const a = new THREE.Vector4();
+  const b = new THREE.Vector4();
+
+  // Ground point (mercator units) under screen pixel (sx, sy), or undefined.
+  const cast = (sx: number, sy: number): [number, number] | undefined => {
+    a.set(sx, sy, 0, 1).applyMatrix4(inv).divideScalar(a.w);
+    b.set(sx, sy, 1, 1).applyMatrix4(inv).divideScalar(b.w);
+    const dirX = (b.x - a.x) / ws;
+    const dirY = (b.y - a.y) / ws;
+    const k = b.z !== a.z ? (z - a.z) / (b.z - a.z) : NaN;
+    const gx = (a.x + (b.x - a.x) * k) / ws;
+    const gy = (a.y + (b.y - a.y) * k) / ws;
+    const hit = Number.isFinite(k) && M[3] * gx * ws + M[7] * gy * ws + M[11] * z + M[15] > 0;
+    if (!cam) return hit ? [gx, gy] : undefined;
+    // Limit to maxUnits from the camera — along the ray's heading if it misses.
+    let dx = hit ? gx - cam.x : dirX;
+    let dy = hit ? gy - cam.y : dirY;
+    const len = Math.hypot(dx, dy);
+    if (!(len > 0)) return undefined;
+    if (!hit || len > maxUnits) {
+      dx *= maxUnits / len;
+      dy *= maxUnits / len;
+    }
+    return [cam.x + dx, cam.y + dy];
+  };
+
+  const px = t.width * pad;
+  const py = t.height * pad;
+  const corners = [
+    cast(-px, t.height + py),
+    cast(t.width + px, t.height + py),
+    cast(t.width + px, 0),
+    cast(-px, 0),
+  ];
+  if (corners.some((c) => !c)) return undefined;
+  const poly = (corners as [number, number][]).map(([x, y]) => [fromUnitX(x), fromUnitY(y)]);
+
+  // x-range of the (convex) quad within the slab y0..y1: its edges clipped to it.
+  return (y0, y1) => {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let i = 0; i < poly.length; i++) {
+      const [ax, ay] = poly[i];
+      const [bx, by] = poly[(i + 1) % poly.length];
+      let t0 = 0;
+      let t1 = 1;
+      const dy = by - ay;
+      if (dy === 0) {
+        if (ay < y0 || ay > y1) continue;
+      } else {
+        let ta = (y0 - ay) / dy;
+        let tb = (y1 - ay) / dy;
+        if (ta > tb) [ta, tb] = [tb, ta];
+        t0 = Math.max(0, ta);
+        t1 = Math.min(1, tb);
+        if (t0 > t1) continue;
+      }
+      const xa = ax + (bx - ax) * t0;
+      const xb = ax + (bx - ax) * t1;
+      lo = Math.min(lo, xa, xb);
+      hi = Math.max(hi, xa, xb);
+    }
+    return lo <= hi ? [lo, hi] : null;
   };
 }
 

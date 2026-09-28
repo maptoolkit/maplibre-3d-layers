@@ -28,6 +28,9 @@ export interface PlacedPoint {
   lat: number;
   /** Synthetic feature id: stable, and distinct per generated instance. */
   id: number;
+  /** The same position in mercator metres, when the placer already has it. */
+  x?: number;
+  y?: number;
 }
 
 /** Clip rectangle in mercator metres. */
@@ -40,6 +43,20 @@ export interface MercBounds {
 
 /** Receives each placed point; return `false` to stop placing (budget spent). */
 export type Emit = (point: PlacedPoint) => boolean;
+
+/**
+ * Optional narrowing of a grid row: the mercator x-range worth scanning within
+ * the slab `y0..y1` (e.g. where the screen meets the ground), or null to skip
+ * the row. Only a pre-filter — emitted points are still tested one by one.
+ */
+export type RowSpan = (y0: number, y1: number) => readonly [number, number] | null;
+
+/**
+ * Optional cheap veto before a grid point is built (mercator metres + its
+ * synthetic id). Must be deterministic per position, so overlapping tile
+ * pieces agree — a vetoed position is simply never placed.
+ */
+export type Accept = (x: number, y: number, id: number) => boolean;
 
 /**
  * Fraction of candidates to keep, 0..1. Thinning DROPS candidates instead of
@@ -60,6 +77,11 @@ export const toMercY = (lat: number): number =>
 export const fromMercX = (x: number): number => x / R / D2R;
 export const fromMercY = (y: number): number =>
   (2 * Math.atan(Math.exp(y / R)) - Math.PI / 2) / D2R;
+/** Mercator metres → MapLibre's 0..1 mercator units (y grows southward), and back. */
+export const unitX = (x: number): number => 0.5 + x / (2 * Math.PI * R);
+export const unitY = (y: number): number => 0.5 - y / (2 * Math.PI * R);
+export const fromUnitX = (u: number): number => (u - 0.5) * 2 * Math.PI * R;
+export const fromUnitY = (u: number): number => (0.5 - u) * 2 * Math.PI * R;
 
 /** Mercator metres per real metre at a latitude. */
 export function mercatorScale(lat: number): number {
@@ -114,14 +136,16 @@ export function positionKey(mercX: number, mercY: number): number {
   return Math.round(mercX * QUANT) * KEY_STRIDE + Math.round(mercY * QUANT);
 }
 
-/** Emit one point unless its 0.5 m cell was already taken. */
-function emitAt(px: number, py: number, seen: Set<number>, emit: Emit): boolean {
+/** Emit one point unless its 0.5 m cell was already taken (or `accept` vetoes it). */
+function emitAt(px: number, py: number, seen: Set<number>, emit: Emit, accept?: Accept): boolean {
   const qx = Math.round(px * QUANT);
   const qy = Math.round(py * QUANT);
+  const id = hash32(qx, qy);
+  if (accept && !accept(px, py, id)) return true;
   const key = qx * KEY_STRIDE + qy;
   if (seen.has(key)) return true; // duplicate from an overlapping tile piece
   seen.add(key);
-  return emit({ lng: fromMercX(px), lat: fromMercY(py), id: hash32(qx, qy) });
+  return emit({ lng: fromMercX(px), lat: fromMercY(py), id, x: px, y: py });
 }
 
 // --------------------------------------------------------------------- line
@@ -194,6 +218,8 @@ export function scatterInPolygon(
   seen: Set<number>,
   emit: Emit,
   keep: Keep = 1,
+  rowSpan?: RowSpan,
+  accept?: Accept,
 ): boolean {
   const crossings: number[] = [];
 
@@ -222,6 +248,11 @@ export function scatterInPolygon(
 
       for (let n = from; n <= to; n++) {
         const rowY = start + (n + 0.5) * cell;
+        // Jitter can move a point anywhere within its cell: widen by one cell.
+        const span = rowSpan ? rowSpan(start + n * cell, start + (n + 1) * cell) : null;
+        if (rowSpan && !span) continue;
+        const spanMin = span ? span[0] - cell : clip.minX;
+        const spanMax = span ? span[1] + cell : clip.maxX;
         crossings.length = 0;
         for (const ring of merc) {
           for (let i = 0, k = ring.length - 2; i < ring.length; k = i, i += 2) {
@@ -236,8 +267,8 @@ export function scatterInPolygon(
 
         const row = hash32(b, n);
         for (let c = 0; c + 1 < crossings.length; c += 2) {
-          const x0 = Math.max(crossings[c], clip.minX);
-          const x1 = Math.min(crossings[c + 1], clip.maxX);
+          const x0 = Math.max(crossings[c], clip.minX, spanMin);
+          const x1 = Math.min(crossings[c + 1], clip.maxX, spanMax);
           if (x0 > x1) continue;
           // Cells whose CENTRE falls inside the span.
           const ix1 = Math.floor(x1 / cell - 0.5);
@@ -248,7 +279,7 @@ export function scatterInPolygon(
             if (keep < 1 && hash32(h, 0x9e37) / 4294967296 >= keep) continue;
             const px = (ix + (h & 0xffff) / 65536) * cell;
             const py = start + (n + ((h >>> 16) & 0xffff) / 65536) * cell;
-            if (!emitAt(px, py, seen, emit)) return false;
+            if (!emitAt(px, py, seen, emit, accept)) return false;
           }
         }
       }
