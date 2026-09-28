@@ -90,6 +90,9 @@ const HARD_STOP_FACTOR = 1.2;
 /** Beyond this many halvings (density < 1/64) distance thinning places nothing. */
 const THIN_HALVINGS = 6;
 
+/** A mesh counts as closed (front faces suffice) up to this share of open edges. */
+const MAX_OPEN_EDGE_SHARE = 0.1;
+
 /** Quiet time (ms) after the last source tile before a data-driven rebuild. */
 const DATA_SETTLE_MS = 150;
 
@@ -909,6 +912,24 @@ export class GltfManager {
         matrix: mesh.matrixWorld.clone(),
       });
     });
+
+    // Unless told otherwise: a closed, consistently wound mesh never shows a
+    // back face, so drawing front faces only is free. A material that is also
+    // used by an open mesh (leaf cards, ...) keeps both sides. "Closed" allows
+    // a few stray open edges (an uncapped trunk base, a crown seam): real
+    // models have them, while sheet geometry is open along most of its edges.
+    if (this.config.doubleSided === undefined) {
+      const open = new Set<THREE.Material>();
+      const all = new Set<THREE.Material>();
+      for (const proto of protos) {
+        const closed = openEdgeShare(proto.geometry) <= MAX_OPEN_EDGE_SHARE;
+        for (const m of Array.isArray(proto.material) ? proto.material : [proto.material]) {
+          all.add(m);
+          if (!closed) open.add(m);
+        }
+      }
+      for (const m of all) if (m.side === THREE.DoubleSide && !open.has(m)) m.side = THREE.FrontSide;
+    }
     return protos;
   }
 
@@ -1387,6 +1408,48 @@ function frameGround(
     }
     return lo <= hi ? [lo, hi] : null;
   };
+}
+
+/**
+ * Share (0..1) of a mesh's edges that are not closed and consistently wound —
+ * i.e. not used once in each direction. 0 for a watertight shell, near 1 for
+ * loose sheets. Positions are welded first, since glTF splits vertices at UV
+ * and normal seams.
+ */
+function openEdgeShare(geometry: THREE.BufferGeometry): number {
+  const pos = geometry.getAttribute('position');
+  if (!pos) return 1;
+  const index = geometry.getIndex();
+  const n = index ? index.count : pos.count;
+  if (n < 3 || n % 3 !== 0) return 1;
+
+  const welded = new Int32Array(pos.count);
+  const ids = new globalThis.Map<string, number>();
+  for (let i = 0; i < pos.count; i++) {
+    const key = `${Math.round(pos.getX(i) * 1e4)},${Math.round(pos.getY(i) * 1e4)},${Math.round(pos.getZ(i) * 1e4)}`;
+    let id = ids.get(key);
+    if (id === undefined) ids.set(key, (id = ids.size));
+    welded[i] = id;
+  }
+
+  // Per undirected edge: +1 for each use as low→high, −1 as high→low.
+  const stride = ids.size;
+  const balance = new globalThis.Map<number, number>();
+  const vertex = (i: number) => welded[index ? index.getX(i) : i];
+  for (let t = 0; t < n; t += 3) {
+    const tri = [vertex(t), vertex(t + 1), vertex(t + 2)];
+    if (tri[0] === tri[1] || tri[1] === tri[2] || tri[0] === tri[2]) continue; // degenerate
+    for (let k = 0; k < 3; k++) {
+      const u = tri[k];
+      const v = tri[(k + 1) % 3];
+      const key = u < v ? u * stride + v : v * stride + u;
+      balance.set(key, (balance.get(key) ?? 0) + (u < v ? 1 : -1));
+    }
+  }
+  if (balance.size === 0) return 1;
+  let open = 0;
+  for (const b of balance.values()) if (b !== 0) open++;
+  return open / balance.size;
 }
 
 /** Fraction of a feature's bbox that the (clipped, padded) view covers (0..1). */

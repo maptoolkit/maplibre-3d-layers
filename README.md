@@ -202,14 +202,16 @@ map.addLayer(new GltfLayer({
   models: MODELS,
   layout: {
     'model-id': ['case', ['==', ['%', ['id'], 3], 0], 'bushy', 'leafy'],
-    'model-spacing': ['match', ['get', 'type'],
-      'tree_row', 9,                                            // metres
-      ['interpolate', ['linear'], ['zoom'], 15, 34, 17, 14],    // thin out when far
-    ],
+    'model-spacing': ['match', ['get', 'type'], 'tree_row', 9, 12],   // metres
   },
   paint: LOOK,
 }));
 ```
+
+That's all it takes, also for a dense forest on a strongly pitched map: by
+default the layer places models only where they are on screen, keeps full
+density near the camera and thins out towards the horizon, and draws distant
+models as billboards — see [Performance and density](#performance-and-density).
 
 ### Options
 
@@ -221,16 +223,16 @@ map.addLayer(new GltfLayer({
 | `source-layer` | — | vector-tile layer to read; **required for vector sources** |
 | `filter` | — | MapLibre filter expression; features that fail are dropped |
 | `minzoom` / `maxzoom` | — | hidden below `minzoom` and at/above `maxzoom`; outside the range the layer costs nothing |
-| `maxInstances` | — | instance budget (default `15000`); denser data is thinned out, see [Density and budget](#density-and-budget) |
+| `maxInstances` | — | instance budget (default `20000`); denser data is thinned out, far away first, see [Performance and density](#performance-and-density) |
 | `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's active terrain |
-| `doubleSided` | — | `false` draws front faces only (cheaper for closed models), `true` both; default: as authored in the glTF |
+| `doubleSided` | — | `false` draws front faces only, `true` both; default: automatic — front faces only for closed meshes, both for open ones such as leaf cards |
 | `lighting` | — | `{ ambient, directional, environment }`, see [Lighting](#lighting) |
 | `layout.visibility` | — | `'visible'` (default) / `'none'` |
 | `layout['model-id']` | — | which entry of `models` a feature uses; defaults to the only model |
 | `layout['model-placement']` | — | `'auto'` (default) / `'point'` / `'line'` / `'fill'`, see [Placement](#placement) |
 | `layout['model-spacing']` | — | metres between models on lines and in polygons (default `25`) |
-| `layout['model-impostor-distance']` | — | metres from the camera beyond which models draw as billboards (default: off), see [Density and budget](#density-and-budget) |
-| `layout['model-thinning-distance']` | — | metres from the camera with full density; beyond, density halves every further such distance (default: off), see [Density and budget](#density-and-budget) |
+| `layout['model-thinning-distance']` | — | metres from the camera with full density; beyond, density halves every further such distance (default: ~2.5 km at z16, halving per zoom level; `Infinity` = off), see [Performance and density](#performance-and-density) |
+| `layout['model-impostor-distance']` | — | metres from the camera beyond which models draw as billboards (default: ~800 m at z16, halving per zoom level; `Infinity` = off), see [Performance and density](#performance-and-density) |
 | `paint['model-scale']` | — | `[x, y, z]` factor on the model's own size (default `[1,1,1]`) |
 | `paint['model-rotation']` | — | `[x, y, z]` degrees around `[east, north, up]`; `z` is a compass heading |
 | `paint['model-translation']` | — | `[x, y, z]` metres along `[east, north, up]` (default `[0,0,0]`) |
@@ -315,57 +317,61 @@ friends vary per model rather than per source feature — that is what keeps a t
 row from becoming a line of identical clones. Point features keep the id they
 have in the source, so `['id']` still addresses the original feature there.
 
-### Density and budget
+### Performance and density
 
-`model-spacing` is in metres and can be data- and zoom-driven — that is the knob
-you should reach for first:
+The defaults are tuned for dense vegetation on a strongly pitched map and
+should rarely need changing. What the layer does on its own:
 
-```js
-'model-spacing': ['match', ['get', 'type'],
-  'tree_row', 9,                                           // avenue: tight
-  ['interpolate', ['linear'], ['zoom'], 15, 34, 17, 14],   // forest: thin out when far
-]
-```
+- **Only what's on screen.** Models are placed where the view meets the ground
+  (plus a small margin at the sides and bottom), never across the whole
+  bounding box of a rotated, pitched view.
+- **Full density near the camera, thinner towards the horizon.** Up to
+  `model-thinning-distance` from the camera everything is placed; beyond it the
+  density halves every further `model-thinning-distance` — no hard edge.
+- **A fixed budget, spent on the foreground.** If the view holds more than
+  `maxInstances` models, the thinning distance shrinks, so far models go first.
+  Which models remain is decided by a hash of their position: they sit exactly
+  where they would at full density, and crossing the budget adds and removes
+  models instead of rearranging them.
+- **Billboards far away.** Beyond `model-impostor-distance` a model is only a few
+  pixels tall, yet its full mesh would be most of the GPU cost. Each model is
+  rendered once into a small texture, and distant instances show it on a
+  camera-facing quad of two triangles. Colour and opacity carry over; gloss and
+  reflections don't, which is invisible at that size.
+- **Cheap to draw.** Closed meshes skip their back faces, and materials only
+  blend while `model-opacity` is actually below 1 (e.g. during a zoom fade-in).
 
-Rendering cost is **triangles × models**, not feature count. A single forest
-polygon can easily be tens of thousands of models, so prefer low-poly assets: a
-thousand copies of a 3.6k-triangle model render at 60 fps, a thousand copies of a
-109k-triangle showcase asset drop to 6 fps.
+With these defaults a forest of 20k trees at 72° pitch renders at 60 fps on a
+MacBook Air.
 
-As a safety net, a refresh that would exceed `maxInstances` keeps only a share of
-the models and warns once. The ones that remain sit exactly where they would have
-at full density, so crossing the budget — by zooming, or by resizing the window —
-adds and removes models instead of rearranging them. Coverage stays even; the
-area is never cut off halfway.
+`model-spacing` (metres, data- and zoom-driven) sets the density itself and is
+the first thing to adjust for a different look.
 
-That share applies to the whole view, foreground included. A strongly pitched
-map sees up to the horizon, so tilting it spreads the budget over kilometres of
-distant, pixel-sized trees and thins out the ones right in front of the camera.
-`model-thinning-distance` fixes that: up to that many metres from the camera
-models keep their full density, beyond it the density halves every further
-`model-thinning-distance` metres — no hard edge. If the view still exceeds
-`maxInstances`, that distance shrinks, so the far models go first:
+#### Advanced tuning
 
-```js
-'model-thinning-distance': ['interpolate', ['exponential', 0.5], ['zoom'], 15, 5000, 18, 625],
-```
-
-Models outside the frame are never placed (only a margin at the sides and
-bottom), so the budget goes to what is on screen.
-
-Far away a model is only a few pixels tall, yet drawing its full mesh there is
-where most of the GPU time goes. `model-impostor-distance` swaps it for a
-billboard beyond that distance: each model is rendered once, slightly from
-above, into a small texture, and distant instances show it on a camera-facing
-quad of two triangles. In a dense forest at 72° pitch that took 20k trees from
-30 to 60 fps on a MacBook Air:
+All of these are optional; the defaults are shown.
 
 ```js
-'model-impostor-distance': ['interpolate', ['exponential', 0.5], ['zoom'], 15, 1600, 18, 200],
+new GltfLayer({
+  // …
+  maxInstances: 20000,  // more = denser far away, but each rebuild (on moveend) takes longer
+  doubleSided: undefined, // true/false forces both/front faces instead of auto-detecting
+  layout: {
+    // full density up to this many metres from the camera; ~2.5 km at z16
+    'model-thinning-distance': ['interpolate', ['exponential', 0.5], ['zoom'], 12, 40000, 20, 156.25],
+    // billboards beyond this; ~800 m at z16, where a tree is ~20–30 px tall
+    'model-impostor-distance': ['interpolate', ['exponential', 0.5], ['zoom'], 12, 12800, 20, 50],
+  },
+});
 ```
 
-Billboards keep instance colour and opacity, but not view-dependent shading
-(gloss, reflections) — keep the distance where models are ~20–30 px tall.
+- Set `model-thinning-distance` to `Infinity` to thin uniformly instead (the whole
+  view shares the budget, foreground included).
+- Set `model-impostor-distance` to `Infinity` to always draw full meshes, e.g. for
+  models whose look depends on the viewing angle; lower it for heavy models.
+- Rendering cost of the full meshes is triangles × models near the camera, so
+  prefer low-poly assets: a thousand copies of a 3.6k-triangle model render at
+  60 fps, a thousand copies of a 109k-triangle showcase asset drop to 6 fps.
 
 ### Data sources
 
@@ -377,7 +383,8 @@ Billboards keep instance colour and opacity, but not view-dependent shading
 
 ### When instances update
 
-The layer refreshes when the map stops moving and when the source's data changes.
+The layer refreshes when the map stops moving and when the source's data changes
+(once a burst of tiles has settled, and never mid-move).
 Positions jump straight to their new location — there is no interpolation between
 updates. `paint`, `layout` and `visibility` are read once when the layer is added;
 custom layers have no `setPaintProperty`.
@@ -417,6 +424,9 @@ bundler or worker configuration is needed.
 - Models on a line can shift if the source serves a differently generalised
   version of that line at another zoom. Models in a polygon are unaffected.
 - Draco- and KTX2-compressed glTF files are not supported yet.
+- Billboards turn about the vertical axis only and are baked once per model from
+  one side, so strongly asymmetric models look the same from every direction far
+  away. Set `model-impostor-distance` to `Infinity` for those.
 - No interpolation between source updates.
 
 **Both**

@@ -6,7 +6,7 @@ import { GltfManager } from './GltfManager';
 import type { ImpostorLight } from './GltfManager';
 import { compileColor, compileNumber, compileString, compileVec3 } from './expression';
 import type { StyleValue, Vec3 } from './expression';
-import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
+import type { ExpressionSpecification, FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
 
 /** How a feature turns into models. `'auto'` picks by geometry type. */
 export type Placement = 'auto' | 'point' | 'line' | 'fill';
@@ -20,11 +20,29 @@ const DEFAULT_LIGHTING = { ambient: 1.5, directional: 2.5, environment: 0.7 };
 const DEFAULT_SPACING = 25;
 
 /**
- * Instances per build before the layer thins itself out. The real cost is
- * triangles x instances, so this default is sized for a ~1k-triangle model
- * (~25M triangles). Raise it for very low-poly models, lower it for heavy ones.
+ * Instances per build before the layer thins itself out. Distant ones draw as
+ * billboards by default, so the GPU cost is mostly the ~1–2k full meshes near
+ * the camera; what grows with this is the CPU time of a rebuild (~70 ms for
+ * 20k trees on a MacBook Air).
  */
-const DEFAULT_MAX_INSTANCES = 15000;
+const DEFAULT_MAX_INSTANCES = 20000;
+
+/**
+ * Default `model-thinning-distance`: full density within ~2.5 km of the camera
+ * at z16 (enough for a 60° pitch), halving per zoom level. Base 0.5 between
+ * stops 2^8 apart makes it halve exactly with each zoom step.
+ */
+const DEFAULT_THINNING_DISTANCE: ExpressionSpecification = [
+  'interpolate', ['exponential', 0.5], ['zoom'], 12, 40000, 20, 156.25,
+];
+
+/**
+ * Default `model-impostor-distance`: billboards beyond ~800 m at z16, where a
+ * tree-sized model is ~20–30 px tall; halving per zoom level like the above.
+ */
+const DEFAULT_IMPOSTOR_DISTANCE: ExpressionSpecification = [
+  'interpolate', ['exponential', 0.5], ['zoom'], 12, 12800, 20, 50,
+];
 
 const PLACEMENTS: readonly Placement[] = ['auto', 'point', 'line', 'fill'];
 
@@ -46,16 +64,15 @@ export interface GltfLayerOptions {
   /** raster-dem source id for elevation; defaults to the map's active terrain. */
   terrainSourceId?: string;
   /**
-   * Upper bound on instances per rebuild (default `15000`). Data denser than
-   * this is thinned by scaling `model-spacing` up, so coverage stays even.
-   * Budget by triangles: instances x the model's triangle count is the real cost.
+   * Upper bound on instances per rebuild (default `20000`). Denser data is
+   * thinned — far away first while `model-thinning-distance` is on.
    */
   maxInstances?: number;
   /**
-   * Override the models' own `doubleSided` flag: `false` draws front faces only
-   * (cheaper — back faces of closed models are hidden anyway), `true` both.
-   * Default: as authored in the glTF. Keep it for models with open, single-sheet
-   * faces such as leaf cards.
+   * Override the models' `doubleSided` flag: `false` draws front faces only,
+   * `true` both. By default a double-sided mesh that is closed (every edge
+   * shared by two consistently wound triangles) draws front faces only — its
+   * back faces are hidden anyway — and open ones such as leaf cards keep both.
    */
   doubleSided?: boolean;
   /**
@@ -88,18 +105,19 @@ export interface GltfLayerOptions {
     'model-spacing'?: StyleValue<number>;
     /**
      * Metres from the camera's ground position up to which instances are placed
-     * at full density (default: off). Beyond it, density halves every further
-     * `model-thinning-distance` metres, and when `maxInstances` is exceeded this
-     * distance shrinks instead of thinning the foreground. Zoom-driven, not
-     * data-driven.
+     * at full density (default: ~2.5 km at z16, halving per zoom level). Beyond
+     * it, density halves every further `model-thinning-distance` metres, and
+     * when `maxInstances` is exceeded this distance shrinks instead of thinning
+     * the foreground. `Infinity` switches it off. Zoom-driven, not data-driven.
      */
     'model-thinning-distance'?: StyleValue<number>;
     /**
      * Metres from the camera's ground position beyond which models draw as
-     * billboards (default: off). Each model is rendered once from the side into
-     * a small texture; far instances show it on a camera-facing quad of two
-     * triangles instead of the full mesh — a few pixels tall at that distance,
-     * but otherwise the bulk of the cost. Zoom-driven, not data-driven.
+     * billboards (default: ~800 m at z16, halving per zoom level). Each model is
+     * rendered once into a small texture; far instances show it on a
+     * camera-facing quad of two triangles instead of the full mesh — a few
+     * pixels tall at that distance, but otherwise the bulk of the cost.
+     * `Infinity` switches it off. Zoom-driven, not data-driven.
      */
     'model-impostor-distance'?: StyleValue<number>;
   };
@@ -242,8 +260,12 @@ export class GltfLayer implements CustomLayerInterface {
         modelId: compileString(layout['model-id'], 'model-id', modelIds[0], POINT),
         placement: this.placement,
         spacing: compileNumber(layout['model-spacing'], 'model-spacing', DEFAULT_SPACING, POINT),
-        thinningDistance: compileNumber(layout['model-thinning-distance'], 'model-thinning-distance', Infinity, POINT),
-        impostorDistance: compileNumber(layout['model-impostor-distance'], 'model-impostor-distance', Infinity, POINT),
+        thinningDistance: compileNumber(
+          layout['model-thinning-distance'] ?? DEFAULT_THINNING_DISTANCE, 'model-thinning-distance', Infinity, POINT,
+        ),
+        impostorDistance: compileNumber(
+          layout['model-impostor-distance'] ?? DEFAULT_IMPOSTOR_DISTANCE, 'model-impostor-distance', Infinity, POINT,
+        ),
         maxInstances: this.options.maxInstances ?? DEFAULT_MAX_INSTANCES,
         doubleSided: this.options.doubleSided,
         rotation: compileVec3(paint['model-rotation'], 'model-rotation', [0, 0, 0], POINT),
