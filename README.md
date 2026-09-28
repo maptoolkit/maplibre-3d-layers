@@ -89,6 +89,8 @@ map.on('load', () => {
     type: 'fill-extrusion',
     source: 'buildings3d',
     'source-layer': 'buildings2d',
+    // A multi-part building's outline: its parts are drawn instead.
+    filter: ['!=', ['get', 'extrude'], false],
     paint: {
       'fill-extrusion-height': ['get', 'height'],
       'fill-extrusion-color': '#fafafa',
