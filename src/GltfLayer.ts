@@ -117,7 +117,9 @@ export interface GltfLayerOptions {
      * rendered once into a small texture; far instances show it on a
      * camera-facing quad of two triangles instead of the full mesh — a few
      * pixels tall at that distance, but otherwise the bulk of the cost.
-     * `Infinity` switches it off. Zoom-driven, not data-driven.
+     * Models in the area a top-down view of the current zoom shows (around the
+     * map centre) always stay full meshes, at any pitch. `Infinity` switches
+     * billboards off. Zoom-driven, not data-driven.
      */
     'model-impostor-distance'?: StyleValue<number>;
   };

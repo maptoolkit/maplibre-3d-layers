@@ -234,7 +234,7 @@ models as billboards — see [Performance and density](#performance-and-density)
 | `layout['model-placement']` | — | `'auto'` (default) / `'point'` / `'line'` / `'fill'`, see [Placement](#placement) |
 | `layout['model-spacing']` | — | metres between models on lines and in polygons (default `25`) |
 | `layout['model-thinning-distance']` | — | metres from the camera with full density; beyond, density halves every further such distance (default: ~2.5 km at z16, halving per zoom level; `Infinity` = off), see [Performance and density](#performance-and-density) |
-| `layout['model-impostor-distance']` | — | metres from the camera beyond which models draw as billboards (default: ~800 m at z16, halving per zoom level; `Infinity` = off), see [Performance and density](#performance-and-density) |
+| `layout['model-impostor-distance']` | — | metres from the camera beyond which models draw as billboards (default: ~800 m at z16, halving per zoom level; `Infinity` = off); the area a top-down view shows always stays full models, see [Performance and density](#performance-and-density) |
 | `paint['model-scale']` | — | `[x, y, z]` factor on the model's own size (default `[1,1,1]`) |
 | `paint['model-rotation']` | — | `[x, y, z]` degrees around `[east, north, up]`; `z` is a compass heading |
 | `paint['model-translation']` | — | `[x, y, z]` metres along `[east, north, up]` (default `[0,0,0]`) |
@@ -339,7 +339,9 @@ should rarely need changing. What the layer does on its own:
   pixels tall, yet its full mesh would be most of the GPU cost. Each model is
   rendered once into a small texture, and distant instances show it on a
   camera-facing quad of two triangles. Colour and opacity carry over; gloss and
-  reflections don't, which is invisible at that size.
+  reflections don't, which is invisible at that size. Whatever a top-down view of
+  the current zoom would show stays a full model, however far you tilt — so at
+  0° pitch there are no billboards at all.
 - **Cheap to draw.** Closed meshes skip their back faces, and materials only
   blend while `model-opacity` is actually below 1 (e.g. during a zoom fade-in).
 

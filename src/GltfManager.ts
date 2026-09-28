@@ -518,6 +518,13 @@ export class GltfManager {
     // `model-impostor-distance`: beyond it, draw the model's billboard instead.
     const impostorDistance = this.config.impostorDistance(zoom, {});
     const impostorCam = Number.isFinite(impostorDistance) ? (cam ?? cameraGround(this.map)) : undefined;
+    // Everything a top-down view of this zoom would show stays a full model, at
+    // any pitch: a circle around the map centre through the (padded) screen
+    // corners. Tilting moves the camera behind the centre, so the camera
+    // distance alone would turn the far half of that area into billboards.
+    const canvas = this.map.getCanvas();
+    const topDownRadius =
+      (Math.hypot(canvas.clientWidth, canvas.clientHeight) / 2) * (1 + FRAME_PAD) / (512 * 2 ** zoom);
     if (cam) {
       const nw = new MercatorCoordinate(cam.x - maxMerc, cam.y - maxMerc).toLngLat();
       const se = new MercatorCoordinate(cam.x + maxMerc, cam.y + maxMerc).toLngLat();
@@ -592,7 +599,8 @@ export class GltfManager {
       // Far away, the impostor (once baked) stands in for the model.
       const far =
         impostorCam !== undefined &&
-        Math.hypot(x - impostorCam.x, y - impostorCam.y) / impostorCam.s >= impostorDistance;
+        Math.hypot(x - impostorCam.x, y - impostorCam.y) / impostorCam.s >= impostorDistance &&
+        Math.hypot(x - this.origin.x, y - this.origin.y) > topDownRadius;
       const key = far && this.models.get(impostorKey(modelId))?.state === 'ready' ? impostorKey(modelId) : modelId;
 
       let g = groups.get(key);
