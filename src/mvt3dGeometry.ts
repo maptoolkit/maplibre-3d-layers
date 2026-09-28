@@ -3,6 +3,7 @@ import earcut from 'earcut';
 import { featureFilter } from '@maplibre/maplibre-gl-style-spec';
 import type { FilterSpecification, Feature, GlobalProperties } from '@maplibre/maplibre-gl-style-spec';
 import { VectorTile } from './vectorTile3d';
+import type { Polygon } from './vectorTile3d';
 
 /** Request: the fetched tile plus which layer to read and an optional filter.
  *  Geometry is stored tile-locally, so the scene origin is NOT needed here. */
@@ -50,6 +51,30 @@ interface P {
   z: number; // north (metres)
 }
 
+/** One 3D feature of the tile, its bounding-box polygon already removed. */
+interface SourceFeature {
+  properties: Record<string, number | string | boolean>;
+  extent: number;
+  baseZ: number;
+  polygons: Polygon[];
+}
+
+/** A connected building: its faces, per source feature, and their extent. */
+interface Part {
+  members: { feature: SourceFeature; polygons: Polygon[] }[];
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
+/**
+ * Faces closer than this (metres, between their bounding boxes) belong to the
+ * same building. Roof and walls of one house touch; separate buildings bundled
+ * into one feature are metres to kilometres apart.
+ */
+const PART_GAP_M = 2;
+
 // MapLibre's mercator metric (earthRadius 6371008.8 m).
 const EARTH_CIRCUMFERENCE = 2 * Math.PI * 6371008.8;
 
@@ -84,6 +109,15 @@ export function buildTile(
   const globals = { zoom: tz } as GlobalProperties;
 
   if (layer) {
+    // A building arrives as a roof and a wall feature with the same id, each a
+    // multipolygon of single faces. The source may also bundle several separate
+    // buildings into one feature (features with identical attributes get merged
+    // into a multipolygon). Terrain has to be anchored per BUILDING: per face
+    // would tear a roof from its walls on a slope, per feature would put a whole
+    // bundle on the height of its common centre. So: collect the faces of all
+    // features sharing an id, split them into connected parts, and anchor each
+    // part at its own centre — roof and walls of one house share that anchor.
+    const byId = new globalThis.Map<unknown, SourceFeature[]>();
     for (let i = 0; i < layer.length; i++) {
       const feature = layer.feature(i);
       if (feature.type !== 0) continue; // only the custom 3D geometry
@@ -92,59 +126,66 @@ export function buildTile(
       const polygons = feature.loadGeometry();
       if (polygons.length < 2) continue; // need bbox + at least one real polygon
 
-      // First polygon is a bounding box: [min, max] corners → base z + centroid.
-      const bboxRing = polygons.shift()![0];
-      const baseZ = bboxRing[0].z;
-      const cx = (bboxRing[0].x + bboxRing[1].x) / 2;
-      const cy = (bboxRing[0].y + bboxRing[1].y) / 2;
+      // First polygon is a bounding box: [min, max] corners → base z.
+      const baseZ = polygons.shift()![0][0].z;
+      const id = feature.properties.id ?? `\u0000${i}`; // no id: a group of its own
+      let group = byId.get(id);
+      if (!group) byId.set(id, (group = []));
+      group.push({ properties: feature.properties, extent: feature.extent, baseZ, polygons });
+    }
 
-      // De-dupe across tile boundaries. The source emits each building WHOLE into
-      // every tile its geometry overlaps (geometry overhangs a tile edge by
-      // hundreds of extent units), and feature ids are renumbered per tile, so at
-      // shared edges/corners the same building sits in 2–4 tiles. Drawing every
-      // copy double-draws coplanar walls → z-fighting/flicker. Render a building
-      // only in the tile whose bounds contain its (tile-stable) bbox centroid.
-      // Half-open [0, extent) → an exact partition (verified: 0 buildings owned by
-      // >1 tile across a 2×2 z15 block); also drops ~¼ of features as duplicates.
-      const ext = feature.extent;
-      if (cx < 0 || cx >= ext || cy < 0 || cy >= ext) continue;
+    for (const group of byId.values()) {
+      const extent = group[0].extent;
+      const tolerance = PART_GAP_M * extent * pow * tileScale; // metres → extent units
+      for (const part of connectedParts(group, tolerance)) {
+        const cx = (part.minX + part.maxX) / 2;
+        const cy = (part.minY + part.maxY) / 2;
 
-      const [lng, lat] = mercToLngLat(
-        (tx + cx / feature.extent) / pow,
-        (ty + cy / feature.extent) / pow,
-      );
+        // De-dupe across tile boundaries. The source emits each building WHOLE
+        // into every tile its geometry overlaps (geometry overhangs a tile edge by
+        // hundreds of extent units), and feature ids are renumbered per tile, so at
+        // shared edges/corners the same building sits in 2–4 tiles. Drawing every
+        // copy double-draws coplanar walls → z-fighting/flicker. Render a building
+        // only in the tile whose bounds contain its (tile-stable) centre.
+        // Half-open [0, extent) → an exact partition.
+        if (cx < 0 || cx >= extent || cy < 0 || cy >= extent) continue;
 
-      const featureStart = positions.length / 3;
+        const [lng, lat] = mercToLngLat((tx + cx / extent) / pow, (ty + cy / extent) / pow);
 
-      for (const polygon of polygons) {
-        const polyVertexBase = positions.length / 3;
-        const flat2D: number[] = [];
-        const holes: number[] = [];
+        for (const member of part.members) {
+          const src = member.feature;
+          const featureStart = positions.length / 3;
+          for (const polygon of member.polygons) {
+            const polyVertexBase = positions.length / 3;
+            const flat2D: number[] = [];
+            const holes: number[] = [];
 
-        for (let r = 0; r < polygon.length; r++) {
-          if (r) holes.push(flat2D.length / 2);
-          const ring = polygon[r];
-          const pts = ring.map((v) => toTileLocal(v, baseZ, feature.extent, pow, tileScale));
-          const n = newellNormal(pts);
-          for (const p of pts) {
-            positions.push(p.x, p.y, p.z);
-            normals.push(n[0], n[1], n[2]);
-            const q = to2D(p, n);
-            flat2D.push(q[0], q[1]);
+            for (let r = 0; r < polygon.length; r++) {
+              if (r) holes.push(flat2D.length / 2);
+              const ring = polygon[r];
+              const pts = ring.map((v) => toTileLocal(v, src.baseZ, src.extent, pow, tileScale));
+              const n = newellNormal(pts);
+              for (const p of pts) {
+                positions.push(p.x, p.y, p.z);
+                normals.push(n[0], n[1], n[2]);
+                const q = to2D(p, n);
+                flat2D.push(q[0], q[1]);
+              }
+            }
+
+            const tri = flat2D.length === 6 ? [0, 1, 2] : earcut(flat2D, holes, 2);
+            for (let t = 0; t < tri.length; t++) indices.push(tri[t] + polyVertexBase);
           }
+
+          features.push({
+            lng,
+            lat,
+            start: featureStart,
+            count: positions.length / 3 - featureStart,
+            properties: src.properties,
+          });
         }
-
-        const tri = flat2D.length === 6 ? [0, 1, 2] : earcut(flat2D, holes, 2);
-        for (let t = 0; t < tri.length; t++) indices.push(tri[t] + polyVertexBase);
       }
-
-      features.push({
-        lng,
-        lat,
-        start: featureStart,
-        count: positions.length / 3 - featureStart,
-        properties: feature.properties,
-      });
     }
   }
 
@@ -155,6 +196,64 @@ export function buildTile(
     features,
     tileScale,
   };
+}
+
+/**
+ * Split the faces of a building id's features into connected parts: faces
+ * whose bounding boxes lie within `tolerance` (extent units) of each other,
+ * transitively. A sweep over the boxes sorted by x keeps large city-model
+ * buildings (thousands of faces) cheap.
+ */
+function connectedParts(group: SourceFeature[], tolerance: number): Part[] {
+  const faces: { feature: SourceFeature; polygon: Polygon; box: [number, number, number, number] }[] = [];
+  for (const feature of group) {
+    for (const polygon of feature.polygons) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const v of polygon[0]) {
+        if (v.x < minX) minX = v.x;
+        if (v.y < minY) minY = v.y;
+        if (v.x > maxX) maxX = v.x;
+        if (v.y > maxY) maxY = v.y;
+      }
+      if (minX > maxX) continue; // empty ring
+      faces.push({ feature, polygon, box: [minX, minY, maxX, maxY] });
+    }
+  }
+
+  const parent = faces.map((_, i) => i);
+  const find = (i: number): number => {
+    while (parent[i] !== i) i = parent[i] = parent[parent[i]];
+    return i;
+  };
+  const order = faces.map((_, i) => i).sort((a, b) => faces[a].box[0] - faces[b].box[0]);
+  for (let oi = 0; oi < order.length; oi++) {
+    const a = faces[order[oi]].box;
+    for (let oj = oi + 1; oj < order.length && faces[order[oj]].box[0] <= a[2] + tolerance; oj++) {
+      const b = faces[order[oj]].box;
+      if (b[1] <= a[3] + tolerance && a[1] <= b[3] + tolerance) {
+        parent[find(order[oi])] = find(order[oj]);
+      }
+    }
+  }
+
+  const parts = new globalThis.Map<number, Part>();
+  for (let i = 0; i < faces.length; i++) {
+    const { feature, polygon, box } = faces[i];
+    const root = find(i);
+    let part = parts.get(root);
+    if (!part) {
+      part = { members: [], minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+      parts.set(root, part);
+    }
+    let member = part.members.find((m) => m.feature === feature);
+    if (!member) part.members.push((member = { feature, polygons: [] }));
+    member.polygons.push(polygon);
+    part.minX = Math.min(part.minX, box[0]);
+    part.minY = Math.min(part.minY, box[1]);
+    part.maxX = Math.max(part.maxX, box[2]);
+    part.maxY = Math.max(part.maxY, box[3]);
+  }
+  return [...parts.values()];
 }
 
 /** Tile-local vertex → true metres (east, up-above-base, north) from the tile NW corner. */

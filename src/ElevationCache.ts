@@ -38,18 +38,31 @@ const MAX_TILE_COORD = EXTENT * (1 - 1e-12);
  * `queryTerrainElevation` when they are missing.
  */
 export function createElevationSampler(map: Map): ElevationSampler {
+  const sample = createMercatorElevationSampler(map);
+  return (lng, lat) =>
+    sample(
+      (180 + lng) / 360,
+      (180 - (180 / Math.PI) * Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360))) / 360,
+    );
+}
+
+/**
+ * {@link createElevationSampler} taking MapLibre mercator units (0..1) instead
+ * of lng/lat — for per-vertex lookups, where the geometry already is in them.
+ */
+export function createMercatorElevationSampler(map: Map): (mx: number, my: number) => number {
   const terrain = map.terrain as unknown as TerrainInternals | null | undefined;
   if (!terrain) return () => 0;
+  const toLngLat = (mx: number, my: number) =>
+    new LngLat(mx * 360 - 180, (360 / Math.PI) * Math.atan(Math.exp(((180 - my * 360) * Math.PI) / 180)) - 90);
   const byZoom = terrain.getElevationForLngLatZoom?.bind(terrain);
-  if (!byZoom) return (lng, lat) => map.queryTerrainElevation([lng, lat]) ?? 0;
+  if (!byZoom) return (mx, my) => map.queryTerrainElevation(toLngLat(mx, my)) ?? 0;
 
   const index = terrain.getCoverageIndex?.() ?? null;
   let fallbackZoom: number | undefined;
 
-  return (lng, lat) => {
+  return (mx, my) => {
     if (index) {
-      const mx = (180 + lng) / 360;
-      const my = (180 - (180 / Math.PI) * Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360))) / 360;
       if (my >= 0 && my < 1) {
         const wrap = Math.floor(mx);
         for (const z of index.zooms) {
@@ -83,7 +96,7 @@ export function createElevationSampler(map: Map): ElevationSampler {
         if (id.canonical.z > fallbackZoom) fallbackZoom = Math.min(id.canonical.z, terrain.tileManager.maxzoom);
       }
     }
-    return byZoom(new LngLat(lng, lat), fallbackZoom);
+    return byZoom(toLngLat(mx, my), fallbackZoom);
   };
 }
 

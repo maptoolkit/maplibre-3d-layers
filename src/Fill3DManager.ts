@@ -2,7 +2,7 @@ import { MercatorCoordinate, LngLat } from 'maplibre-gl';
 import type { CoveringTilesOptions, Map } from 'maplibre-gl';
 import * as THREE from 'three';
 import type { ElevationCache } from './ElevationCache';
-import { tileBounds } from './ElevationCache';
+import { createMercatorElevationSampler, tileBounds } from './ElevationCache';
 import type { GeoBounds } from './ElevationCache';
 import type { TileRequest, TileResult, FeatureSpan } from './mvt3dGeometry';
 import type { ColorEval, OpacityEval } from './paint';
@@ -10,6 +10,9 @@ import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
 // Inlined as a base64 blob so the built bundle stays single-file — no separate
 // worker asset to host. Works for both the ESM package and the <script> build.
 import Mvt3dWorker from './mvt3dWorker.ts?worker&inline';
+
+/** Vertices this close (metres) above a building's base count as its base. */
+const BASE_EPSILON_M = 0.05;
 
 /** Re-anchor the scene origin once the map centre drifts this far from it (metres). */
 const REBASE_DISTANCE_M = 3000;
@@ -446,19 +449,31 @@ export class Fill3DManager {
     for (const entry of this.tiles.values()) this.placeMesh(entry);
   }
 
-  /** Add terrain elevation (per feature centroid) to each vertex Y. */
+  /**
+   * Add terrain elevation to each vertex Y: the building's anchor (its centre)
+   * everywhere, except that vertices at its base follow the ground down where
+   * it drops below the anchor — so the downhill walls of a building on a slope
+   * reach the ground instead of floating. (fill-extrusion sinks the base 10 m
+   * instead; these meshes aren't hidden by terrain, so that would show.)
+   */
   private bake(entry: TileEntry) {
     if (!entry.geometry || !entry.positionBase || !entry.features) return;
     const attr = entry.geometry.getAttribute('position') as THREE.BufferAttribute;
     const pos = attr.array as Float32Array;
     const base = entry.positionBase;
     const elevationAt = this.elevation.batch();
+    const groundAt = createMercatorElevationSampler(this.map);
+    const scale = entry.tileScale ?? 0;
 
     for (const b of entry.features) {
       const ele = elevationAt(new LngLat(b.lng, b.lat));
       const end = b.start + b.count;
       for (let v = b.start; v < end; v++) {
-        pos[v * 3 + 1] = base[v * 3 + 1] + ele;
+        const rel = base[v * 3 + 1];
+        pos[v * 3 + 1] =
+          rel <= BASE_EPSILON_M && scale
+            ? Math.min(ele, groundAt(entry.tileMx + pos[v * 3] * scale, entry.tileMy - pos[v * 3 + 2] * scale)) + rel
+            : rel + ele;
       }
     }
     attr.needsUpdate = true;
