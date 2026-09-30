@@ -193,6 +193,10 @@ export class GltfLayer implements CustomLayerInterface {
   private readonly mainMat = new THREE.Matrix4();
   private readonly originMat = new THREE.Matrix4();
   private readonly originScale = new THREE.Vector3();
+  private readonly sceneToClip = new THREE.Matrix4();
+  private readonly clipToScene = new THREE.Matrix4();
+  private readonly eye = new THREE.Vector4();
+  private readonly eyeShift = new THREE.Matrix4();
   private readonly sunColor = new THREE.Color();
 
   constructor(options: GltfLayerOptions) {
@@ -296,7 +300,8 @@ export class GltfLayer implements CustomLayerInterface {
     this.originMat
       .makeTranslation(o.x, o.y, o.z)
       .scale(this.originScale.set(o.s, -o.s, o.s));
-    this.camera.projectionMatrix.multiplyMatrices(this.mainMat, this.originMat);
+    this.sceneToClip.multiplyMatrices(this.mainMat, this.originMat);
+    this.placeCamera();
 
     this.syncLight();
     this.renderer.resetState();
@@ -312,6 +317,29 @@ export class GltfLayer implements CustomLayerInterface {
     this.renderer.render(this.scene, this.camera);
     // No triggerRepaint() here: that re-renders the map every frame even when
     // nothing changes. Builds, model loads and DEM updates request their own.
+  }
+
+  /**
+   * Put three's camera where MapLibre's actually is. Only the projection comes
+   * from MapLibre, so the camera would otherwise sit at the scene origin — sea
+   * level at the map centre of the last rebuild — and every view-dependent term
+   * (specular, environment reflections) would shade as seen from there, and jump
+   * whenever a rebuild moves the origin. The eye is where the projection's rays
+   * meet: the scene point mapping to clip (0, 0, z, 0). The camera moves there
+   * and the projection takes the inverse shift, so positions on screen and
+   * frustum culling stay exactly as before.
+   */
+  private placeCamera() {
+    const P = this.sceneToClip;
+    this.eye.set(0, 0, 1, 0).applyMatrix4(this.clipToScene.copy(P).invert());
+    if (Math.abs(this.eye.w) > 1e-12) {
+      this.camera.position.set(this.eye.x / this.eye.w, this.eye.y / this.eye.w, this.eye.z / this.eye.w);
+    } else {
+      this.camera.position.set(0, 0, 0); // no finite eye (orthographic) — keep the old frame
+    }
+    const c = this.camera.position;
+    this.camera.projectionMatrix.multiplyMatrices(P, this.eyeShift.makeTranslation(c.x, c.y, c.z));
+    this.camera.projectionMatrixInverse.copy(this.camera.projectionMatrix).invert();
   }
 
   /**
