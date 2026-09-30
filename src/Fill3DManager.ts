@@ -6,6 +6,7 @@ import { createMercatorElevationSampler, tileBounds } from './ElevationCache';
 import type { GeoBounds } from './ElevationCache';
 import type { TileRequest, TileResult, FeatureSpan } from './mvt3dGeometry';
 import type { ColorEval, OpacityEval } from './paint';
+import { globalStateOf, watchGlobalState } from './globalState';
 import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
 // Inlined as a base64 blob so the built bundle stays single-file — no separate
 // worker asset to host. Works for both the ESM package and the <script> build.
@@ -27,6 +28,7 @@ const FILL3D_VERTEX = /* glsl */ `
   uniform vec3 u_lightpos;
   uniform float u_lightintensity;
   uniform vec3 u_lightcolor;
+  uniform float u_opacity; // fill-3d-opacity when it's the same for every feature
   varying vec4 v_color;
   void main() {
     float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
@@ -45,7 +47,7 @@ const FILL3D_VERTEX = /* glsl */ `
       mix(vec3(0.0), vec3(0.3), 1.0 - u_lightcolor),
       vec3(1.0)
     );
-    v_color = vec4(lit, color.a);
+    v_color = vec4(lit, color.a * u_opacity);
     gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
   }
 `;
@@ -66,6 +68,7 @@ function createFill3DMaterial(transparent: boolean): THREE.ShaderMaterial {
       u_lightpos: { value: new THREE.Vector3(0.288, 0.996, 0.498) },
       u_lightintensity: { value: 0.5 },
       u_lightcolor: { value: new THREE.Vector3(1, 1, 1) },
+      u_opacity: { value: 1 },
     },
     vertexShader: FILL3D_VERTEX,
     fragmentShader: FILL3D_FRAGMENT,
@@ -146,6 +149,8 @@ export class Fill3DManager {
   private readonly onData: (ev: unknown) => void;
   private readonly onMoveEnd: () => void;
   private onSourceData?: (ev: unknown) => void;
+  private readonly unwatchGlobalState: () => void;
+  private recolorRafId?: number;
 
   // Terrain DEM tiles stream in as a burst of `data` events. Instead of a full
   // rebake per event, we accumulate the changed tiles' bounds and flush ONE
@@ -202,6 +207,15 @@ export class Fill3DManager {
     };
     map.on('data', this.onData);
     map.on('moveend', this.onMoveEnd);
+
+    // `["global-state", …]`: a per-feature value is baked into the vertices, so
+    // re-bake it; a feature-constant opacity is a uniform read every frame.
+    const { color, opacity } = config;
+    const baked = [...color.globalStateRefs, ...(opacity.featureConstant ? [] : opacity.globalStateRefs)];
+    this.unwatchGlobalState = watchGlobalState(map, [...baked, ...opacity.globalStateRefs], () => {
+      if (baked.length) this.scheduleRecolor();
+      else map.triggerRepaint();
+    });
 
     this.initSource();
   }
@@ -331,7 +345,7 @@ export class Fill3DManager {
     // Copy positions so we can keep the base-relative Y for re-baking.
     geometry.setAttribute('position', new THREE.BufferAttribute(result.position.slice(), 3));
     geometry.setAttribute('normal', new THREE.BufferAttribute(result.normal, 3));
-    geometry.setAttribute('color', this.colorAttribute(result));
+    geometry.setAttribute('color', this.colorAttribute(result.position.length / 3, result.features));
     geometry.setIndex(new THREE.BufferAttribute(result.index, 1));
 
     const mesh = new THREE.Mesh(geometry, this.material);
@@ -351,13 +365,16 @@ export class Fill3DManager {
   }
 
   /** Evaluate fill-3d-color / fill-3d-opacity per feature into a per-vertex RGBA attribute.
-   *  Colours stay sRGB — the shader shades and outputs in sRGB, matching fill-extrusion. */
-  private colorAttribute(result: TileResult): THREE.BufferAttribute {
+   *  Colours stay sRGB — the shader shades and outputs in sRGB, matching fill-extrusion.
+   *  A feature-constant opacity is left out here: it's the `u_opacity` uniform. */
+  private colorAttribute(vertexCount: number, features: FeatureSpan[]): THREE.BufferAttribute {
     const zoom = this.map.getZoom();
-    const rgba = new Float32Array((result.position.length / 3) * 4);
-    for (const b of result.features) {
-      const [r, g, bl, ca] = this.config.color(zoom, b.properties);
-      const a = ca * this.config.opacity(zoom, b.properties);
+    const state = globalStateOf(this.map);
+    const { color, opacity } = this.config;
+    const rgba = new Float32Array(vertexCount * 4);
+    for (const b of features) {
+      const [r, g, bl, ca] = color(zoom, b.properties, undefined, state);
+      const a = opacity.featureConstant ? ca : ca * opacity(zoom, b.properties, undefined, state);
       const end = b.start + b.count;
       for (let v = b.start; v < end; v++) {
         rgba[v * 4] = r;
@@ -367,6 +384,35 @@ export class Fill3DManager {
       }
     }
     return new THREE.BufferAttribute(rgba, 4);
+  }
+
+  /**
+   * Evaluate a feature-constant fill-3d-opacity for this frame (call each frame),
+   * so zoom fades and global state apply smoothly. Returns the opacity in effect.
+   */
+  syncOpacity(): number {
+    const { opacity } = this.config;
+    const value = opacity.featureConstant
+      ? opacity(this.map.getZoom(), {}, undefined, globalStateOf(this.map))
+      : 1;
+    this.material.uniforms.u_opacity.value = value;
+    return value;
+  }
+
+  /** Re-bake every tile's colours after a global-state change (one per frame at most). */
+  private scheduleRecolor() {
+    if (this.recolorRafId !== undefined) return;
+    this.recolorRafId = requestAnimationFrame(() => {
+      this.recolorRafId = undefined;
+      for (const entry of this.tiles.values()) {
+        if (entry.state !== 'ready' || !entry.geometry || !entry.positionBase || !entry.features) continue;
+        entry.geometry.setAttribute(
+          'color',
+          this.colorAttribute(entry.positionBase.length / 3, entry.features),
+        );
+      }
+      this.map.triggerRepaint();
+    });
   }
 
   /**
@@ -511,6 +557,8 @@ export class Fill3DManager {
     this.map.off('moveend', this.onMoveEnd);
     if (this.onSourceData) this.map.off('sourcedata', this.onSourceData);
     if (this.rebakeRafId !== undefined) cancelAnimationFrame(this.rebakeRafId);
+    if (this.recolorRafId !== undefined) cancelAnimationFrame(this.recolorRafId);
+    this.unwatchGlobalState();
     this.worker.terminate();
     for (const entry of this.tiles.values()) {
       if (entry.mesh) this.group.remove(entry.mesh);

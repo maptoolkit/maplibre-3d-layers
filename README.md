@@ -127,8 +127,9 @@ map.on('load', () => {
 | `paint['fill-3d-color']` | — | colour, constant or expression (default white) |
 | `paint['fill-3d-opacity']` | — | `0..1`, constant or expression (default `1`) |
 
-Colour and opacity are evaluated per feature against its properties and the
-current zoom.
+Colour and opacity are evaluated per feature against its properties, the
+current zoom and the map's [global state](#global-state). An opacity that is the
+same for every feature (zoom and global state only) is evaluated every frame.
 
 ---
 
@@ -244,7 +245,8 @@ models as billboards — see [Performance and density](#performance-and-density)
 ### Expressions
 
 Every `layout` and `paint` value accepts a constant or a MapLibre expression over
-`['zoom']`, the feature's properties and `['id']`. The three-component properties
+`['zoom']`, the feature's properties, `['id']` and
+[`['global-state', …]`](#global-state). The three-component properties
 additionally accept **per-component** expressions, which is the only way to build
 a vector out of values — the style spec itself has no syntax for it:
 
@@ -258,7 +260,9 @@ a vector out of values — the style spec itself has no syntax for it:
 
 Properties are re-evaluated whenever the layer refreshes (see
 [When instances update](#when-instances-update)), so zoom-driven values step at
-the end of a zoom rather than continuously.
+the end of a zoom rather than continuously. The exception is a `model-opacity`
+that is the same for every feature: it is evaluated every frame, so a zoom fade
+is smooth.
 
 ### Sizing and orientation
 
@@ -408,6 +412,39 @@ in order to show anything at all; set it to `0` to switch it off.
 
 ---
 
+## Global state
+
+Both layers read MapLibre's global state, like native layers do: set a value with
+`map.setGlobalStateProperty()` (or the style's root `state`) and read it with
+`['global-state', name]`. MapLibre has no `['pitch']` expression, so camera-driven
+styling feeds the camera in from outside:
+
+```js
+const syncPitch = () => map.setGlobalStateProperty('pitch', Math.round(map.getPitch()));
+map.on('pitch', syncPitch);
+syncPitch();
+
+// Faded in by zoom, or by pitch when tilted — the same expression works for
+// fill-extrusion-opacity, fill-3d-opacity and model-opacity.
+const opacity = ['interpolate', ['linear'], ['zoom'],
+  16, ['max', 0, ['/', ['global-state', 'pitch'], 85]],
+  17, ['max', 0.3, ['/', ['global-state', 'pitch'], 85]]];
+```
+
+How fast a change shows:
+
+- **Opacity that is the same for every feature** (`fill-3d-opacity`,
+  `model-opacity` over zoom and global state only): every frame.
+- **Other colour and opacity values** (`fill-3d-color`, `model-color`, or an
+  opacity that also reads feature data): re-evaluated on the next frame after
+  the global state changes.
+- **Everything else on `GltfLayer`** (`filter`, `model-id`, scale, rotation,
+  placement, …): on the next rebuild — right away while the map is still,
+  otherwise when the move ends.
+
+Keep the values coarse (e.g. whole degrees): every `setGlobalStateProperty` is a
+style change. With terrain, many of them during an animation cost frames.
+
 ## Requirements
 
 MapLibre GL JS **≥6** and three.js **≥0.160**, both peer dependencies. No special
@@ -435,7 +472,8 @@ bundler or worker configuration is needed.
 
 **Both**
 
-- `paint`, `layout` and `visibility` are fixed once the layer has been added.
+- `paint`, `layout` and `visibility` are fixed once the layer has been added —
+  drive changing values through [global state](#global-state).
 
 ## Development
 

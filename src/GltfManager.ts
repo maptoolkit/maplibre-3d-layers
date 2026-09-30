@@ -6,7 +6,8 @@ import { featureFilter } from '@maplibre/maplibre-gl-style-spec';
 import type { FilterSpecification, GlobalProperties } from '@maplibre/maplibre-gl-style-spec';
 import { createElevationSampler, tileBounds } from './ElevationCache';
 import type { GeoBounds } from './ElevationCache';
-import type { Evaluator, Rgba, Vec3 } from './expression';
+import type { Evaluator, GlobalState, Rgba, Vec3 } from './expression';
+import { globalStateOf, watchGlobalState } from './globalState';
 import type { Placement } from './GltfLayer';
 import {
   fromUnitX,
@@ -198,6 +199,9 @@ interface Rec {
   rot: Vec3;
   scl: Vec3;
   tr: Vec3;
+  /** The feature it came from — re-evaluates colour/alpha on a global-state change. */
+  props: Record<string, unknown>;
+  id?: string | number;
 }
 
 /**
@@ -244,6 +248,9 @@ const PARS_FRAGMENT = /* glsl */ `
 #ifdef MTK_INSTANCE_ALPHA
   varying float vInstanceAlpha;
 #endif
+#ifdef MTK_OPACITY
+  uniform float mtkOpacity;
+#endif
 `;
 
 const BODY_FRAGMENT = /* glsl */ `
@@ -253,6 +260,9 @@ const BODY_FRAGMENT = /* glsl */ `
 #endif
 #ifdef MTK_INSTANCE_ALPHA
   diffuseColor.a *= vInstanceAlpha;
+#endif
+#ifdef MTK_OPACITY
+  diffuseColor.a *= mtkOpacity;
 #endif
 `;
 
@@ -292,6 +302,11 @@ export class GltfManager {
   private lastThinScale = 1;
   /** Whether a material was transparent as authored (e.g. glTF alphaMode BLEND). */
   private readonly ownTransparent = new WeakMap<THREE.Material, boolean>();
+  /** `model-opacity` when it's the same for every instance, shared by all shaders. */
+  private readonly opacityUniform = { value: 1 };
+  /** Some instance alpha < 1 (per-instance opacity) / the uniform opacity < 1. */
+  private instanceFading = false;
+  private uniformFading = false;
 
   /** Cached source features; re-read on source data, re-culled on move. */
   private features: RawFeature[] = [];
@@ -300,6 +315,8 @@ export class GltfManager {
 
   private readonly onData: (ev: unknown) => void;
   private readonly onMoveEnd: () => void;
+  private readonly unwatchGlobalState: (() => void)[];
+  private paintRafId?: number;
   private needsRead = false;
   private needsBuild = false;
   private pendingDemRegions: GeoBounds[] = [];
@@ -360,7 +377,59 @@ export class GltfManager {
     map.on('data', this.onData);
     map.on('moveend', this.onMoveEnd);
 
+    // `["global-state", …]`. Colour/alpha are rewritten in place; anything that
+    // decides placement or transforms needs a rebuild, which a move does anyway
+    // on moveend. A uniform opacity is read every frame, so it only repaints.
+    const refs = (...evals: (Evaluator<unknown> | undefined)[]) =>
+      evals.flatMap((e) => (e ? [...e.globalStateRefs] : []));
+    const { color, opacity } = config;
+    const whenStill = (fn: () => void) => () => {
+      if (!map.isMoving()) fn();
+    };
+    this.unwatchGlobalState = [
+      watchGlobalState(map, refs(color, this.instanceOpacity ? opacity : undefined), () => this.schedulePaint()),
+      watchGlobalState(map, refs(opacity), () => map.triggerRepaint()),
+      watchGlobalState(
+        map,
+        refs(config.modelId, config.rotation, config.scale, config.translation, config.spacing,
+          config.thinningDistance, config.impostorDistance),
+        whenStill(() => this.schedule(false, true)),
+      ),
+      watchGlobalState(
+        map,
+        featureFilter(config.filter, 'filter').getGlobalStateRefs(),
+        whenStill(() => this.refresh()),
+      ),
+    ];
+
     this.refresh();
+  }
+
+  /** `model-opacity` differs per instance → per-instance alpha attribute. */
+  private get instanceOpacity(): boolean {
+    return !!this.config.opacity && !this.config.opacity.featureConstant;
+  }
+
+  /** `model-opacity` is the same for all instances → one uniform, set each frame. */
+  private get uniformOpacity(): boolean {
+    return !!this.config.opacity?.featureConstant;
+  }
+
+  /**
+   * Evaluate a feature-constant `model-opacity` for this frame (call each
+   * frame), so zoom fades and global state apply smoothly. Returns the opacity
+   * in effect.
+   */
+  syncOpacity(): number {
+    const { opacity } = this.config;
+    if (!opacity?.featureConstant) return 1;
+    const value = opacity(this.map.getZoom(), {}, undefined, globalStateOf(this.map));
+    this.opacityUniform.value = value;
+    if (value < 1 !== this.uniformFading) {
+      this.uniformFading = value < 1;
+      this.setFading(this.instanceFading || this.uniformFading);
+    }
+    return value;
   }
 
   /**
@@ -485,7 +554,7 @@ export class GltfManager {
     if (this.disposed) return;
 
     const out: RawFeature[] = [];
-    const globals = { zoom: this.map.getZoom() } as GlobalProperties;
+    const globals = { zoom: this.map.getZoom(), globalState: globalStateOf(this.map) } as GlobalProperties;
     for (const f of featuresOf(data)) {
       const props = (f.properties ?? {}) as Record<string, unknown>;
       const bbox = bboxOf(f.geometry);
@@ -504,6 +573,7 @@ export class GltfManager {
   /** Re-anchor the origin and rebuild every instance from the cached features. */
   private build() {
     const zoom = this.map.getZoom();
+    const state = globalStateOf(this.map);
     const om = MercatorCoordinate.fromLngLat(this.map.getCenter(), 0);
     this.origin = { x: om.x, y: om.y, z: om.z, s: om.meterInMercatorCoordinateUnits() };
 
@@ -512,11 +582,11 @@ export class GltfManager {
     // `thin` metres. Candidates are collected first and selected at the end, so
     // an over-budget view shrinks that distance instead of thinning everything.
     // The view is clipped to where density has fallen below ~1/64.
-    const thin = this.config.thinningDistance(zoom, {});
+    const thin = this.config.thinningDistance(zoom, {}, undefined, state);
     const cam = Number.isFinite(thin) && thin > 0 ? cameraGround(this.map) : undefined;
     const maxMerc = cam ? thin * (1 + THIN_HALVINGS) * cam.s : Infinity;
     // `model-impostor-distance`: beyond it, draw the model's billboard instead.
-    const impostorDistance = this.config.impostorDistance(zoom, {});
+    const impostorDistance = this.config.impostorDistance(zoom, {}, undefined, state);
     const impostorCam = Number.isFinite(impostorDistance) ? (cam ?? cameraGround(this.map)) : undefined;
     // Everything a top-down view of this zoom would show stays a full model, at
     // any pitch: a circle around the map centre through the (padded) screen
@@ -547,7 +617,7 @@ export class GltfManager {
     // the bbox-based pre-thinning only guards against runaway candidate counts.
     const max = this.config.maxInstances;
     const budget = max * CANDIDATE_FACTOR;
-    const { cells, keep } = this.planCells(visible, zoom, view, budget);
+    const { cells, keep } = this.planCells(visible, zoom, state, view, budget);
     const inFrame = frameTest(this.map, FRAME_PAD);
     // Scan only the grid cells where the screen meets the ground.
     const rowSpan = frameGround(this.map, FRAME_PAD, cam, maxMerc);
@@ -585,7 +655,7 @@ export class GltfManager {
     };
     const place = (f: RawFeature, point: PlacedPoint, x: number, y: number): boolean => {
       const id = point.id;
-      const modelId = this.config.modelId(zoom, f.props, id);
+      const modelId = this.config.modelId(zoom, f.props, id, state);
       const model = this.models.get(modelId);
       if (!model) {
         this.warnOnce(
@@ -610,7 +680,7 @@ export class GltfManager {
           (g = {
             recs: [],
             colors: this.config.color ? [] : undefined,
-            alphas: this.config.opacity ? [] : undefined,
+            alphas: this.instanceOpacity ? [] : undefined,
           }),
         );
       }
@@ -619,12 +689,14 @@ export class GltfManager {
         lat: point.lat,
         east: (x - this.origin.x) / this.origin.s,
         north: (this.origin.y - y) / this.origin.s,
-        rot: [...this.config.rotation(zoom, f.props, id)] as Vec3,
-        scl: [...this.config.scale(zoom, f.props, id)] as Vec3,
-        tr: [...this.config.translation(zoom, f.props, id)] as Vec3,
+        rot: [...this.config.rotation(zoom, f.props, id, state)] as Vec3,
+        scl: [...this.config.scale(zoom, f.props, id, state)] as Vec3,
+        tr: [...this.config.translation(zoom, f.props, id, state)] as Vec3,
+        props: f.props,
+        id,
       });
-      g.colors?.push(this.config.color!(zoom, f.props, id));
-      g.alphas?.push(this.config.opacity!(zoom, f.props, id));
+      g.colors?.push(this.config.color!(zoom, f.props, id, state));
+      g.alphas?.push(this.config.opacity!(zoom, f.props, id, state));
       return ++placed < limit;
     };
 
@@ -691,7 +763,8 @@ export class GltfManager {
     for (const [modelId, batch] of this.batches) {
       if (!groups.has(modelId)) this.disposeBatch(modelId, batch);
     }
-    this.setFading([...groups.values()].some((g) => g.alphas?.some((a) => a < 1)));
+    this.instanceFading = [...groups.values()].some((g) => g.alphas?.some((a) => a < 1));
+    this.setFading(this.instanceFading || this.uniformFading);
     for (const [modelId, g] of groups) {
       const batch = this.batchFor(modelId, g.recs.length);
       batch.recs = g.recs;
@@ -744,6 +817,7 @@ export class GltfManager {
   private planCells(
     visible: RawFeature[],
     zoom: number,
+    state: GlobalState,
     view: GeoBounds,
     max: number,
   ): { cells: number[]; keep: number } {
@@ -762,7 +836,7 @@ export class GltfManager {
         estimate += pointsOf(f.geometry).length;
         continue;
       }
-      const spacing = Math.max(MIN_SPACING_M, this.config.spacing(zoom, f.props, f.id));
+      const spacing = Math.max(MIN_SPACING_M, this.config.spacing(zoom, f.props, f.id, state));
       cells[i] = spacing;
       // Estimate only — the real grid is banded, this just sizes the budget.
       const cell = spacing * mercatorScale((f.bbox.south + f.bbox.north) / 2);
@@ -802,7 +876,7 @@ export class GltfManager {
     const capacity = Math.max(MIN_CAPACITY, nextPow2(count));
     const meshes: THREE.InstancedMesh[] = [];
     let alphaAttr: THREE.InstancedBufferAttribute | undefined;
-    if (this.config.opacity) {
+    if (this.instanceOpacity) {
       alphaAttr = new THREE.InstancedBufferAttribute(new Float32Array(capacity), 1);
     }
     for (const proto of model.protos) {
@@ -850,6 +924,20 @@ export class GltfManager {
         this.sMat.multiplyMatrices(this.sBase, batch.protos[m].matrix);
         batch.meshes[m].setMatrixAt(i, this.sMat);
       }
+    }
+
+    for (const mesh of batch.meshes) {
+      mesh.count = n;
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.computeBoundingSphere();
+    }
+    this.writePaint(batch, colors, alphas);
+  }
+
+  /** Write per-instance colours / alphas (either may be absent). */
+  private writePaint(batch: Batch, colors?: Rgba[], alphas?: number[]) {
+    const n = batch.recs.length;
+    for (let i = 0; i < n; i++) {
       const color = colors?.[i];
       if (color) {
         this.sColor.setRGB(color[0], color[1], color[2], THREE.SRGBColorSpace);
@@ -858,14 +946,35 @@ export class GltfManager {
       const alpha = alphas?.[i];
       if (alpha !== undefined && batch.alphaAttr) batch.alphaAttr.setX(i, alpha);
     }
-
     for (const mesh of batch.meshes) {
-      mesh.count = n;
-      mesh.instanceMatrix.needsUpdate = true;
       if (colors?.length && mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-      mesh.computeBoundingSphere();
     }
     if (alphas?.length && batch.alphaAttr) batch.alphaAttr.needsUpdate = true;
+  }
+
+  /**
+   * Re-evaluate per-instance colour/alpha after a global-state change, without
+   * a rebuild (one per frame at most).
+   */
+  private schedulePaint() {
+    if (this.disposed || this.paintRafId !== undefined) return;
+    this.paintRafId = requestAnimationFrame(() => {
+      this.paintRafId = undefined;
+      const zoom = this.map.getZoom();
+      const state: GlobalState = globalStateOf(this.map);
+      const { color, opacity } = this.config;
+      const instanceOpacity = this.instanceOpacity;
+      let fading = false;
+      for (const batch of this.batches.values()) {
+        const colors = color && batch.recs.map((r) => color(zoom, r.props, r.id, state));
+        const alphas = instanceOpacity ? batch.recs.map((r) => opacity!(zoom, r.props, r.id, state)) : undefined;
+        fading ||= !!alphas?.some((a) => a < 1);
+        this.writePaint(batch, colors, alphas);
+      }
+      this.instanceFading = fading;
+      this.setFading(this.instanceFading || this.uniformFading);
+      this.map.triggerRepaint();
+    });
   }
 
   private disposeBatch(modelId: string, batch: Batch) {
@@ -952,7 +1061,8 @@ export class GltfManager {
 
   /** Whether a loaded model still lacks its impostor (bake inside a render tick). */
   needsImpostors(): boolean {
-    if (!Number.isFinite(this.config.impostorDistance(this.map.getZoom(), {}))) return false;
+    const impostorDistance = this.config.impostorDistance(this.map.getZoom(), {}, undefined, globalStateOf(this.map));
+    if (!Number.isFinite(impostorDistance)) return false;
     for (const [id, model] of this.models) {
       if (model.state === 'ready' && !id.startsWith('\u0000') && !this.models.has(impostorKey(id))) return true;
     }
@@ -1072,7 +1182,7 @@ export class GltfManager {
     };
     this.patchMaterial(material); // per-instance colour/alpha, on top of the billboard
     material.side = THREE.DoubleSide; // the quad turns; never cull it
-    material.customProgramCacheKey = () => `mtk-impostor-${this.config.opacity ? 'a' : ''}`;
+    material.customProgramCacheKey = () => `mtk-impostor-${this.opacityKey}`;
 
     return {
       url: model.url,
@@ -1110,7 +1220,10 @@ export class GltfManager {
       material.side = this.config.doubleSided ? THREE.DoubleSide : THREE.FrontSide;
     }
     if (this.config.opacity) {
-      material.defines = { ...material.defines, MTK_INSTANCE_ALPHA: '' };
+      material.defines = {
+        ...material.defines,
+        ...(this.instanceOpacity ? { MTK_INSTANCE_ALPHA: '' } : { MTK_OPACITY: '' }),
+      };
       // Transparency is switched on per build, only while some instance is
       // actually below full opacity (see setFading) — blending costs a lot.
       // Solid objects with a uniform alpha read better with depth writes on —
@@ -1120,6 +1233,7 @@ export class GltfManager {
     const previous = material.onBeforeCompile;
     material.onBeforeCompile = (shader, renderer) => {
       previous?.call(material, shader, renderer);
+      if (this.uniformOpacity) shader.uniforms.mtkOpacity = this.opacityUniform;
       shader.vertexShader = shader.vertexShader
         .replace('#include <color_pars_vertex>', PARS_VERTEX)
         .replace('#include <color_vertex>', BODY_VERTEX);
@@ -1127,8 +1241,13 @@ export class GltfManager {
         .replace('#include <color_pars_fragment>', PARS_FRAGMENT)
         .replace('#include <color_fragment>', BODY_FRAGMENT);
     };
-    material.customProgramCacheKey = () => `mtk-gltf-${this.config.opacity ? 'a' : ''}`;
+    material.customProgramCacheKey = () => `mtk-gltf-${this.opacityKey}`;
     material.needsUpdate = true;
+  }
+
+  /** Shader variant for `model-opacity`: per-instance, uniform or none. */
+  private get opacityKey(): string {
+    return this.instanceOpacity ? 'a' : this.uniformOpacity ? 'u' : '';
   }
 
   private warnOnce(key: string, ...message: unknown[]) {
@@ -1143,6 +1262,8 @@ export class GltfManager {
     this.map.off('data', this.onData);
     this.map.off('moveend', this.onMoveEnd);
     if (this.rafId !== undefined) cancelAnimationFrame(this.rafId);
+    if (this.paintRafId !== undefined) cancelAnimationFrame(this.paintRafId);
+    for (const unwatch of this.unwatchGlobalState) unwatch();
     if (this.settleTimer !== undefined) clearTimeout(this.settleTimer);
     for (const [modelId, batch] of this.batches) this.disposeBatch(modelId, batch);
     for (const model of this.models.values()) {

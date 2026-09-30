@@ -58,8 +58,12 @@ export interface Fill3DLayerOptions {
  * ```
  *
  * `fill-3d-color` / `fill-3d-opacity` are evaluated per feature (against its
- * feature properties + zoom) into per-vertex colours. Note: `visibility` and the
- * paint values are read once when the layer is added (no live `setPaintProperty`).
+ * feature properties + zoom) into per-vertex colours. `["global-state", …]` reads
+ * the map's global state (`map.setGlobalStateProperty`) and updates live; an
+ * opacity that is the same for every feature (zoom / global state only) is
+ * evaluated each frame, so zoom and pitch fades are smooth. Note: `visibility`
+ * and the paint values are read once when the layer is added (no live
+ * `setPaintProperty`).
  */
 export class Fill3DLayer implements CustomLayerInterface {
   readonly id: string;
@@ -156,6 +160,8 @@ export class Fill3DLayer implements CustomLayerInterface {
       .makeTranslation(o.x, o.y, o.z)
       .scale(this.originScale.set(o.s, -o.s, o.s));
 
+    // Fully faded out (e.g. a zoom or pitch fade) → nothing to draw.
+    if (this.manager!.syncOpacity() <= 0) return;
     this.manager!.syncLight(); // match fill-extrusion shading (light follows bearing)
     this.camera.projectionMatrix.multiplyMatrices(this.mainMat, this.originMat);
     this.renderer.resetState();

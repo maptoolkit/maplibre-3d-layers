@@ -291,6 +291,8 @@ export class GltfLayer implements CustomLayerInterface {
 
   render(_gl: WebGL2RenderingContext, args: CustomRenderMethodInput) {
     if (!this.visible) return; // hidden → don't draw, don't keep repainting
+    // Fully faded out (e.g. a zoom or pitch fade) → nothing to draw.
+    if (this.manager!.syncOpacity() <= 0) return;
 
     // Fold the (re-anchored) scene origin into the camera projection so instance
     // matrices stay in small local metres. Origin is at sea level; instances

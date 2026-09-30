@@ -10,12 +10,20 @@ import type {
 /** A style value: either a constant or a MapLibre expression. */
 export type StyleValue<T> = T | ExpressionSpecification;
 
-/** A compiled property: evaluate against zoom + a feature's properties/id. */
-export type Evaluator<T> = (
-  zoom: number,
-  props: Record<string, unknown>,
-  id?: string | number,
-) => T;
+/** The map's global state (`map.getGlobalState()`), read by `["global-state", …]`. */
+export type GlobalState = Record<string, unknown>;
+
+/**
+ * A compiled property: evaluate against zoom + a feature's properties/id, and
+ * the map's global state for `["global-state", …]`.
+ */
+export interface Evaluator<T> {
+  (zoom: number, props: Record<string, unknown>, id?: string | number, globalState?: GlobalState): T;
+  /** Same value for every feature — depends on zoom and global state only. */
+  readonly featureConstant: boolean;
+  /** Global-state keys the value reads; a change to one of them needs a re-evaluation. */
+  readonly globalStateRefs: ReadonlySet<string>;
+}
 
 /** MVT geometry type used when evaluating (`['geometry-type']` depends on it). */
 export type GeometryType = 1 | 2 | 3; // Point | LineString | Polygon
@@ -48,6 +56,39 @@ const STRING_SPEC = spec({
 
 interface Compiled {
   evaluate(globals: GlobalProperties, feature: Feature): unknown;
+  /** 'constant' | 'camera' don't read feature data ('source' | 'composite' do). */
+  kind: string;
+  globalStateRefs?: Set<string>;
+}
+
+const NO_REFS: ReadonlySet<string> = new Set();
+
+/** Attach what an evaluator depends on (see {@link Evaluator}). */
+function evaluator<T>(
+  fn: (zoom: number, props: Record<string, unknown>, id?: string | number, globalState?: GlobalState) => T,
+  featureConstant: boolean,
+  globalStateRefs: ReadonlySet<string> = NO_REFS,
+): Evaluator<T> {
+  return Object.assign(fn, { featureConstant, globalStateRefs });
+}
+
+/** An evaluator that always returns `value`. */
+function constant<T>(value: T): Evaluator<T> {
+  return evaluator(() => value, true);
+}
+
+/** Wrap a compiled expression; `read` post-processes its raw result. */
+function fromCompiled<T>(
+  expr: Compiled,
+  geometryType: GeometryType,
+  read: (v: unknown) => T,
+): Evaluator<T> {
+  return evaluator(
+    (zoom, props, id, globalState) =>
+      read(expr.evaluate({ zoom, globalState } as GlobalProperties, makeFeature(geometryType, props, id))),
+    expr.kind === 'constant' || expr.kind === 'camera',
+    expr.globalStateRefs ?? NO_REFS,
+  );
 }
 
 /** Compile one value; returns undefined (after warning) if it doesn't parse. */
@@ -79,15 +120,15 @@ export function compileColor(
   fallback: Rgba,
   geometryType: GeometryType = 3,
 ): Evaluator<Rgba> {
-  if (value === undefined) return () => fallback;
+  if (value === undefined) return constant(fallback);
   const expr = compile(value, name, COLOR_SPEC);
-  if (!expr) return () => fallback;
-  return (zoom, props, id) => {
-    const c = expr.evaluate({ zoom } as GlobalProperties, makeFeature(geometryType, props, id)) as Color;
+  if (!expr) return constant(fallback);
+  return fromCompiled(expr, geometryType, (v) => {
+    const c = v as Color;
     // Color channels are premultiplied by alpha — undo for a plain RGB triple.
     const inv = c.a > 0 ? 1 / c.a : 0;
-    return [c.r * inv, c.g * inv, c.b * inv, c.a];
-  };
+    return [c.r * inv, c.g * inv, c.b * inv, c.a] as Rgba;
+  });
 }
 
 /** Compile a numeric property. */
@@ -97,11 +138,10 @@ export function compileNumber(
   fallback: number,
   geometryType: GeometryType = 3,
 ): Evaluator<number> {
-  if (value === undefined) return () => fallback;
+  if (value === undefined) return constant(fallback);
   const expr = compile(value, name, NUMBER_SPEC);
-  if (!expr) return () => fallback;
-  return (zoom, props, id) =>
-    expr.evaluate({ zoom } as GlobalProperties, makeFeature(geometryType, props, id)) as number;
+  if (!expr) return constant(fallback);
+  return fromCompiled(expr, geometryType, (v) => v as number);
 }
 
 /** Compile a string property (e.g. `model-id`). */
@@ -111,11 +151,10 @@ export function compileString(
   fallback: string,
   geometryType: GeometryType = 3,
 ): Evaluator<string> {
-  if (value === undefined) return () => fallback;
+  if (value === undefined) return constant(fallback);
   const expr = compile(value, name, STRING_SPEC);
-  if (!expr) return () => fallback;
-  return (zoom, props, id) =>
-    expr.evaluate({ zoom } as GlobalProperties, makeFeature(geometryType, props, id)) as string;
+  if (!expr) return constant(fallback);
+  return fromCompiled(expr, geometryType, (v) => v as string);
 }
 
 /**
@@ -140,43 +179,40 @@ export function compileVec3(
   fallback: Vec3,
   geometryType: GeometryType = 3,
 ): Evaluator<Vec3> {
-  if (value === undefined) return () => fallback;
+  if (value === undefined) return constant(fallback);
 
   // Scalar shorthand: the same value on all three axes (uniform scaling).
-  if (typeof value === 'number') {
-    const uniform: Vec3 = [value, value, value];
-    return () => uniform;
-  }
+  if (typeof value === 'number') return constant<Vec3>([value, value, value]);
 
   // A bare 3-array that isn't itself an expression → compile per component, so
   // individual components may be expressions.
   if (Array.isArray(value) && value.length === 3 && !isExpression(value)) {
-    if (value.every((v) => typeof v === 'number')) {
-      const constant = [...value] as Vec3;
-      return () => constant;
-    }
+    if (value.every((v) => typeof v === 'number')) return constant([...value] as Vec3);
     const parts = value.map((v, i) =>
       compileNumber(v as StyleValue<number>, `${name}[${i}]`, fallback[i], geometryType),
     );
     const out: Vec3 = [0, 0, 0];
-    return (zoom, props, id) => {
-      out[0] = parts[0](zoom, props, id);
-      out[1] = parts[1](zoom, props, id);
-      out[2] = parts[2](zoom, props, id);
-      return out;
-    };
+    return evaluator(
+      (zoom, props, id, globalState) => {
+        out[0] = parts[0](zoom, props, id, globalState);
+        out[1] = parts[1](zoom, props, id, globalState);
+        out[2] = parts[2](zoom, props, id, globalState);
+        return out;
+      },
+      parts.every((p) => p.featureConstant),
+      new Set(parts.flatMap((p) => [...p.globalStateRefs])),
+    );
   }
 
   const expr = compile(value, name, spec({ ...VEC3_SPEC, default: fallback }));
-  if (!expr) return () => fallback;
+  if (!expr) return constant(fallback);
   const out: Vec3 = [0, 0, 0];
-  return (zoom, props, id) => {
-    const v = expr.evaluate({ zoom } as GlobalProperties, makeFeature(geometryType, props, id));
+  return fromCompiled(expr, geometryType, (v) => {
     if (typeof v === 'number') {
       out[0] = out[1] = out[2] = v;
       return out;
     }
     if (Array.isArray(v) && v.length === 3) return v as Vec3;
     return fallback;
-  };
+  });
 }
