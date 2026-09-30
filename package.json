@@ -1,6 +1,6 @@
 {
   "name": "@maptoolkit/maplibre-3d-layers",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Render a z-encoded MVT (maptoolkit buildings3d) as real 3D meshes via three.js, as a MapLibre GL JS custom layer.",
   "type": "module",
   "license": "MIT",
