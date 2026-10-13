@@ -80,7 +80,7 @@ map.on('load', () => {
 
   map.addSource('buildings3d', {
     type: 'vector',
-    url: 'https://vtc.maptoolkit.net/buildings3d.json',
+    url: 'https://dataconnector.maptoolkit.net/maptoolkit/buildings3d2.json?api_key=iib',
   });
 
   // Footprints — also what makes MapLibre load the source's tiles.
