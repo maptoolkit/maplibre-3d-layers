@@ -397,6 +397,16 @@ Positions jump straight to their new location — there is no interpolation betw
 updates. `paint`, `layout` and `visibility` are read once when the layer is added;
 custom layers have no `setPaintProperty`.
 
+For frame-by-frame rendering (e.g. recording a camera flight on a frozen clock),
+bring the layer up to date with the current view yourself and wait for it before
+drawing the frame. Both `GltfLayer` and `Fill3DLayer` have:
+
+```js
+layer.update();          // what the end of a move does, now (also mid-move); cheap if nothing changed
+await layer.whenIdle();  // nothing in flight: data read, models and tiles loaded, terrain heights baked
+map.triggerRepaint();    // the layer changed after the last render: draw the frame again
+```
+
 ### Lighting
 
 Direction and colour follow the style's `light` property (including

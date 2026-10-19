@@ -4,6 +4,7 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { GltfManager } from './GltfManager';
 import type { ImpostorLight } from './GltfManager';
+import { untilIdle } from './idle';
 import { compileColor, compileNumber, compileString, compileVec3 } from './expression';
 import type { StyleValue, Vec3 } from './expression';
 import type { ExpressionSpecification, FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
@@ -412,6 +413,21 @@ export class GltfLayer implements CustomLayerInterface {
     room.dispose();
     pmrem.dispose();
     this.renderer.resetState(); // PMREM rendered into the shared context
+  }
+
+  /**
+   * For frame-by-frame rendering, e.g. recording a camera flight: bring the layer up to date
+   * with the current view now. Otherwise it only updates once the map stops moving. Await
+   * {@link whenIdle} before drawing the frame.
+   */
+  update(): void {
+    if (this.visible) this.manager?.updateNow();
+  }
+
+  /** Resolves once the layer has nothing in flight: data read, models and tiles loaded, terrain heights baked. */
+  whenIdle(): Promise<void> {
+    const manager = this.manager;
+    return manager ? untilIdle(() => manager.isIdle()) : Promise.resolve();
   }
 
   onRemove() {

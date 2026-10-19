@@ -322,6 +322,9 @@ export class GltfManager {
   private pendingDemRegions: GeoBounds[] = [];
   private rafId?: number;
   private settleTimer?: ReturnType<typeof setTimeout>;
+  private flushing = false;
+  private viewMoved = true; // since the last read/build
+  private readonly onMove = () => (this.viewMoved = true);
   private disposed = false;
 
   // Scratch objects reused while writing instance matrices.
@@ -376,6 +379,7 @@ export class GltfManager {
     this.onMoveEnd = () => (this.wholeDataset ? this.schedule(false, true) : this.refresh());
     map.on('data', this.onData);
     map.on('moveend', this.onMoveEnd);
+    map.on('move', this.onMove);
 
     // `["global-state", …]`. Colour/alpha are rewritten in place; anything that
     // decides placement or transforms needs a rebuild, which a move does anyway
@@ -446,6 +450,28 @@ export class GltfManager {
     }, DATA_SETTLE_MS);
   }
 
+  /**
+   * What the end of a move or a data burst does, right away (also mid-move, without waiting for
+   * the data to settle). Nothing if neither happened since the last read/build.
+   */
+  updateNow() {
+    if (this.settleTimer !== undefined) {
+      clearTimeout(this.settleTimer);
+      this.settleTimer = undefined;
+      this.refresh();
+    } else if (this.viewMoved) {
+      this.onMoveEnd();
+    }
+  }
+
+  /** Nothing in flight: no model loading, no read, build, rebake or repaint waiting. */
+  isIdle(): boolean {
+    if (this.flushing || this.rafId !== undefined || this.paintRafId !== undefined || this.settleTimer !== undefined) return false;
+    if (this.needsRead || this.needsBuild || this.pendingDemRegions.length) return false;
+    for (const model of this.models.values()) if (model.state === 'loading') return false;
+    return true;
+  }
+
   /** Re-read the source and rebuild all instances (coalesced to one frame). */
   refresh() {
     this.schedule(true, true);
@@ -458,12 +484,14 @@ export class GltfManager {
     if (this.rafId !== undefined) return;
     this.rafId = requestAnimationFrame(() => {
       this.rafId = undefined;
-      void this.flush();
+      this.flushing = true;
+      void this.flush().finally(() => (this.flushing = false));
     });
   }
 
   private async flush() {
     if (this.disposed) return;
+    if (this.needsRead || this.needsBuild) this.viewMoved = false; // read/built for the current view
     // Out of the zoom range: drop everything and don't even read the source.
     // MapLibre already skips render(), but the instances would still be built.
     if (this.hidden()) {
@@ -1261,6 +1289,7 @@ export class GltfManager {
     this.disposed = true;
     this.map.off('data', this.onData);
     this.map.off('moveend', this.onMoveEnd);
+    this.map.off('move', this.onMove);
     if (this.rafId !== undefined) cancelAnimationFrame(this.rafId);
     if (this.paintRafId !== undefined) cancelAnimationFrame(this.paintRafId);
     for (const unwatch of this.unwatchGlobalState) unwatch();

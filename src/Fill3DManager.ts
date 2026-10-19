@@ -295,6 +295,20 @@ export class Fill3DManager {
     }
   }
 
+  /** What the end of a move does, right away: re-anchor if needed, load the view's tiles. */
+  updateNow() {
+    this.maybeRebase();
+    this.update();
+  }
+
+  /** Nothing in flight: no tile loading or parsing, no rebake or recolour waiting. */
+  isIdle(): boolean {
+    if (this.onSourceData || this.rebakeRafId !== undefined || this.recolorRafId !== undefined) return false;
+    if (this.pendingDemRegions.length) return false;
+    for (const entry of this.tiles.values()) if (entry.state === 'loading') return false;
+    return true;
+  }
+
   /** Fetch a canonical tile's original pbf and hand it to the worker. */
   private loadTile(key: string, x: number, y: number, z: number) {
     const pow = 2 ** z;

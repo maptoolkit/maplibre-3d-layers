@@ -3,6 +3,7 @@ import type { Map, CustomLayerInterface, CustomRenderMethodInput } from 'maplibr
 import * as THREE from 'three';
 import { ElevationCache } from './ElevationCache';
 import { Fill3DManager } from './Fill3DManager';
+import { untilIdle } from './idle';
 import { compileColor, compileOpacity } from './paint';
 import type { PaintValue } from './paint';
 import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
@@ -173,6 +174,21 @@ export class Fill3DLayer implements CustomLayerInterface {
     this.renderer.render(this.scene, this.camera);
     // No triggerRepaint() here: that re-renders the map every frame even when
     // nothing changes. Tile loads and DEM rebakes request their own.
+  }
+
+  /**
+   * For frame-by-frame rendering, e.g. recording a camera flight: bring the layer up to date
+   * with the current view now. Otherwise it only updates once the map stops moving. Await
+   * {@link whenIdle} before drawing the frame.
+   */
+  update(): void {
+    if (this.visible) this.manager?.updateNow();
+  }
+
+  /** Resolves once the layer has nothing in flight: data read, models and tiles loaded, terrain heights baked. */
+  whenIdle(): Promise<void> {
+    const manager = this.manager;
+    return manager ? untilIdle(() => manager.isIdle()) : Promise.resolve();
   }
 
   onRemove() {
