@@ -342,8 +342,8 @@ should rarely need changing. What the layer does on its own:
 - **Billboards far away.** Beyond `model-impostor-distance` a model is only a few
   pixels tall, yet its full mesh would be most of the GPU cost. Each model is
   rendered once into a small texture, and distant instances show it on a
-  camera-facing quad of two triangles. Colour and opacity carry over; gloss and
-  reflections don't, which is invisible at that size. Whatever a top-down view of
+  camera-facing quad of two triangles. Colour and opacity carry over (a fade blends
+  them like the full models); gloss and reflections don't, which is invisible at that size. Whatever a top-down view of
   the current zoom would show stays a full model, however far you tilt — so at
   0° pitch there are no billboards at all.
 - **Cheap to draw.** Closed meshes skip their back faces, and materials only
