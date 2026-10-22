@@ -37,7 +37,7 @@
 
     map.on('load', () => {
       // Replace the style's own OSM 3D buildings — else they z-fight our meshes.
-      for (const id of ['building_3D', 'building_3D_public']) {
+      for (const id of ['building_3d', 'building_3d_multicolored']) {
         if (map.getLayer(id)) map.removeLayer(id);
       }
 
@@ -53,7 +53,7 @@
       // The buildings tiles as a first-class vector source.
       map.addSource('buildings3d', {
         type: 'vector',
-        url: 'https://vtc.maptoolkit.net/buildings3d.json?api_key=iib',
+        url: 'https://dataconnector.maptoolkit.net/maptoolkit/buildings3d2.json?api_key=iib',
       });
 
       // LOD1: native fill-extrusion on the 2D footprints — also makes MapLibre
