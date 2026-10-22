@@ -12,6 +12,9 @@ import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
 // worker asset to host. Works for both the ESM package and the <script> build.
 import Mvt3dWorker from './mvt3dWorker.ts?worker&inline';
 
+/** The parts of MapLibre's `RequestParameters` a tile fetch uses. */
+type TileRequestParameters = { url: string; credentials?: RequestCredentials; headers?: HeadersInit };
+
 /** Vertices this close (metres) above a building's base count as its base. */
 const BASE_EPSILON_M = 0.05;
 
@@ -310,7 +313,8 @@ export class Fill3DManager {
       .replace('{x}', String(x))
       .replace('{y}', String(y));
 
-    fetch(url)
+    this.tileRequest(url)
+      .then((req) => fetch(req.url, { credentials: req.credentials, headers: req.headers }))
       .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
       .then((buffer) => {
         const e = this.tiles.get(key);
@@ -330,6 +334,23 @@ export class Fill3DManager {
         const entry = this.tiles.get(key);
         if (entry) entry.state = 'empty';
       });
+  }
+
+  /**
+   * A tile request as MapLibre sends its own: through the map's `transformRequest`
+   * (rewritten URL, credentials such as a session cookie, headers). `_requestManager`
+   * is MapLibre-internal; without it, or if the transform fails, the URL is fetched as is.
+   */
+  private async tileRequest(url: string): Promise<TileRequestParameters> {
+    const manager = (this.map as unknown as {
+      _requestManager?: { transformRequest(url: string, type: string): TileRequestParameters | Promise<TileRequestParameters> };
+    })._requestManager;
+    if (!manager) return { url };
+    try {
+      return await manager.transformRequest(url, 'Tile');
+    } catch {
+      return { url };
+    }
   }
 
   private onTileParsed(result: TileResult) {

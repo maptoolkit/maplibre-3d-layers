@@ -114,6 +114,12 @@ map.on('load', () => {
 > Put the `fill-extrusion` on `buildings2d`, **never** on `buildings3d` — a
 > native style layer cannot render the 3D source-layer and will produce garbage.
 
+The layer fetches the source's original tiles itself (above `maxzoom` MapLibre
+would only hand it re-encoded, overzoomed ones). Those requests go through the
+map's `transformRequest` like MapLibre's own, so credentials and headers set
+there apply to them too, e.g. a session cookie with `credentials: 'include'`
+instead of an `api_key` in the URL.
+
 ### Options
 
 | option | required | description |
