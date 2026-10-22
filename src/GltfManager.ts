@@ -253,16 +253,33 @@ const PARS_FRAGMENT = /* glsl */ `
 #endif
 `;
 
-const BODY_FRAGMENT = /* glsl */ `
-#include <color_fragment>
-#if defined( USE_INSTANCING_COLOR ) && !defined( USE_COLOR ) && !defined( USE_COLOR_ALPHA )
-  diffuseColor.rgb *= vColor.rgb;
-#endif
+// `model-opacity` multiplies the fragment's alpha. Billboards apply it only after
+// the alpha test (MTK_ALPHA_AFTER_TEST): their cutout must test the baked
+// texture's own alpha, or an opacity below 0.5 would discard every fragment
+// and one above would make the billboard fully opaque.
+const OPACITY_FRAGMENT = /* glsl */ `
 #ifdef MTK_INSTANCE_ALPHA
   diffuseColor.a *= vInstanceAlpha;
 #endif
 #ifdef MTK_OPACITY
   diffuseColor.a *= mtkOpacity;
+#endif
+`;
+
+const BODY_FRAGMENT = /* glsl */ `
+#include <color_fragment>
+#if defined( USE_INSTANCING_COLOR ) && !defined( USE_COLOR ) && !defined( USE_COLOR_ALPHA )
+  diffuseColor.rgb *= vColor.rgb;
+#endif
+#ifndef MTK_ALPHA_AFTER_TEST
+${OPACITY_FRAGMENT}
+#endif
+`;
+
+const ALPHATEST_FRAGMENT = /* glsl */ `
+#include <alphatest_fragment>
+#ifdef MTK_ALPHA_AFTER_TEST
+${OPACITY_FRAGMENT}
 #endif
 `;
 
@@ -300,6 +317,8 @@ export class GltfManager {
   private readonly impostorRight = { value: new THREE.Vector3(1, 0, 0) };
   /** The distance-thinning scale the last build fitted; seeds the next one's cutoff. */
   private lastThinScale = 1;
+  /** Billboard materials: cut out by alpha test, opacity applied after it (see setFading). */
+  private readonly impostorMaterials = new WeakSet<THREE.Material>();
   /** Whether a material was transparent as authored (e.g. glTF alphaMode BLEND). */
   private readonly ownTransparent = new WeakMap<THREE.Material, boolean>();
   /** `model-opacity` when it's the same for every instance, shared by all shaders. */
@@ -1181,6 +1200,9 @@ export class GltfManager {
       );
     };
     this.patchMaterial(material); // per-instance colour/alpha, on top of the billboard
+    material.defines = { ...material.defines, MTK_ALPHA_AFTER_TEST: '' };
+    this.impostorMaterials.add(material);
+    this.applyFading(material, this.instanceFading || this.uniformFading);
     material.side = THREE.DoubleSide; // the quad turns; never cull it
     material.customProgramCacheKey = () => `mtk-impostor-${this.opacityKey}`;
 
@@ -1201,14 +1223,23 @@ export class GltfManager {
     for (const model of this.models.values()) {
       for (const proto of model.protos) {
         const materials = Array.isArray(proto.material) ? proto.material : [proto.material];
-        for (const m of materials) {
-          const transparent = fading || (this.ownTransparent.get(m) ?? false);
-          if (m.transparent === transparent) continue;
-          m.transparent = transparent;
-          m.needsUpdate = true;
-        }
+        for (const m of materials) this.applyFading(m, fading);
       }
     }
+  }
+
+  /**
+   * One material's share of setFading. Billboards keep their alpha test either
+   * way; while fading they drop alpha-to-coverage, which would turn the faded
+   * alpha into a coverage mask on top of the blending.
+   */
+  private applyFading(m: THREE.Material, fading: boolean) {
+    const transparent = fading || (this.ownTransparent.get(m) ?? false);
+    const coverage = this.impostorMaterials.has(m) ? !fading : m.alphaToCoverage;
+    if (m.transparent === transparent && m.alphaToCoverage === coverage) return;
+    m.transparent = transparent;
+    m.alphaToCoverage = coverage;
+    m.needsUpdate = true;
   }
 
   /** Make a stock three material honour `instanceColor` and our `instanceAlpha`. */
@@ -1239,7 +1270,8 @@ export class GltfManager {
         .replace('#include <color_vertex>', BODY_VERTEX);
       shader.fragmentShader = shader.fragmentShader
         .replace('#include <color_pars_fragment>', PARS_FRAGMENT)
-        .replace('#include <color_fragment>', BODY_FRAGMENT);
+        .replace('#include <color_fragment>', BODY_FRAGMENT)
+        .replace('#include <alphatest_fragment>', ALPHATEST_FRAGMENT);
     };
     material.customProgramCacheKey = () => `mtk-gltf-${this.opacityKey}`;
     material.needsUpdate = true;
