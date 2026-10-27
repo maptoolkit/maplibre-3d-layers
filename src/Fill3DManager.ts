@@ -134,7 +134,9 @@ interface TileEntry {
  *
  * Vertical placement: the worker emits feature-base-relative heights; this class
  * bakes terrain elevation per feature centroid into the vertex Y, and re-bakes
- * whenever new DEM tiles stream in (via the shared {@link ElevationCache}).
+ * whenever new DEM tiles stream in (via the shared {@link ElevationCache}) or the
+ * map's terrain is switched. Without terrain the meshes sit on the flat map,
+ * nothing below it: the source sinks ground walls 10 m for slopes (see bake).
  */
 export class Fill3DManager {
   /** Current scene anchor; read by the layer to build the projection matrix. */
@@ -151,6 +153,7 @@ export class Fill3DManager {
   private readonly config: Fill3DConfig;
   private readonly onData: (ev: unknown) => void;
   private readonly onMoveEnd: () => void;
+  private readonly onTerrain: () => void;
   private onSourceData?: (ev: unknown) => void;
   private readonly unwatchGlobalState: () => void;
   private recolorRafId?: number;
@@ -208,8 +211,15 @@ export class Fill3DManager {
       this.maybeRebase();
       this.update();
     };
+    // Terrain switched on, off or re-set: the cached elevations are stale, and
+    // without terrain the sunk wall bases must come up to the map (see bake).
+    this.onTerrain = () => {
+      this.elevation.clear();
+      this.rebakeAll();
+    };
     map.on('data', this.onData);
     map.on('moveend', this.onMoveEnd);
+    map.on('terrain', this.onTerrain);
 
     // `["global-state", …]`: a per-feature value is baked into the vertices, so
     // re-bake it; a feature-constant opacity is a uniform read every frame.
@@ -522,29 +532,49 @@ export class Fill3DManager {
    * it drops below the anchor — so the downhill walls of a building on a slope
    * reach the ground instead of floating. (fill-extrusion sinks the base 10 m
    * instead; these meshes aren't hidden by terrain, so that would show.)
+   *
+   * The source itself sinks the walls standing on a building's base 10 m below
+   * it as a reserve for slopes (buildings3d `MTK_BUILDINGS3D_GROUND_DEPTH`): the
+   * only vertices below the base. The terrain surface covers that reserve. The
+   * flat map covers nothing, so without terrain those vertices come up to the
+   * base — else every wall shows 10 m too deep on a pitched map.
    */
   private bake(entry: TileEntry) {
     if (!entry.geometry || !entry.positionBase || !entry.features) return;
     const attr = entry.geometry.getAttribute('position') as THREE.BufferAttribute;
     const pos = attr.array as Float32Array;
     const base = entry.positionBase;
+    const flat = !this.map.terrain;
     const elevationAt = this.elevation.batch();
     const groundAt = createMercatorElevationSampler(this.map);
     const scale = entry.tileScale ?? 0;
 
     for (const b of entry.features) {
-      const ele = elevationAt(new LngLat(b.lng, b.lat));
+      const ele = flat ? 0 : elevationAt(new LngLat(b.lng, b.lat));
       const end = b.start + b.count;
       for (let v = b.start; v < end; v++) {
         const rel = base[v * 3 + 1];
-        pos[v * 3 + 1] =
-          rel <= BASE_EPSILON_M && scale
+        pos[v * 3 + 1] = flat
+          ? Math.max(rel, 0)
+          : rel <= BASE_EPSILON_M && scale
             ? Math.min(ele, groundAt(entry.tileMx + pos[v * 3] * scale, entry.tileMy - pos[v * 3 + 2] * scale)) + rel
             : rel + ele;
       }
     }
     attr.needsUpdate = true;
     entry.geometry.computeBoundingSphere();
+  }
+
+  /** Rebake every ready tile against the map's current terrain (or none). */
+  private rebakeAll() {
+    this.pendingDemRegions = [];
+    let changed = 0;
+    for (const entry of this.tiles.values()) {
+      if (entry.state !== 'ready') continue;
+      this.bake(entry);
+      changed++;
+    }
+    if (changed) this.map.triggerRepaint();
   }
 
   /** Coalesce a burst of DEM `data` events into one rebake on the next frame. */
@@ -576,6 +606,7 @@ export class Fill3DManager {
   dispose() {
     this.map.off('data', this.onData);
     this.map.off('moveend', this.onMoveEnd);
+    this.map.off('terrain', this.onTerrain);
     if (this.onSourceData) this.map.off('sourcedata', this.onSourceData);
     if (this.rebakeRafId !== undefined) cancelAnimationFrame(this.rebakeRafId);
     if (this.recolorRafId !== undefined) cancelAnimationFrame(this.recolorRafId);
