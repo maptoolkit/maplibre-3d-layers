@@ -134,6 +134,11 @@ export class ElevationCache {
     map.on('data', this.onData);
   }
 
+  /** Drop every cached sample, e.g. after the map's terrain changed. */
+  clear() {
+    this.entries.clear();
+  }
+
   /** Detach the terrain-data listener and clear the cache. */
   dispose() {
     this.map.off('data', this.onData);
