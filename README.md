@@ -302,9 +302,14 @@ Like everything else it can be data- or zoom-driven:
 )
 ```
 
-Orientation follows the glTF convention that assets face **+Z**, which the layer
-maps to north. So `model-rotation: [0, 0, 0]` points a model north, and
+Orientation follows the glTF convention that assets face **+Z** with their right
+side at **−X**; the layer maps +Z to north and −X to east. So
+`model-rotation: [0, 0, 0]` points a model north, and
 `[0, 0, ['get', 'bearing']]` takes a plain compass bearing with no offset.
+A georeferenced export with north at −Z and east at +X (Blender's glTF export of
+a scene modelled east = +X, north = +Y) needs a 180° turn about the vertical
+axis, in the file or as `model-rotation: [0, 0, 180]`. Up to 0.5.3 the layer
+mapped +X to east and so drew every model mirrored.
 `model-translation` is applied after rotation and scale — use its third component
 to lift a model whose origin sits in its middle rather than at its feet.
 
