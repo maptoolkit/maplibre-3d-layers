@@ -60,8 +60,9 @@ jobs:
         with:
           files: dist/maplibre-3d-layers.standalone.mjs
 
-      # Consumers that pin this package (styleeditor, community docs) open a bump PR on this
-      # event; each one ignores packages it doesn't use and waits until npm serves the version.
+      # Consumers that pin this package (styleeditor, community docs, the maptoolkit.org website)
+      # open a bump PR on this event; each one ignores packages it doesn't use and waits until
+      # npm serves the version.
       # The version is the one npm publish just used: package.json's, not the tag's.
       - name: Notify consumers
         continue-on-error: true
@@ -69,7 +70,7 @@ jobs:
           GH_TOKEN: ${{ secrets.MAPTOOLKIT_OPS_PAT }}
         run: |
           name=$(node -p "require('./package.json').name"); version=$(node -p "require('./package.json').version")
-          for repo in maptoolkit/styleeditor maptoolkit/docs; do
+          for repo in maptoolkit/styleeditor maptoolkit/docs maptoolkit/maptoolkit-org-website; do
             gh api "repos/$repo/dispatches" -f event_type=maptoolkit-package-released \
               -f "client_payload[package]=$name" -f "client_payload[version]=$version" \
               && echo "$repo ← $name@$version" \
