@@ -139,6 +139,11 @@ export interface ImpostorLight {
 /** Key of a model's impostor in `models` — can't collide with a user model id. */
 const impostorKey = (modelId: string) => `\u0000impostor:${modelId}`;
 
+// glTF is right-handed (+Y up, front +Z, right −X); the scene frame
+// (x=east, y=up, z=north) is mirrored. Models are mirrored across x = 0 on
+// load, so a model at rotation 0 faces north with its right side east.
+const MIRROR_X = new THREE.Matrix4().makeScale(-1, 1, 1);
+
 /** Impostor texture width in pixels; the height follows the model's aspect. */
 const IMPOSTOR_RES = 128;
 
@@ -1028,11 +1033,13 @@ export class GltfManager {
   /**
    * Flatten a loaded glTF scene into instanceable primitives: one entry per mesh,
    * carrying the mesh's transform *within* the file so a node hierarchy survives
-   * instancing. Materials are patched for per-instance colour/alpha.
+   * instancing. Geometry is mirrored into the scene's handedness (MIRROR_X).
+   * Materials are patched for per-instance colour/alpha.
    */
   private flatten(root: THREE.Object3D): Proto[] {
     root.updateMatrixWorld(true);
     const protos: Proto[] = [];
+    const mirrored = { flipped: new Set<object>(), rewound: new Set<object>() };
     root.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
       if (!mesh.isMesh) return;
@@ -1042,10 +1049,14 @@ export class GltfManager {
       }
       const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
       for (const material of materials) this.patchMaterial(material);
+      mirrorX(mesh.geometry, mirrored);
       protos.push({
         geometry: mesh.geometry,
         material: mesh.material,
-        matrix: mesh.matrixWorld.clone(),
+        // M·W·M on the mirrored geometry = M·W on the file's. The mirror can't
+        // go into the instance matrix: three.js culls by the mesh's handedness,
+        // not the instance's, so the model would show its back faces.
+        matrix: MIRROR_X.clone().multiply(mesh.matrixWorld).multiply(MIRROR_X),
       });
     });
 
@@ -1569,6 +1580,51 @@ function frameGround(
     }
     return lo <= hi ? [lo, hi] : null;
   };
+}
+
+/**
+ * Mirror a geometry across x = 0 and reverse its triangles, in place, so it
+ * stays consistently wound with its front faces outside. glTF lets primitives
+ * share accessors, so `mirrored` keeps a shared attribute from flipping twice.
+ */
+function mirrorX(geometry: THREE.BufferGeometry, mirrored: { flipped: Set<object>; rewound: Set<object> }) {
+  const first = (seen: Set<object>, item: object) => !seen.has(item) && !!seen.add(item);
+
+  for (const name of ['position', 'normal', 'tangent']) {
+    const attr = geometry.getAttribute(name);
+    if (!attr || !first(mirrored.flipped, attr)) continue;
+    for (let i = 0; i < attr.count; i++) {
+      attr.setX(i, -attr.getX(i));
+      // A tangent's w is the bitangent's sign, which flips with the handedness.
+      if (name === 'tangent') attr.setW(i, -attr.getW(i));
+    }
+  }
+
+  const index = geometry.getIndex();
+  if (index) {
+    if (first(mirrored.rewound, index)) {
+      for (let t = 0; t + 2 < index.count; t += 3) {
+        const b = index.getX(t + 1);
+        index.setX(t + 1, index.getX(t + 2));
+        index.setX(t + 2, b);
+      }
+    }
+  } else {
+    for (const attr of Object.values(geometry.attributes)) {
+      if (!first(mirrored.rewound, attr)) continue;
+      for (let t = 0; t + 2 < attr.count; t += 3) {
+        for (let c = 0; c < attr.itemSize; c++) {
+          const b = attr.getComponent(t + 1, c);
+          attr.setComponent(t + 1, c, attr.getComponent(t + 2, c));
+          attr.setComponent(t + 2, c, b);
+        }
+      }
+    }
+  }
+
+  // GLTFLoader sets the bounds from the accessors' min/max.
+  geometry.boundingBox = null;
+  geometry.boundingSphere = null;
 }
 
 /**
