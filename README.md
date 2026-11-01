@@ -349,7 +349,11 @@ should rarely need changing. What the layer does on its own:
 
 - **Only what's on screen.** Models are placed where the view meets the ground
   (plus a small margin at the sides and bottom), never across the whole
-  bounding box of a rotated, pitched view.
+  bounding box of a rotated, pitched view. A large model (over 25 m) stays as
+  long as any part of its box is on screen, not only its anchor: a 2 km bridge
+  anchored at mid-span still shows at a tower, a tall tower whose foot is
+  below the screen still shows its top. Its distance thinning counts from its
+  nearest side.
 - **Full density near the camera, thinner towards the horizon.** Up to
   `model-thinning-distance` from the camera everything is placed; beyond it the
   density halves every further `model-thinning-distance` — no hard edge.

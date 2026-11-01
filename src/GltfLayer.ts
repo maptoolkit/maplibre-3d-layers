@@ -299,6 +299,8 @@ export class GltfLayer implements CustomLayerInterface {
     // carry their absolute terrain elevation in Y.
     const o = this.manager!.origin;
     this.mainMat.fromArray(args.defaultProjectionData.mainMatrix as unknown as number[]);
+    // The next rebuild culls by each model's extent with this matrix.
+    this.manager!.setViewMatrix(args.defaultProjectionData.mainMatrix as unknown as ArrayLike<number>);
     this.originMat
       .makeTranslation(o.x, o.y, o.z)
       .scale(this.originScale.set(o.s, -o.s, o.s));

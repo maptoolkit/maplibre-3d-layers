@@ -28,6 +28,11 @@ import type { Accept, MercBounds, PlacedPoint, RowSpan } from './placement';
 
 const D2R = Math.PI / 180;
 
+/**
+ * Models smaller than this (metres, extent radius and height) are culled by
+ * their anchor with the frame padding, as before; larger ones by their extent.
+ */
+const SMALL_MODEL = 25;
 /** Viewport padding (fraction of the view size) when culling source features. */
 const CULL_PAD = 0.25;
 
@@ -122,8 +127,21 @@ interface ModelEntry {
   url: string;
   state: 'loading' | 'ready' | 'error';
   protos: Proto[];
+  /**
+   * Extent around the anchor in model metres (once loaded): the largest
+   * horizontal distance from the anchor (any heading) and the lowest and
+   * highest point. Culling tests this box, not the anchor alone.
+   */
+  extent?: ModelExtent;
   /** An impostor's baked texture (its only proto is the billboard quad). */
   target?: THREE.WebGLRenderTarget;
+}
+
+/** A model's reach around its anchor, in metres (see ModelEntry.extent). */
+interface ModelExtent {
+  radius: number;
+  bottom: number;
+  top: number;
 }
 
 /** Light for baking impostors, in the bake frame (x=east, y=up, z=toward the viewer). */
@@ -322,6 +340,8 @@ export class GltfManager {
   private readonly impostorRight = { value: new THREE.Vector3(1, 0, 0) };
   /** The distance-thinning scale the last build fitted; seeds the next one's cutoff. */
   private lastThinScale = 1;
+  /** The map's mercator → clip matrix of the last frame (setViewMatrix), for culling by extent. */
+  private viewMatrix?: Float64Array;
   /** Billboard materials: cut out by alpha test, opacity applied after it (see setFading). */
   private readonly impostorMaterials = new WeakSet<THREE.Material>();
   /** Whether a material was transparent as authored (e.g. glTF alphaMode BLEND). */
@@ -636,13 +656,18 @@ export class GltfManager {
       maxY: toMercY(view.north),
     };
 
-    const visible = this.features.filter((f) => overlaps(view, f.bbox));
+    // Large models reach far beyond their anchor (a 2 km bridge, a 300 m tower
+    // whose foot is below the screen): grow the pre-filter by the farthest reach.
+    const reachMax = this.maxReach(zoom, state);
+    const visible = this.features.filter((f) => overlaps(growBounds(view, reachMax), f.bbox));
     // The budget is enforced on the collected on-screen candidates at the end;
     // the bbox-based pre-thinning only guards against runaway candidate counts.
     const max = this.config.maxInstances;
     const budget = max * CANDIDATE_FACTOR;
     const { cells, keep } = this.planCells(visible, zoom, state, view, budget);
     const inFrame = frameTest(this.map, FRAME_PAD);
+    const boxInFrame = this.viewMatrix ? boxFrameTest(this.viewMatrix, FRAME_PAD) : undefined;
+    const ground = this.map.terrain ? this.map.getCenterElevation() : 0;
     // Scan only the grid cells where the screen meets the ground.
     const rowSpan = frameGround(this.map, FRAME_PAD, cam, maxMerc);
     // Candidates whose survival scale reaches `cutoff` are vetoed before they
@@ -670,9 +695,16 @@ export class GltfManager {
       const x = point.x !== undefined ? unitX(point.x) : mercX(point.lng);
       const y = point.y !== undefined ? unitY(point.y) : mercY(point.lat);
       // A pitched, rotated view's lng/lat bbox is mostly off-screen — don't
-      // spend the budget there.
-      if (inFrame && !inFrame(x, y)) return true;
-      const need = cam ? survivalScale(Math.hypot(x - cam.x, y - cam.y) / cam.s, thin, point.id) : 0;
+      // spend the budget there. A model counts as on screen while any part of
+      // its extent is (the anchor alone where the extent or matrix is unknown).
+      const reach = boxInFrame ? this.reachOf(f, point.id, zoom, state) : undefined;
+      if (reach && boxInFrame) {
+        const s = this.origin.s;
+        if (!boxInFrame(x, y, reach.radius * s, (ground + reach.bottom) * s, (ground + reach.top) * s)) return true;
+      } else if (inFrame && !inFrame(x, y)) return true;
+      // Distance thinning measures to the model's nearest side, not its anchor.
+      const near = reach && cam ? Math.max(0, Math.hypot(x - cam.x, y - cam.y) - reach.radius * cam.s) : 0;
+      const need = cam ? survivalScale((reach ? near : Math.hypot(x - cam.x, y - cam.y)) / cam.s, thin, point.id) : 0;
       if (need >= cutoff) return true;
       candidates.push({ f, point, x, y, need });
       return candidates.length < budget;
@@ -799,6 +831,47 @@ export class GltfManager {
   }
 
   /** Which placement mode a feature uses: the configured one, or by geometry. */
+  /**
+   * The extent of the model an instance draws, in metres, scaled and shifted as
+   * writeInstances() places it (`model-scale`, `model-translation`); undefined
+   * while the model isn't loaded, and for small models (SMALL_MODEL). A tilted instance (roll or pitch) may point
+   * any way, so its reach then covers all directions.
+   */
+  private reachOf(f: RawFeature, id: number, zoom: number, state: Record<string, unknown>): ModelExtent | undefined {
+    const extent = this.models.get(this.config.modelId(zoom, f.props, id, state))?.extent;
+    // Small models (vegetation, street furniture) keep the cheap anchor test.
+    if (!extent || (extent.radius < SMALL_MODEL && extent.top - extent.bottom < SMALL_MODEL)) return undefined;
+    const scl = this.config.scale(zoom, f.props, id, state);
+    const tr = this.config.translation(zoom, f.props, id, state);
+    const rot = this.config.rotation(zoom, f.props, id, state);
+    const h = Math.max(Math.abs(scl[0]), Math.abs(scl[2]));
+    const a = extent.bottom * scl[1];
+    const b = extent.top * scl[1];
+    let radius = extent.radius * h + Math.hypot(tr[0], tr[1]);
+    let bottom = Math.min(a, b) + tr[2];
+    let top = Math.max(a, b) + tr[2];
+    if (rot[0] || rot[1]) {
+      radius = Math.max(radius, Math.abs(bottom), Math.abs(top));
+      bottom = Math.min(bottom, -radius);
+      top = Math.max(top, radius);
+    }
+    return { radius, bottom, top };
+  }
+
+  /** The farthest any loaded model reaches from its anchor, in metres (for the pre-filter). */
+  private maxReach(zoom: number, state: Record<string, unknown>): number {
+    const scl = this.config.scale(zoom, {}, undefined, state);
+    const tr = this.config.translation(zoom, {}, undefined, state);
+    const k = Math.max(Math.abs(scl[0]), Math.abs(scl[1]), Math.abs(scl[2]));
+    let reach = 0;
+    for (const model of this.models.values()) {
+      const e = model.extent;
+      if (!e) continue;
+      reach = Math.max(reach, Math.hypot(e.radius, Math.max(Math.abs(e.top), Math.abs(e.bottom))) * k);
+    }
+    return reach + Math.hypot(tr[0], tr[1], tr[2]);
+  }
+
   private placementFor(f: RawFeature): Placement | undefined {
     const type = f.geometry.type;
     const wanted =
@@ -1019,6 +1092,7 @@ export class GltfManager {
       (gltf) => {
         if (this.disposed) return;
         entry.protos = this.flatten(gltf.scene);
+        entry.extent = modelExtent(entry.protos);
         entry.state = 'ready';
         this.schedule(false, true); // features may already be waiting on this model
       },
@@ -1078,6 +1152,19 @@ export class GltfManager {
       for (const m of all) if (m.side === THREE.DoubleSide && !open.has(m)) m.side = THREE.FrontSide;
     }
     return protos;
+  }
+
+  /**
+   * The map's mercator → clip matrix (the custom layer's mainMatrix; call each
+   * frame). build() culls each instance by its model's extent with it, so a
+   * model stays while any part of it is on screen, not only its anchor.
+   */
+  setViewMatrix(m: ArrayLike<number>) {
+    const first = !this.viewMatrix;
+    if (first) this.viewMatrix = new Float64Array(16);
+    for (let i = 0; i < 16; i++) this.viewMatrix![i] = m[i];
+    // The first build ran before any frame, culling by anchors: redo it by extent.
+    if (first) this.schedule(false, true);
   }
 
   // ---------------------------------------------------------------- impostors
@@ -1408,6 +1495,74 @@ function nextPow2(n: number): number {
 function toOrigin(lngLat: LngLat): SceneOrigin {
   const om = MercatorCoordinate.fromLngLat(lngLat, 0);
   return { x: om.x, y: om.y, z: om.z, s: om.meterInMercatorCoordinateUnits() };
+}
+
+/** Bounds grown by `metres` on every side. */
+function growBounds(b: GeoBounds, metres: number): GeoBounds {
+  if (!(metres > 0)) return b;
+  const dLat = metres / 111320;
+  const dLng = dLat / Math.max(0.01, Math.cos((((b.north + b.south) / 2) * Math.PI) / 180));
+  return { west: b.west - dLng, east: b.east + dLng, south: b.south - dLat, north: b.north + dLat };
+}
+
+/**
+ * A model's extent around its anchor, in model metres: the largest horizontal
+ * distance (x/z, any heading) and the lowest and highest point (y up).
+ */
+function modelExtent(protos: Proto[]): ModelExtent | undefined {
+  const box = new THREE.Box3();
+  for (const proto of protos) {
+    if (!proto.geometry.boundingBox) proto.geometry.computeBoundingBox();
+    box.union(proto.geometry.boundingBox!.clone().applyMatrix4(proto.matrix));
+  }
+  if (box.isEmpty()) return undefined;
+  let radius = 0;
+  for (const x of [box.min.x, box.max.x]) for (const z of [box.min.z, box.max.z]) radius = Math.max(radius, Math.hypot(x, z));
+  return { radius, bottom: box.min.y, top: box.max.y };
+}
+
+/**
+ * Is any part of a model's box on screen? The box stands on the anchor (x, y,
+ * mercator units): `r` around it, from height z0 to z1 (mercator units). Its
+ * corners are projected with the map's mercator → clip matrix; the screen is
+ * grown by `pad` of its size at the sides and bottom, as in frameTest. A box
+ * the camera plane cuts is kept: part of it is right in front of the camera.
+ */
+function boxFrameTest(
+  M: Float64Array,
+  pad: number,
+): (x: number, y: number, r: number, z0: number, z1: number) => boolean {
+  const lo = -1 - 2 * pad; // clip space spans 2 per screen size
+  const hi = 1 + 2 * pad;
+  return (x, y, r, z0, z1) => {
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    let behind = false;
+    let front = false;
+    for (let i = 0; i < 8; i++) {
+      const X = i & 1 ? x + r : x - r;
+      const Y = i & 2 ? y + r : y - r;
+      const Z = i & 4 ? z1 : z0;
+      const w = M[3] * X + M[7] * Y + M[11] * Z + M[15];
+      if (w <= 0) {
+        behind = true;
+        continue;
+      }
+      front = true;
+      const sx = (M[0] * X + M[4] * Y + M[8] * Z + M[12]) / w;
+      const sy = (M[1] * X + M[5] * Y + M[9] * Z + M[13]) / w;
+      if (sx < minX) minX = sx;
+      if (sx > maxX) maxX = sx;
+      if (sy < minY) minY = sy;
+      if (sy > maxY) maxY = sy;
+    }
+    if (!front) return false;
+    if (behind) return true;
+    // Clip y is up: the bottom of the screen is -1 (grown), the top +1 (not grown).
+    return maxX >= lo && minX <= hi && maxY >= lo && minY <= 1;
+  };
 }
 
 /** The visible bounds, grown by {@link CULL_PAD} so models don't pop at the edge. */
