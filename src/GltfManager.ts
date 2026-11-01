@@ -33,6 +33,7 @@ const D2R = Math.PI / 180;
  * their anchor with the frame padding, as before; larger ones by their extent.
  */
 const SMALL_MODEL = 25;
+const isSmall = (e: ModelExtent): boolean => e.radius < SMALL_MODEL && e.top - e.bottom < SMALL_MODEL;
 /** Viewport padding (fraction of the view size) when culling source features. */
 const CULL_PAD = 0.25;
 
@@ -830,7 +831,6 @@ export class GltfManager {
     this.map.triggerRepaint();
   }
 
-  /** Which placement mode a feature uses: the configured one, or by geometry. */
   /**
    * The extent of the model an instance draws, in metres, scaled and shifted as
    * writeInstances() places it (`model-scale`, `model-translation`); undefined
@@ -840,7 +840,7 @@ export class GltfManager {
   private reachOf(f: RawFeature, id: number, zoom: number, state: Record<string, unknown>): ModelExtent | undefined {
     const extent = this.models.get(this.config.modelId(zoom, f.props, id, state))?.extent;
     // Small models (vegetation, street furniture) keep the cheap anchor test.
-    if (!extent || (extent.radius < SMALL_MODEL && extent.top - extent.bottom < SMALL_MODEL)) return undefined;
+    if (!extent || isSmall(extent)) return undefined;
     const scl = this.config.scale(zoom, f.props, id, state);
     const tr = this.config.translation(zoom, f.props, id, state);
     const rot = this.config.rotation(zoom, f.props, id, state);
@@ -858,20 +858,32 @@ export class GltfManager {
     return { radius, bottom, top };
   }
 
-  /** The farthest any loaded model reaches from its anchor, in metres (for the pre-filter). */
+  /**
+   * The farthest a large model reaches from its anchor, in metres (for the pre-filter). Small models keep the
+   * anchor test, so a layer of them (trees) needs no reach and evaluates nothing. A data-driven `model-scale` or
+   * `model-translation` is evaluated per feature, with the feature's own id (`["id"]` is the placement's synthetic
+   * id, not known before placing): evaluated without a feature it would warn and fall back to 0.
+   */
   private maxReach(zoom: number, state: Record<string, unknown>): number {
-    const scl = this.config.scale(zoom, {}, undefined, state);
-    const tr = this.config.translation(zoom, {}, undefined, state);
-    const k = Math.max(Math.abs(scl[0]), Math.abs(scl[1]), Math.abs(scl[2]));
-    let reach = 0;
+    let far = 0;
     for (const model of this.models.values()) {
       const e = model.extent;
-      if (!e) continue;
-      reach = Math.max(reach, Math.hypot(e.radius, Math.max(Math.abs(e.top), Math.abs(e.bottom))) * k);
+      if (e && !isSmall(e)) far = Math.max(far, Math.hypot(e.radius, Math.max(Math.abs(e.top), Math.abs(e.bottom))));
     }
-    return reach + Math.hypot(tr[0], tr[1], tr[2]);
+    if (!far) return 0;
+    const { scale, translation } = this.config;
+    const reach = (props: Record<string, unknown>, id?: string | number): number => {
+      const scl = scale(zoom, props, id, state);
+      const tr = translation(zoom, props, id, state);
+      return far * Math.max(Math.abs(scl[0]), Math.abs(scl[1]), Math.abs(scl[2])) + Math.hypot(tr[0], tr[1], tr[2]);
+    };
+    if (scale.featureConstant && translation.featureConstant) return reach({});
+    let max = 0;
+    for (const f of this.features) max = Math.max(max, reach(f.props, f.id));
+    return max;
   }
 
+  /** Which placement mode a feature uses: the configured one, or by geometry. */
   private placementFor(f: RawFeature): Placement | undefined {
     const type = f.geometry.type;
     const wanted =
