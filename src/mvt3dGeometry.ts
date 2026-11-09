@@ -37,9 +37,11 @@ export interface TileResult {
    * x=east, y=height-above-base, z=north. Scene-origin independent.
    */
   position: Float32Array;
-  /** Per-vertex face normal in the same (east, up, north) frame. */
-  normal: Float32Array;
-  index: Uint32Array;
+  /** Per-vertex face normal in the same (east, up, north) frame, scaled to ±127
+   *  (a normalized Int8 attribute — a quarter of the bytes of float32). */
+  normal: Int8Array;
+  /** Uint16 while the tile has at most 65536 vertices (half the bytes), else Uint32. */
+  index: Uint16Array | Uint32Array;
   features: FeatureSpan[];
   /** meterInMercatorCoordinateUnits at the tile's latitude (for placement). */
   tileScale: number;
@@ -189,10 +191,13 @@ export function buildTile(
     }
   }
 
+  const vertexCount = positions.length / 3;
+  const normal = new Int8Array(normals.length);
+  for (let i = 0; i < normals.length; i++) normal[i] = Math.round(normals[i] * 127);
   return {
     position: new Float32Array(positions),
-    normal: new Float32Array(normals),
-    index: new Uint32Array(indices),
+    normal,
+    index: vertexCount <= 65536 ? new Uint16Array(indices) : new Uint32Array(indices),
     features,
     tileScale,
   };

@@ -117,8 +117,9 @@ interface TileEntry {
   bounds: GeoBounds;
   mesh?: THREE.Mesh;
   geometry?: THREE.BufferGeometry;
-  /** Worker positions with y = height above the feature base (no terrain yet). */
-  positionBase?: Float32Array;
+  /** Per vertex: the worker's y, the height above the feature base (no terrain
+   *  yet). x and z never change, so only y is kept for re-baking. */
+  baseY?: Float32Array;
   features?: FeatureSpan[];
 }
 
@@ -372,11 +373,15 @@ export class Fill3DManager {
       return;
     }
 
+    const vertexCount = result.position.length / 3;
+    // Keep the base-relative Y for re-baking (bake() overwrites it in `position`).
+    const baseY = new Float32Array(vertexCount);
+    for (let v = 0; v < vertexCount; v++) baseY[v] = result.position[v * 3 + 1];
+
     const geometry = new THREE.BufferGeometry();
-    // Copy positions so we can keep the base-relative Y for re-baking.
-    geometry.setAttribute('position', new THREE.BufferAttribute(result.position.slice(), 3));
-    geometry.setAttribute('normal', new THREE.BufferAttribute(result.normal, 3));
-    geometry.setAttribute('color', this.colorAttribute(result.position.length / 3, result.features));
+    geometry.setAttribute('position', new THREE.BufferAttribute(result.position, 3));
+    geometry.setAttribute('normal', new THREE.BufferAttribute(result.normal, 3, true));
+    geometry.setAttribute('color', this.colorAttribute(vertexCount, result.features));
     geometry.setIndex(new THREE.BufferAttribute(result.index, 1));
 
     const mesh = new THREE.Mesh(geometry, this.material);
@@ -387,7 +392,7 @@ export class Fill3DManager {
     entry.tileScale = result.tileScale;
     entry.mesh = mesh;
     entry.geometry = geometry;
-    entry.positionBase = result.position; // y = base-relative height
+    entry.baseY = baseY;
     entry.features = result.features;
 
     this.placeMesh(entry);
@@ -397,24 +402,26 @@ export class Fill3DManager {
 
   /** Evaluate fill-3d-color / fill-3d-opacity per feature into a per-vertex RGBA attribute.
    *  Colours stay sRGB — the shader shades and outputs in sRGB, matching fill-extrusion.
+   *  8 bits per channel (normalized), like the colour itself; a quarter of float32.
    *  A feature-constant opacity is left out here: it's the `u_opacity` uniform. */
   private colorAttribute(vertexCount: number, features: FeatureSpan[]): THREE.BufferAttribute {
     const zoom = this.map.getZoom();
     const state = globalStateOf(this.map);
     const { color, opacity } = this.config;
-    const rgba = new Float32Array(vertexCount * 4);
+    const rgba = new Uint8Array(vertexCount * 4);
     for (const b of features) {
       const [r, g, bl, ca] = color(zoom, b.properties, undefined, state);
       const a = opacity.featureConstant ? ca : ca * opacity(zoom, b.properties, undefined, state);
+      const R = Math.round(r * 255), G = Math.round(g * 255), B = Math.round(bl * 255), A = Math.round(a * 255);
       const end = b.start + b.count;
       for (let v = b.start; v < end; v++) {
-        rgba[v * 4] = r;
-        rgba[v * 4 + 1] = g;
-        rgba[v * 4 + 2] = bl;
-        rgba[v * 4 + 3] = a;
+        rgba[v * 4] = R;
+        rgba[v * 4 + 1] = G;
+        rgba[v * 4 + 2] = B;
+        rgba[v * 4 + 3] = A;
       }
     }
-    return new THREE.BufferAttribute(rgba, 4);
+    return new THREE.BufferAttribute(rgba, 4, true);
   }
 
   /**
@@ -436,11 +443,8 @@ export class Fill3DManager {
     this.recolorRafId = requestAnimationFrame(() => {
       this.recolorRafId = undefined;
       for (const entry of this.tiles.values()) {
-        if (entry.state !== 'ready' || !entry.geometry || !entry.positionBase || !entry.features) continue;
-        entry.geometry.setAttribute(
-          'color',
-          this.colorAttribute(entry.positionBase.length / 3, entry.features),
-        );
+        if (entry.state !== 'ready' || !entry.geometry || !entry.baseY || !entry.features) continue;
+        entry.geometry.setAttribute('color', this.colorAttribute(entry.baseY.length, entry.features));
       }
       this.map.triggerRepaint();
     });
@@ -540,10 +544,10 @@ export class Fill3DManager {
    * base — else every wall shows 10 m too deep on a pitched map.
    */
   private bake(entry: TileEntry) {
-    if (!entry.geometry || !entry.positionBase || !entry.features) return;
+    if (!entry.geometry || !entry.baseY || !entry.features) return;
     const attr = entry.geometry.getAttribute('position') as THREE.BufferAttribute;
     const pos = attr.array as Float32Array;
-    const base = entry.positionBase;
+    const baseY = entry.baseY;
     const flat = !this.map.terrain;
     const elevationAt = this.elevation.batch();
     const groundAt = createMercatorElevationSampler(this.map);
@@ -553,7 +557,7 @@ export class Fill3DManager {
       const ele = flat ? 0 : elevationAt(new LngLat(b.lng, b.lat));
       const end = b.start + b.count;
       for (let v = b.start; v < end; v++) {
-        const rel = base[v * 3 + 1];
+        const rel = baseY[v];
         pos[v * 3 + 1] = flat
           ? Math.max(rel, 0)
           : rel <= BASE_EPSILON_M && scale
