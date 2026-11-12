@@ -4,7 +4,7 @@ import * as THREE from 'three';
 import type { ElevationCache } from './ElevationCache';
 import { createMercatorElevationSampler, tileBounds } from './ElevationCache';
 import type { GeoBounds } from './ElevationCache';
-import type { TileRequest, TileResult, FeatureSpan } from './mvt3dGeometry';
+import type { TileRequest, TileResult, FeatureSpan, TerrainAnchors } from './mvt3dGeometry';
 import type { ColorEval, OpacityEval } from './paint';
 import { globalStateOf, watchGlobalState } from './globalState';
 import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
@@ -80,6 +80,20 @@ function createFill3DMaterial(transparent: boolean): THREE.ShaderMaterial {
     // BackSide is the outer shell here (source winding + scale(1,1,-1) reflection).
     side: THREE.BackSide,
     transparent,
+    // A transparent layer draws after a depth pre-pass and blends only what lies
+    // at that depth; an opaque one writes its own depth (see setPass).
+    depthFunc: THREE.LessEqualDepth,
+    depthWrite: !transparent,
+  });
+}
+
+/** The depth pre-pass of a transparent layer: a program that only places the vertices. */
+function createDepthMaterial(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    vertexShader: 'void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: 'void main() {}',
+    side: THREE.BackSide, // as the colour material
+    colorWrite: false,
   });
 }
 
@@ -117,9 +131,17 @@ interface TileEntry {
   bounds: GeoBounds;
   mesh?: THREE.Mesh;
   geometry?: THREE.BufferGeometry;
-  /** Worker positions with y = height above the feature base (no terrain yet). */
-  positionBase?: Float32Array;
+  /** Per vertex: the worker's y, the height above the feature base (no terrain
+   *  yet). x and z never change, so only y is kept for re-baking. */
+  baseY?: Float32Array;
+  /** Per vertex its ground column, per column x, z — and the ground height per
+   *  column during a bake (NaN = not sampled yet). */
+  column?: Uint32Array;
+  columnXZ?: Float32Array;
+  groundCache?: Float32Array;
   features?: FeatureSpan[];
+  /** The wall feet per group of touching buildings (see anchorFits). */
+  anchors?: TerrainAnchors;
 }
 
 /**
@@ -133,7 +155,8 @@ interface TileEntry {
  * precision high anywhere on earth (e.g. flying Vienna → Berlin).
  *
  * Vertical placement: the worker emits feature-base-relative heights; this class
- * bakes terrain elevation per feature centroid into the vertex Y, and re-bakes
+ * bakes terrain elevation into the vertex Y — per group of touching buildings
+ * fitted to their wall feet, else per feature centre (see bake) — and re-bakes
  * whenever new DEM tiles stream in (via the shared {@link ElevationCache}) or the
  * map's terrain is switched. Without terrain the meshes sit on the flat map,
  * nothing below it: the source sinks ground walls 10 m for slopes (see bake).
@@ -150,6 +173,7 @@ export class Fill3DManager {
   private readonly worker: Worker;
   private readonly tiles = new globalThis.Map<string, TileEntry>();
   private readonly material: THREE.ShaderMaterial;
+  private readonly depthMaterial: THREE.ShaderMaterial;
   private readonly config: Fill3DConfig;
   private readonly onData: (ev: unknown) => void;
   private readonly onMoveEnd: () => void;
@@ -190,6 +214,7 @@ export class Fill3DManager {
     // Shades like MapLibre's fill-extrusion (flat directional ramp). Per-vertex
     // sRGB colour (fill-3d-color) + alpha (fill-3d-opacity) via the `color` attr.
     this.material = createFill3DMaterial(config.transparent);
+    this.depthMaterial = createDepthMaterial();
 
     this.worker = new Mvt3dWorker();
     this.worker.onmessage = (e: MessageEvent<TileResult>) => this.onTileParsed(e.data);
@@ -372,11 +397,15 @@ export class Fill3DManager {
       return;
     }
 
+    const vertexCount = result.position.length / 3;
+    // Keep the base-relative Y for re-baking (bake() overwrites it in `position`).
+    const baseY = new Float32Array(vertexCount);
+    for (let v = 0; v < vertexCount; v++) baseY[v] = result.position[v * 3 + 1];
+
     const geometry = new THREE.BufferGeometry();
-    // Copy positions so we can keep the base-relative Y for re-baking.
-    geometry.setAttribute('position', new THREE.BufferAttribute(result.position.slice(), 3));
-    geometry.setAttribute('normal', new THREE.BufferAttribute(result.normal, 3));
-    geometry.setAttribute('color', this.colorAttribute(result.position.length / 3, result.features));
+    geometry.setAttribute('position', new THREE.BufferAttribute(result.position, 3));
+    geometry.setAttribute('normal', new THREE.BufferAttribute(result.normal, 3, true));
+    geometry.setAttribute('color', this.colorAttribute(vertexCount, result.features));
     geometry.setIndex(new THREE.BufferAttribute(result.index, 1));
 
     const mesh = new THREE.Mesh(geometry, this.material);
@@ -387,8 +416,11 @@ export class Fill3DManager {
     entry.tileScale = result.tileScale;
     entry.mesh = mesh;
     entry.geometry = geometry;
-    entry.positionBase = result.position; // y = base-relative height
+    entry.baseY = baseY;
+    entry.column = result.column;
+    entry.columnXZ = result.columnXZ;
     entry.features = result.features;
+    entry.anchors = result.anchors;
 
     this.placeMesh(entry);
     this.bake(entry);
@@ -397,24 +429,26 @@ export class Fill3DManager {
 
   /** Evaluate fill-3d-color / fill-3d-opacity per feature into a per-vertex RGBA attribute.
    *  Colours stay sRGB — the shader shades and outputs in sRGB, matching fill-extrusion.
+   *  8 bits per channel (normalized), like the colour itself; a quarter of float32.
    *  A feature-constant opacity is left out here: it's the `u_opacity` uniform. */
   private colorAttribute(vertexCount: number, features: FeatureSpan[]): THREE.BufferAttribute {
     const zoom = this.map.getZoom();
     const state = globalStateOf(this.map);
     const { color, opacity } = this.config;
-    const rgba = new Float32Array(vertexCount * 4);
+    const rgba = new Uint8Array(vertexCount * 4);
     for (const b of features) {
       const [r, g, bl, ca] = color(zoom, b.properties, undefined, state);
       const a = opacity.featureConstant ? ca : ca * opacity(zoom, b.properties, undefined, state);
+      const R = Math.round(r * 255), G = Math.round(g * 255), B = Math.round(bl * 255), A = Math.round(a * 255);
       const end = b.start + b.count;
       for (let v = b.start; v < end; v++) {
-        rgba[v * 4] = r;
-        rgba[v * 4 + 1] = g;
-        rgba[v * 4 + 2] = bl;
-        rgba[v * 4 + 3] = a;
+        rgba[v * 4] = R;
+        rgba[v * 4 + 1] = G;
+        rgba[v * 4 + 2] = B;
+        rgba[v * 4 + 3] = A;
       }
     }
-    return new THREE.BufferAttribute(rgba, 4);
+    return new THREE.BufferAttribute(rgba, 4, true);
   }
 
   /**
@@ -436,34 +470,33 @@ export class Fill3DManager {
     this.recolorRafId = requestAnimationFrame(() => {
       this.recolorRafId = undefined;
       for (const entry of this.tiles.values()) {
-        if (entry.state !== 'ready' || !entry.geometry || !entry.positionBase || !entry.features) continue;
-        entry.geometry.setAttribute(
-          'color',
-          this.colorAttribute(entry.positionBase.length / 3, entry.features),
-        );
+        if (entry.state !== 'ready' || !entry.geometry || !entry.baseY || !entry.features) continue;
+        entry.geometry.setAttribute('color', this.colorAttribute(entry.baseY.length, entry.features));
       }
       this.map.triggerRepaint();
     });
   }
 
   /**
-   * Switch the shared material between the two rendering passes. A depth-only
+   * Whether the layer needs a depth pre-pass: only when it is transparent. The
    * pre-pass establishes the nearest surface per pixel; the colour pass then only
    * blends fragments at that depth — so interior/back walls of semi-transparent
    * buildings are hidden (like fill-extrusion's opaque-then-composite), while the
-   * frontmost outer shell keeps its smooth per-feature alpha.
+   * frontmost outer shell keeps its smooth per-feature alpha. An opaque layer
+   * draws in one pass and writes its depth itself: a second pass over all the
+   * geometry costs more than shading the fragments that end up hidden.
+   */
+  get depthPrepass(): boolean {
+    return this.config.transparent;
+  }
+
+  /**
+   * Set the scene up for one rendering pass. The depth pre-pass (see
+   * {@link depthPrepass}) draws the buildings with a program that only places
+   * the vertices.
    */
   setPass(pass: 'depth' | 'color') {
-    const m = this.material;
-    m.depthTest = true;
-    m.depthFunc = THREE.LessEqualDepth;
-    if (pass === 'depth') {
-      m.colorWrite = false;
-      m.depthWrite = true;
-    } else {
-      m.colorWrite = true;
-      m.depthWrite = false;
-    }
+    this.scene.overrideMaterial = pass === 'depth' ? this.depthMaterial : null;
   }
 
   /**
@@ -527,11 +560,16 @@ export class Fill3DManager {
   }
 
   /**
-   * Add terrain elevation to each vertex Y: the building's anchor (its centre)
-   * everywhere, except that vertices at its base follow the ground down where
-   * it drops below the anchor — so the downhill walls of a building on a slope
-   * reach the ground instead of floating. (fill-extrusion sinks the base 10 m
+   * Add terrain elevation to each vertex Y: the height the building's base goes
+   * to everywhere, except that vertices at its base follow the ground down where
+   * it drops below that — so the downhill walls of a building on a slope reach
+   * the ground instead of floating. (fill-extrusion sinks the base 10 m
    * instead; these meshes aren't hidden by terrain, so that would show.)
+   *
+   * Where the base goes: for a building in a group of touching buildings (the
+   * source gives their heights in one frame) to its base height plus the group's
+   * terrain fit (see anchorFits) — neighbours stay as they stand to each other in
+   * the data; for any other building to the terrain height at its centre.
    *
    * The source itself sinks the walls standing on a building's base 10 m below
    * it as a reserve for slopes (buildings3d `MTK_BUILDINGS3D_GROUND_DEPTH`): the
@@ -540,24 +578,37 @@ export class Fill3DManager {
    * base — else every wall shows 10 m too deep on a pitched map.
    */
   private bake(entry: TileEntry) {
-    if (!entry.geometry || !entry.positionBase || !entry.features) return;
+    if (!entry.geometry || !entry.baseY || !entry.features) return;
     const attr = entry.geometry.getAttribute('position') as THREE.BufferAttribute;
     const pos = attr.array as Float32Array;
-    const base = entry.positionBase;
+    const baseY = entry.baseY;
     const flat = !this.map.terrain;
     const elevationAt = this.elevation.batch();
     const groundAt = createMercatorElevationSampler(this.map);
     const scale = entry.tileScale ?? 0;
+    // The terrain under a vertex, sampled once per ground column: a wall's top
+    // and bottom and the roof above it share one.
+    const column = entry.column!;
+    const xz = entry.columnXZ!;
+    const cache = (entry.groundCache ??= new Float32Array(xz.length / 2));
+    cache.fill(NaN);
+    const groundOf = (c: number) => {
+      let g = cache[c];
+      if (g !== g) cache[c] = g = groundAt(entry.tileMx + xz[c * 2] * scale, entry.tileMy - xz[c * 2 + 1] * scale);
+      return g;
+    };
+    const fits = flat || !scale || !entry.anchors ? undefined : anchorFits(entry.anchors, groundOf);
 
     for (const b of entry.features) {
-      const ele = flat ? 0 : elevationAt(new LngLat(b.lng, b.lat));
+      const fit = fits && b.anchor !== undefined ? fits[b.anchor] : NaN;
+      const ele = flat ? 0 : fit === fit ? b.base! + fit : elevationAt(new LngLat(b.lng, b.lat));
       const end = b.start + b.count;
       for (let v = b.start; v < end; v++) {
-        const rel = base[v * 3 + 1];
+        const rel = baseY[v];
         pos[v * 3 + 1] = flat
           ? Math.max(rel, 0)
           : rel <= BASE_EPSILON_M && scale
-            ? Math.min(ele, groundAt(entry.tileMx + pos[v * 3] * scale, entry.tileMy - pos[v * 3 + 2] * scale)) + rel
+            ? Math.min(ele, groundOf(column[v])) + rel
             : rel + ele;
       }
     }
@@ -619,7 +670,44 @@ export class Fill3DManager {
     this.tiles.clear();
     this.scene.remove(this.group);
     this.material.dispose();
+    this.depthMaterial.dispose();
   }
+}
+
+/**
+ * Per group of touching buildings: how far the terrain lies above the source's
+ * heights — the median of (terrain at a wall foot − the foot's height) over the
+ * group's wall feet standing on the ground, weighted by the wall length each
+ * stands for. The source's heights fit the terrain up to this offset (the
+ * height datum) and what the terrain model misses of the ground's shape; the
+ * median ignores feet where it misses most.
+ */
+function anchorFits(anchors: TerrainAnchors, groundOf: (column: number) => number): Float32Array {
+  const groups = anchors.start.length - 1;
+  const fits = new Float32Array(groups);
+  const diff = new Float32Array(anchors.column.length);
+  for (let i = 0; i < diff.length; i++) diff[i] = groundOf(anchors.column[i]) - anchors.height[i];
+  const order: number[] = [];
+  for (let g = 0; g < groups; g++) {
+    order.length = 0;
+    let total = 0;
+    for (let i = anchors.start[g]; i < anchors.start[g + 1]; i++) {
+      order.push(i);
+      total += anchors.weight[i];
+    }
+    order.sort((a, b) => diff[a] - diff[b]);
+    let fit = NaN; // a group without feet: its buildings go to their centres
+    let sum = 0;
+    for (const i of order) {
+      sum += anchors.weight[i];
+      if (sum >= total / 2) {
+        fit = diff[i];
+        break;
+      }
+    }
+    fits[g] = fit;
+  }
+  return fits;
 }
 
 function toOrigin(lngLat: LngLat): SceneOrigin {

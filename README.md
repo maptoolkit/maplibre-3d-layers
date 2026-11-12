@@ -120,8 +120,15 @@ map's `transformRequest` like MapLibre's own, so credentials and headers set
 there apply to them too, e.g. a session cookie with `credentials: 'include'`
 instead of an `api_key` in the URL.
 
-**Vertical placement.** With terrain, a building sits on the terrain height of
-its centre, and the vertices at its base follow the ground down on a slope. The
+**Vertical placement.** With terrain, buildings that touch go onto it together:
+the source gives their heights in one frame and each building's base (its
+lowest point), and the group is fitted to the terrain at all its wall feet
+standing on the ground (the median of terrain height − foot height). Neighbours
+so stay as they stand to each other in the data, and a building stepping up a
+slope isn't lifted by the terrain at its centre. A building without a base
+height in the source's frame (bodies generated from OSM) sits on the terrain
+height of its centre. Either way the vertices at a building's base follow the
+ground down on a slope. The
 source also sinks the walls standing on a building's base 10 m below it as a
 reserve for slopes (buildings3d `MTK_BUILDINGS3D_GROUND_DEPTH`); the terrain
 surface hides that reserve. Without terrain the meshes sit on the flat map,

@@ -60,6 +60,23 @@ export function createMercatorElevationSampler(map: Map): (mx: number, my: numbe
 
   const index = terrain.getCoverageIndex?.() ?? null;
   let fallbackZoom: number | undefined;
+  // The index lookup per (wrap, zoom, tile), memoised under a numeric key: one
+  // sampler serves thousands of points in few tiles, and building the string
+  // key for every point and zoom was the bulk of a bake. `false` = not covered.
+  type TileSample = ((x: number, y: number, extent: number) => number) | null | false;
+  const memo = new globalThis.Map<number, TileSample>();
+  const direct = (wrap: number, z: number, tx: number, ty: number): TileSample => {
+    const key = `${wrap}/${z}/${tx}/${ty}`;
+    return index!.samplerPerTile.has(key) ? (index!.samplerPerTile.get(key) ?? null) : false;
+  };
+  const lookup = (wrap: number, z: number, tx: number, ty: number): TileSample => {
+    // Exact in a double for wraps -2..5 and zooms below 22; anything else unmemoised.
+    if (wrap < -2 || wrap > 5 || z > 21) return direct(wrap, z, tx, ty);
+    const k = ((wrap + 2) * 32 + z) * 2 ** 44 + tx * 2 ** 22 + ty;
+    let s = memo.get(k);
+    if (s === undefined) memo.set(k, (s = direct(wrap, z, tx, ty)));
+    return s;
+  };
 
   return (mx, my) => {
     if (index) {
@@ -71,9 +88,8 @@ export function createMercatorElevationSampler(map: Map): (mx: number, my: numbe
           const sy = my * scale;
           const tx = Math.floor(sx);
           const ty = Math.floor(sy);
-          const key = `${wrap}/${z}/${tx}/${ty}`;
-          if (!index.samplerPerTile.has(key)) continue;
-          const sample = index.samplerPerTile.get(key);
+          const sample = lookup(wrap, z, tx, ty);
+          if (sample === false) continue;
           if (sample) {
             return sample(
               Math.min((sx - tx) * EXTENT, MAX_TILE_COORD),
