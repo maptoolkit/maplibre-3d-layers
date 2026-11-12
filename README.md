@@ -134,7 +134,8 @@ source also sinks the walls standing on a building's base 10 m below it as a
 reserve for slopes (buildings3d `MTK_BUILDINGS3D_GROUND_DEPTH`); the terrain
 surface hides that reserve. Without terrain the meshes sit on the flat map,
 which hides nothing below it, so the reserve is cut off at the base. Switching
-the terrain on or off re-bakes the loaded tiles.
+the terrain on or off re-bakes the loaded tiles. Landmarks are placed in their
+own way, see [Landmarks](#landmarks-models-in-the-tiles).
 
 ### Options
 
@@ -145,6 +146,7 @@ the terrain on or off re-bakes the loaded tiles.
 | `source-layer` | ✅ | vector-tile layer to read (e.g. `buildings3d`) |
 | `filter` | — | MapLibre filter expression; features that fail are dropped |
 | `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's active terrain |
+| `workers` | — | at most this many tile workers (default: half the logical processors, at least 1, at most 4). They start as tiles queue up |
 | `layout.visibility` | — | `'visible'` (default) / `'none'` |
 | `paint['fill-3d-color']` | — | colour, constant or expression (default white) |
 | `paint['fill-3d-opacity']` | — | `0..1`, constant or expression (default `1`) |
@@ -152,6 +154,50 @@ the terrain on or off re-bakes the loaded tiles.
 Colour and opacity are evaluated per feature against its properties, the
 current zoom and the map's [global state](#global-state). An opacity that is the
 same for every feature (zoom and global state only) is evaluated every frame.
+
+Tiles are parsed and triangulated in web workers, several side by side (see
+`workers`): each tile goes to an idle worker, or to a new one while the pool
+may grow, else to the one with the least to do.
+
+### Landmarks: models in the tiles
+
+A feature that carries the numbers `anchor_lng` and `anchor_lat` is a model
+built against the terrain around that point: a landmark that the tile build
+wrote into the 3D layer face by face (Maptoolkit's `buildings3d` marks them
+with `source: 'landmark'` and gives each face its `colour`). Such a feature is
+placed as one rigid body, like a `GltfLayer` model:
+
+- **With terrain** every vertex goes to its height in the model plus the
+  terrain height at the anchor. Nothing is fitted to wall feet and no vertex
+  follows the ground: the model's feet reach below the ground on purpose, and
+  parts on lower ground than the anchor are below it in the model already.
+- **Without terrain** nothing is cut off at the map. What lies below it shows
+  through the flat map, and the fake AO at a wall foot starts at the model's
+  own lowest point there.
+- **One part.** All faces of the id are one building; they are not split into
+  connected parts (a landmark is one id with tens of thousands of faces, which
+  that search is not made for). It is drawn from the tile that holds the centre
+  of its bounding box, so the tile build writes a landmark into that tile only.
+
+Give landmarks a layer of their own where they need other paint, or another
+place among the style's layers, than the buildings — and leave them out of the
+buildings' layer:
+
+```js
+const isLandmark = ['==', ['get', 'source'], 'landmark'];
+map.addLayer(new Fill3DLayer({
+  id: 'buildings-3d', source: 'buildings3d', 'source-layer': 'buildings3d',
+  filter: ['!', isLandmark],
+}));
+map.addLayer(new Fill3DLayer({
+  id: 'landmarks-3d', source: 'buildings3d', 'source-layer': 'buildings3d',
+  filter: isLandmark,
+  paint: { 'fill-3d-color': ['to-color', ['get', 'colour'], '#ffffff'] },
+}));
+```
+
+The filter is applied before a feature's geometry is read, so the second layer
+costs little on the tiles without a landmark.
 
 ### Experimental: fake ambient occlusion, extrusions, ground skirt
 
@@ -173,8 +219,8 @@ same for every feature (zoom and global state only) is evaluated every frame.
   end points, or, for vertical edges, on the same column where they overlap
   (neighbours of different height). That needs tiles whose CityGML part is
   topologically clean, every contact of two faces an edge pair — as the
-  buildings3d build makes it with its topology cleanup (vts branch
-  `prototype/buildings3d-topology`, `MTK_BUILDINGS3D_TOPOLOGY=all`). On tiles
+  buildings3d build makes it with its topology cleanup (vts,
+  `MTK_BUILDINGS3D_TOPOLOGY=all`). On tiles
   as served today about a third of Vienna's inner edges get no darkening. OSM
   bodies and extrusions need no cleanup, except that a lower roof against a
   wall running on above it gets none. An inner edge darkens as much as the
@@ -198,6 +244,13 @@ same for every feature (zoom and global state only) is evaluated every frame.
 - **Extrusions** replace a native `fill-extrusion` on the same footprints (hide
   that one). The footprints are clipped to the tile; roof and wall carry
   `type: 'roof' | 'wall'`, so `fill-3d-color` expressions work as on the 3D layer.
+- **In two passes:** a tile shows its geometry first, without AO. Its worker
+  keeps the parsed tile and, once no tile waits for its geometry, works out the
+  inner edges, the AO attributes, the tables and the skirt for the vertices
+  that are on the map already; the AO then fades in per tile (0.5 s). Measured
+  on nine dense Vienna tiles, one thread: the geometry after about 2 s instead
+  of about 5 s for a build in one go, the AO after about 5 s in all. The parsed
+  tiles stay in memory until their AO pass — about 260 MB for those nine.
 - **Cost:** with the intensity a constant `0` (the default) no inner edges
   are searched and no AO data is built or uploaded. With AO on, a vertex
   carries 8 more bytes (height above ground, face, plane position) and the
