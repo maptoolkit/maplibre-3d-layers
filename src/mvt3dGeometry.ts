@@ -161,13 +161,16 @@ export function buildTile(
             const polyVertexBase = positions.length / 3;
             const flat2D: number[] = [];
             const holes: number[] = [];
+            const rings = polygon.map((ring) => ring.map((v) => toTileLocal(v, src.baseZ, src.extent, pow, tileScale)));
+            // One normal for the whole face, from its outer ring. A hole runs the
+            // other way round: with a normal of its own it was projected mirrored
+            // for the triangulation — the hole ended up elsewhere and the roof
+            // covered its courtyard — and its vertices were lit from behind.
+            const n = newellNormal(rings[0]);
 
-            for (let r = 0; r < polygon.length; r++) {
+            for (let r = 0; r < rings.length; r++) {
               if (r) holes.push(flat2D.length / 2);
-              const ring = polygon[r];
-              const pts = ring.map((v) => toTileLocal(v, src.baseZ, src.extent, pow, tileScale));
-              const n = newellNormal(pts);
-              for (const p of pts) {
+              for (const p of rings[r]) {
                 positions.push(p.x, p.y, p.z);
                 normals.push(n[0], n[1], n[2]);
                 const q = to2D(p, n);
