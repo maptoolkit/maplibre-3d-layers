@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>fill-3d · benchmark: main vs working tree</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { margin: 0; height: 100%; font: 12px/1.4 system-ui, sans-serif; }
+    #map { position: absolute; inset: 0 0 0 0; }
+    #panel {
+      position: absolute; top: 10px; left: 10px; z-index: 1; max-height: calc(100% - 40px); overflow: auto;
+      background: rgba(255, 255, 255, 0.95); border-radius: 6px; padding: 10px 12px; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+    }
+    #panel h1 { font-size: 13px; margin: 0 0 6px; }
+    table { border-collapse: collapse; font: 11px/1.35 ui-monospace, monospace; }
+    td, th { padding: 1px 6px; text-align: right; white-space: nowrap; }
+    th { border-bottom: 1px solid #999; }
+    td:nth-child(-n+3), th:nth-child(-n+3) { text-align: left; }
+    tr.sep td { border-top: 1px solid #ccc; }
+    #status { margin: 6px 0; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+    <h1>Benchmark: Fill3DLayer of main vs the working tree</h1>
+    <div>
+      frames/bearing <input id="frames" type="number" value="30" min="3" style="width:50px" />
+      bearings <input id="bearings" type="number" value="4" min="1" max="8" style="width:40px" />
+      <button id="run">Run</button> <button id="copy">Copy JSON</button>
+    </div>
+    <div id="status">Needs <code>sh scripts/bench-baseline.sh</code> once (exports main to bench/baseline/).</div>
+    <table id="out"></table>
+  </div>
+
+  <!--
+    Fill3DLayer of a reference revision (bench/baseline/src, exported by
+    sh scripts/bench-baseline.sh — default: main) against the working tree, on
+    the live buildings3d tiles. Automated matrix: location × terrain ×
+    configuration. Per run: load time (layer added → all tiles meshed),
+    main-thread time in tile parse/bake, GPU buffer bytes, frame times from
+    forced synchronous redraws (map.redraw() + a 1-pixel readback, so vsync
+    doesn't cap them) at a few bearings, and — where the browser has timer
+    queries (EXT_disjoint_timer_query_webgl2) — the GPU time of the layer per
+    pass: depth pre-pass (transparent layers only), colour, the two skirt passes.
+    Query: ?quick (fewer frames), ?frames=&bearings=, ?style=minimal (background only),
+    ?loc=oper,innsbruck, ?cfg=main,fill3d%2BAO (+ as %2B), ?autorun.
+  -->
+  <script type="module">
+    import { Map } from 'maplibre-gl';
+    import 'maplibre-gl/dist/maplibre-gl.css';
+    import * as tree from '/src/index.ts';
+
+    const $ = (id) => document.getElementById(id);
+    const q = new URLSearchParams(location.search);
+    let base;
+    try {
+      base = await import('/bench/baseline/src/index.ts');
+    } catch (e) {
+      $('status').textContent = 'Baseline missing — run: sh scripts/bench-baseline.sh';
+      throw e;
+    }
+
+    const LOCATIONS = {
+      oper: { center: [16.3751, 48.2064], zoom: 17, pitch: 60, note: 'CityGML, dense' },
+      akademie: { center: [16.3664, 48.2012], zoom: 17, pitch: 60, note: 'CityGML, dense' },
+      innsbruck: { center: [11.3958, 47.2672], zoom: 17, pitch: 60, note: 'OSM, mostly flat roofs' },
+      hallstatt: { center: [13.6494, 47.5622], zoom: 17, pitch: 60, note: 'OSM, small town on a slope' },
+    };
+    const AO = 0.8;
+    const CONFIGS = [
+      { id: 'empty', note: 'map only, no buildings' },
+      { id: 'main', lib: 'base', native: true },
+      // Without AO: no edge search, no AO attributes or tables, no skirt.
+      { id: 'fill3d', lib: 'tree', native: true },
+      { id: 'fill3d+AO', lib: 'tree', native: true, ao: AO, skirt: 0 },
+      { id: 'fill3d+AO+skirt', lib: 'tree', native: true, ao: AO, skirt: 3 },
+      // The footprints as the layer's own prisms instead of a native fill-extrusion.
+      { id: 'fill3d ext+AO+skirt', lib: 'tree', ext: true, ao: AO, skirt: 3 },
+      // A transparent layer (opacity 1: same picture): it draws with a depth pre-pass, an opaque one in one pass.
+      { id: 'fill3d+AO+skirt α', lib: 'tree', native: true, ao: AO, skirt: 3, opacity: 1 },
+    ];
+    const pick = (all, key) => (q.get(key) ? q.get(key).split(',') : null);
+    const locs = pick(LOCATIONS, 'loc') ?? Object.keys(LOCATIONS);
+    const cfgs = CONFIGS.filter((c) => !pick(CONFIGS, 'cfg') || pick(CONFIGS, 'cfg').includes(c.id));
+    if (q.has('quick')) {
+      $('frames').value = 5;
+      $('bearings').value = 2;
+    }
+    if (q.has('frames')) $('frames').value = q.get('frames');
+    if (q.has('bearings')) $('bearings').value = q.get('bearings');
+
+    const WALL = '#f2efe9';
+    const ROOF = '#cdc5b9';
+    const style = q.get('style') === 'minimal'
+      ? { version: 8, sources: {}, layers: [{ id: 'bg', type: 'background', paint: { 'background-color': '#eceae4' } }] }
+      : 'https://styles.maptoolkit.org/summer.json';
+
+    const map = window.map = new Map({
+      container: 'map',
+      center: LOCATIONS[locs[0]].center,
+      zoom: 17,
+      pitch: 60,
+      maxPitch: 85,
+      canvasContextAttributes: { antialias: true },
+      style,
+      attributionControl: false,
+    });
+    await new Promise((r) => map.once('load', r));
+    for (const id of ['building_3d', 'building_3d_multicolored']) if (map.getLayer(id)) map.removeLayer(id);
+    map.addSource('mtk-terrain', { type: 'raster-dem', url: 'https://tiles.maptoolkit.org/terrainrgb.json', encoding: 'terrarium', tileSize: 512 });
+    map.addSource('b3d-live', { type: 'vector', url: 'https://dataconnector.maptoolkit.net/maptoolkit/buildings3d2.json?api_key=iib', maxzoom: 15 });
+    const source = 'b3d-live';
+    const firstSymbol = () => map.getStyle().layers.find((l) => l.type === 'symbol')?.id;
+    const gl = map.painter.context.gl;
+    // Wait until the frame is really drawn: gl.finish() doesn't block in Chrome,
+    // reading back one pixel does.
+    const px = new Uint8Array(4);
+    const sync = () => gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+
+    // GPU time per pass of the fill-3d layer (depth, colour, the two skirt passes),
+    // where the browser has timer queries: a query runs from one setPass() to the
+    // next and to the end of the layer's render().
+    const timer = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+    const gpuPending = [];
+    let gpuQuery = null;
+    const gpuEnd = () => {
+      if (!gpuQuery) return;
+      gl.endQuery(timer.TIME_ELAPSED_EXT);
+      gpuPending.push(gpuQuery);
+      gpuQuery = null;
+    };
+    const gpuBegin = (pass) => {
+      gpuEnd();
+      const query = gl.createQuery();
+      gl.beginQuery(timer.TIME_ELAPSED_EXT, query);
+      gpuQuery = { pass, query };
+    };
+    /** Collect the finished queries into `into[pass]` (ms); returns how many are still open. */
+    function gpuCollect(into) {
+      const disjoint = gl.getParameter(timer.GPU_DISJOINT_EXT);
+      for (let i = gpuPending.length - 1; i >= 0; i--) {
+        const { pass, query } = gpuPending[i];
+        if (!gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE)) continue;
+        if (!disjoint) (into[pass] ??= []).push(gl.getQueryParameter(query, gl.QUERY_RESULT) / 1e6);
+        gl.deleteQuery(query);
+        gpuPending.splice(i, 1);
+      }
+      return gpuPending.length;
+    }
+    let gpuOn = false;
+    function gpuWrap(l) {
+      if (!timer || !l.manager?.setPass) return;
+      const setPass = l.manager.setPass.bind(l.manager);
+      l.manager.setPass = (pass) => {
+        if (gpuOn) gpuBegin(pass);
+        setPass(pass);
+      };
+      const render = l.render.bind(l);
+      l.render = (...args) => {
+        render(...args);
+        gpuEnd();
+      };
+    }
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    async function until(cond, timeout = 180000) {
+      const t0 = performance.now();
+      while (!cond()) {
+        if (performance.now() - t0 > timeout) throw new Error('timeout');
+        await sleep(100);
+      }
+    }
+    const fill3dReady = (layer) => {
+      const m = layer?.manager;
+      if (!m) return true;
+      if (m.tileTemplate == null) return false;
+      for (const e of m.tiles.values()) if (e.state === 'loading') return false;
+      return m.rebakeRafId === undefined;
+    };
+    let layer = null;
+    const settled = () => map.loaded() && !map.isMoving() && map.areTilesLoaded() && fill3dReady(layer);
+    async function settle() {
+      await until(settled);
+      await sleep(300); // DEM rebakes run on the next frame
+      await until(settled);
+    }
+
+    function clear() {
+      if (map.getLayer('fill-3d')) map.removeLayer('fill-3d');
+      if (map.getLayer('buildings-lod1')) map.removeLayer('buildings-lod1');
+      layer = null;
+    }
+
+    function addConfig(c) {
+      clear();
+      if (c.id === 'empty') return { parseMs: 0, bakeMs: 0 };
+      if (c.native) {
+        map.addLayer({
+          id: 'buildings-lod1', type: 'fill-extrusion', source, 'source-layer': 'buildings2d',
+          filter: ['!=', ['get', 'extrude'], false],
+          paint: { 'fill-extrusion-height': ['get', 'height'], 'fill-extrusion-base': ['coalesce', ['get', 'min_height'], 0], 'fill-extrusion-color': WALL },
+        }, firstSymbol());
+      }
+      const lib = { base, tree }[c.lib];
+      const paint = { 'fill-3d-color': ['match', ['get', 'type'], 'roof', ROOF, WALL] };
+      if (c.ao) {
+        paint['fill-3d-ambient-occlusion-intensity'] = c.ao;
+        paint['fill-3d-ambient-occlusion-ground-radius'] = c.skirt ?? 0;
+      }
+      if (c.opacity != null) paint['fill-3d-opacity'] = c.opacity; // makes the layer transparent
+      layer = new lib.Fill3DLayer({
+        id: 'fill-3d', source, 'source-layer': 'buildings3d', paint,
+        extrusion: c.ext ? { 'source-layer': 'buildings2d', filter: ['!=', ['get', 'extrude'], false] } : undefined,
+      });
+      map.addLayer(layer, firstSymbol());
+      gpuWrap(layer);
+      // Main-thread time spent meshing and baking tiles (wrapped per instance).
+      const t = { parseMs: 0, bakeMs: 0 };
+      const m = layer.manager;
+      const wrap = (name, key) => {
+        const orig = m[name];
+        m[name] = function (...args) {
+          const t0 = performance.now();
+          try { return orig.apply(this, args); } finally { t[key] += performance.now() - t0; }
+        };
+      };
+      wrap('onTileParsed', 'parseMs');
+      wrap('bake', 'bakeMs');
+      return t;
+    }
+
+    function buffers() {
+      const out = { f3: 0, f3v: 0, skirt: 0, nat: 0, natV: 0 };
+      const tiles = layer?.manager?.tiles;
+      if (tiles) {
+        for (const e of tiles.values()) {
+          if (e.state !== 'ready') continue;
+          const g = e.geometry;
+          for (const a of Object.values(g.attributes)) out.f3 += a.array.byteLength;
+          out.f3 += g.index.array.byteLength;
+          // The tile's AO edge tables (four small integer textures).
+          if (e.ao) for (const t of Object.values(e.ao)) out.f3 += t.image.data.byteLength;
+          out.f3v += g.attributes.position.count;
+          if (e.skirtGeometry) {
+            const s = e.skirtGeometry;
+            for (const a of Object.values(s.attributes)) out.skirt += a.array.byteLength;
+            out.skirt += s.index.array.byteLength;
+          }
+        }
+      }
+      const bytes = (a) => (a ? a.length * a.bytesPerElement : 0);
+      if (map.getLayer('buildings-lod1')) {
+        for (const tile of Object.values(map.style.tileManagers[source]._inViewTiles._tiles)) {
+          const b = tile.buckets?.['buildings-lod1'];
+          if (!b) continue;
+          out.nat += bytes(b.layoutVertexArray) + bytes(b.centroidVertexArray) + bytes(b.indexArray);
+          for (const pc of Object.values(b.programConfigurations.programConfigurations))
+            for (const bd of Object.values(pc.binders)) out.nat += bytes(bd.paintVertexArray);
+          out.natV += b.layoutVertexArray.length;
+        }
+      }
+      return out;
+    }
+
+    async function frames(n, bearings) {
+      const times = [];
+      const gpu = {};
+      for (let k = 0; k < bearings; k++) {
+        map.jumpTo({ bearing: (360 / bearings) * k + 15 });
+        await settle();
+        map.redraw();
+        sync(); // warm-up frame
+        gpuOn = !!timer;
+        for (let i = 0; i < n; i++) {
+          const t0 = performance.now();
+          map.redraw();
+          sync();
+          times.push(performance.now() - t0);
+        }
+        gpuOn = false;
+        // Query results arrive a few frames later.
+        for (let wait = 0; timer && gpuCollect(gpu) && wait < 40; wait++) await sleep(25);
+      }
+      times.sort((a, b) => a - b);
+      const med = (a) => (a && a.length ? a.slice().sort((x, y) => x - y)[Math.floor(a.length / 2)] : null);
+      return {
+        median: times[Math.floor(times.length / 2)], p95: times[Math.floor(times.length * 0.95)],
+        gpuDepth: med(gpu.depth), gpuColor: med(gpu.color),
+        gpuSkirt: gpu.skirtCollect ? med(gpu.skirtCollect) + med(gpu.skirtApply) : null,
+      };
+    }
+
+    const results = [];
+    const fmt = (v, d = 1) => (v == null ? '' : v.toFixed(d));
+    function render() {
+      const head = '<tr><th>location</th><th>terrain</th><th>config</th><th>load s</th><th>parse ms</th><th>bake ms</th><th>frame ms</th><th>p95</th><th>Δ main</th><th>GPU depth</th><th>colour</th><th>skirt</th><th>3js MB</th><th>skirt MB</th><th>native MB</th></tr>';
+      let prev = '';
+      $('out').innerHTML = head + results.map((r) => {
+        const main = results.find((x) => x.loc === r.loc && x.terrain === r.terrain && x.cfg === 'main');
+        const delta = main && r.cfg !== 'main' && r.cfg !== 'empty' ? ((r.frame / main.frame - 1) * 100).toFixed(0) + ' %' : '';
+        const key = r.loc + r.terrain;
+        const sep = key !== prev ? ' class="sep"' : '';
+        prev = key;
+        return `<tr${sep}><td>${r.loc}</td><td>${r.terrain ? 'on' : 'off'}</td><td>${r.cfg}</td><td>${fmt(r.loadS)}</td><td>${fmt(r.parseMs, 0)}</td><td>${fmt(r.bakeMs, 0)}</td><td>${fmt(r.frame, 2)}</td><td>${fmt(r.p95, 2)}</td><td>${delta}</td><td>${fmt(r.gpuDepth, 2)}</td><td>${fmt(r.gpuColor, 2)}</td><td>${fmt(r.gpuSkirt, 2)}</td><td>${fmt(r.f3 / 1e6, 2)}</td><td>${fmt(r.skirt / 1e6, 2)}</td><td>${fmt(r.nat / 1e6, 2)}</td></tr>`;
+      }).join('');
+    }
+
+    async function run() {
+      results.length = 0;
+      const n = +$('frames').value;
+      const bearings = +$('bearings').value;
+      const info = gl.getExtension('WEBGL_debug_renderer_info');
+      const gpu = info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : 'unknown GPU';
+      for (const loc of locs) {
+        for (const terrain of [false, true]) {
+          clear();
+          const L = LOCATIONS[loc];
+          map.setTerrain(terrain ? { source: 'mtk-terrain', exaggeration: 1 } : null);
+          map.jumpTo({ center: L.center, zoom: L.zoom, pitch: L.pitch, bearing: 15 });
+          await settle();
+          // Alternate the order per block (empty first), so that a GPU warming up
+          // over the run does not always hit the same configurations late.
+          const block = results.length ? new Set(results.map((r) => r.loc + r.terrain)).size : 0;
+          const order = block % 2 ? [cfgs[0], ...cfgs.slice(1).reverse()] : cfgs;
+          for (const c of order) {
+            $('status').textContent = `${loc} · terrain ${terrain ? 'on' : 'off'} · ${c.id} …  (${gpu})`;
+            map.jumpTo({ bearing: 15 });
+            const t0 = performance.now();
+            const t = addConfig(c);
+            await settle();
+            const loadS = (performance.now() - t0) / 1000;
+            const buf = buffers();
+            const f = await frames(n, bearings);
+            results.push({ loc, terrain, cfg: c.id, loadS, parseMs: t.parseMs, bakeMs: t.bakeMs, frame: f.median, p95: f.p95, gpuDepth: f.gpuDepth, gpuColor: f.gpuColor, gpuSkirt: f.gpuSkirt, ...buf });
+            render();
+          }
+        }
+      }
+      clear();
+      window.benchResults = { gpu, gpuTimer: !!timer, ua: navigator.userAgent, size: [map.getCanvas().width, map.getCanvas().height], frames: n, bearings, results };
+      $('status').textContent = `done — ${gpu}, canvas ${map.getCanvas().width}×${map.getCanvas().height}${timer ? '' : ' — no GPU timer queries in this browser (GPU columns stay empty)'}`;
+      window.benchDone = true;
+    }
+
+    $('run').addEventListener('click', run);
+    $('copy').addEventListener('click', () => navigator.clipboard.writeText(JSON.stringify(window.benchResults ?? results, null, 1)));
+    window.benchReady = true;
+    if (q.has('autorun')) run();
+  </script>
+</body>
+</html>

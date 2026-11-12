@@ -5,7 +5,9 @@ import { ElevationCache } from './ElevationCache';
 import { Fill3DManager } from './Fill3DManager';
 import { compileColor, compileOpacity } from './paint';
 import type { PaintValue } from './paint';
+import { compileNumber } from './expression';
 import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
+import type { ExtrusionRequest } from './mvt3dGeometry';
 
 /** Neutral colour used when no `fill-3d-color` is given (white → material shows). */
 const NEUTRAL_COLOR: [number, number, number, number] = [1, 1, 1, 1];
@@ -22,6 +24,21 @@ export interface Fill3DLayerOptions {
   filter?: FilterSpecification;
   /** raster-dem source id for elevation; defaults to the map's active terrain. */
   terrainSourceId?: string;
+  /**
+   * EXPERIMENTAL: also draw a layer of 2D footprints from the same tiles as
+   * extruded prisms (instead of a native `fill-extrusion`), so they get the
+   * same fake AO. Roof and wall spans carry `type: 'roof' | 'wall'` for the
+   * paint expressions, like the 3D layer's features.
+   */
+  extrusion?: {
+    /** Layer with the footprint polygons, e.g. `buildings2d`. */
+    'source-layer': string;
+    filter?: FilterSpecification;
+    /** Roof height in metres (default `['get', 'height']`). */
+    height?: PaintValue<number>;
+    /** Bottom in metres (default `['coalesce', ['get', 'min_height'], 0]`). */
+    base?: PaintValue<number>;
+  };
   layout?: {
     /** `'none'` hides the layer (and skips loading its tiles). */
     visibility?: 'visible' | 'none';
@@ -31,6 +48,14 @@ export interface Fill3DLayerOptions {
     'fill-3d-color'?: PaintValue<string>;
     /** Constant 0..1 or a MapLibre number expression. */
     'fill-3d-opacity'?: PaintValue<number>;
+    /** EXPERIMENTAL: fake ambient occlusion, 0..1 (default 0 = off). Zoom /
+     *  global-state expressions are evaluated each frame. */
+    'fill-3d-ambient-occlusion-intensity'?: PaintValue<number>;
+    /** EXPERIMENTAL: metres up the wall foot and out from inner edges (default 3). */
+    'fill-3d-ambient-occlusion-radius'?: number;
+    /** EXPERIMENTAL: width in metres of the darkened ground around the
+     *  building feet (default 3; 0 = none). Read when the layer is added. */
+    'fill-3d-ambient-occlusion-ground-radius'?: number;
   };
 }
 
@@ -78,6 +103,8 @@ export class Fill3DLayer implements CustomLayerInterface {
   private readonly colorEval: ReturnType<typeof compileColor>;
   private readonly opacityEval: ReturnType<typeof compileOpacity>;
   private readonly transparent: boolean;
+  private readonly extrusion?: ExtrusionRequest;
+  private readonly ao: { intensity: ReturnType<typeof compileNumber>; radius: number; groundRadius: number };
 
   private camera!: THREE.Camera;
   private scene!: THREE.Scene;
@@ -107,6 +134,21 @@ export class Fill3DLayer implements CustomLayerInterface {
     this.opacityEval = compileOpacity(paint['fill-3d-opacity'], 1);
     // A transparent material is only needed if opacity may drop below 1.
     this.transparent = 'fill-3d-opacity' in paint;
+
+    const intensity = compileNumber(paint['fill-3d-ambient-occlusion-intensity'], 'fill-3d-ambient-occlusion-intensity', 0);
+    if (!intensity.featureConstant) {
+      console.warn('Fill3DLayer: fill-3d-ambient-occlusion-intensity must not depend on feature data — ignored');
+    }
+    this.ao = {
+      intensity: intensity.featureConstant ? intensity : compileNumber(0, 'fill-3d-ambient-occlusion-intensity', 0),
+      radius: Math.max(0.1, paint['fill-3d-ambient-occlusion-radius'] ?? 3),
+      groundRadius: Math.max(0, paint['fill-3d-ambient-occlusion-ground-radius'] ?? 3),
+    };
+
+    const ext = options.extrusion;
+    if (ext) {
+      this.extrusion = { sourceLayer: ext['source-layer'], filter: ext.filter, height: ext.height, base: ext.base };
+    }
   }
 
   onAdd(map: Map, gl: WebGL2RenderingContext) {
@@ -143,6 +185,10 @@ export class Fill3DLayer implements CustomLayerInterface {
         sourceId: this.sourceId,
         sourceLayer: this.sourceLayer,
         filter: this.filter,
+        extrusion: this.extrusion,
+        ao: this.ao,
+        // The strongest-shade-wins skirt keeps its shade in the framebuffer's alpha.
+        skirtMax: gl.getContextAttributes()?.alpha !== false,
       },
     );
     if (this.visible) this.manager.update();
@@ -163,6 +209,7 @@ export class Fill3DLayer implements CustomLayerInterface {
     // Fully faded out (e.g. a zoom or pitch fade) → nothing to draw.
     if (this.manager!.syncOpacity() <= 0) return;
     this.manager!.syncLight(); // match fill-extrusion shading (light follows bearing)
+    this.manager!.syncAo();
     this.camera.projectionMatrix.multiplyMatrices(this.mainMat, this.originMat);
     this.renderer.resetState();
     // A transparent layer: depth pre-pass, then the colour pass — only the
@@ -174,6 +221,12 @@ export class Fill3DLayer implements CustomLayerInterface {
     }
     this.manager!.setPass('color');
     this.renderer.render(this.scene, this.camera);
+    if (this.manager!.skirtPasses) {
+      this.manager!.setPass('skirtCollect');
+      this.renderer.render(this.scene, this.camera);
+      this.manager!.setPass('skirtApply');
+      this.renderer.render(this.scene, this.camera);
+    }
     // No triggerRepaint() here: that re-renders the map every frame even when
     // nothing changes. Tile loads and DEM rebakes request their own.
   }

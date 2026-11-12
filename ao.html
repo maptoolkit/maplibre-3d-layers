@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>fill-3d · fake AO</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body, #map { margin: 0; height: 100%; }
+    #panel {
+      position: absolute; top: 10px; left: 10px; z-index: 1; width: 290px;
+      font: 12px/1.45 system-ui, sans-serif; background: rgba(255, 255, 255, 0.93);
+      border-radius: 6px; padding: 10px 12px; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+    }
+    #panel h1 { font-size: 13px; margin: 0 0 6px; }
+    #panel label { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+    #panel input[type=range] { flex: 1; }
+    #panel .val { width: 32px; text-align: right; font-variant-numeric: tabular-nums; }
+    #panel button { margin-top: 6px; }
+    #stats { margin-top: 8px; white-space: pre; font: 11px/1.4 ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+    <h1>Fake AO (experimental)</h1>
+    <label><input type="checkbox" id="ext" checked /> extrusions with three.js (else native)</label>
+    <label><input type="checkbox" id="terrain" checked /> terrain</label>
+    <label><input type="checkbox" id="opacity" checked /> opacity from the style (else opaque)</label>
+    <label>AO intensity <input type="range" id="intensity" min="0" max="1" step="0.05" value="0.8" /><span class="val" id="intensityVal"></span></label>
+    <label>AO radius m <input type="range" id="radius" min="1" max="8" step="0.5" value="3" /><span class="val" id="radiusVal"></span></label>
+    <label>skirt m <input type="range" id="ground" min="0" max="8" step="0.5" value="3" /><span class="val" id="groundVal"></span></label>
+    <button id="bench">Benchmark: rotate 360° (10 s)</button>
+    <div id="stats"></div>
+  </div>
+
+  <!--
+    Test page for the experimental fake AO (inner edges from per-tile edge
+    tables, wall feet, ground skirt) and the three.js extrusions of `buildings2d`.
+    Intensity is live (a global-state expression); radius, skirt, the extrusion
+    and the opacity switch re-create the layer.
+    Opacity: the buildings' zoom/pitch fade of the style's 3D scene (metadata
+    `maptoolkit:scene3d`: `fill3d` for the meshes, `lod1` for the native
+    extrusions) — a transparent layer, which draws with a depth pre-pass; off,
+    the layer is opaque and draws in one pass.
+  -->
+  <script type="module">
+    import { Map } from 'maplibre-gl';
+    import 'maplibre-gl/dist/maplibre-gl.css';
+    import { Fill3DLayer } from '/src/index.ts';
+
+    const $ = (id) => document.getElementById(id);
+    const map = window.map = new Map({
+      container: 'map',
+      center: [11.3958, 47.2672], // Innsbruck old town
+      zoom: 17.2,
+      pitch: 62,
+      maxPitch: 85,
+      bearing: 30,
+      canvasContextAttributes: { antialias: true },
+      style: 'https://styles.maptoolkit.org/summer.json',
+      hash: true,
+    });
+
+    const WALL = '#f2efe9';
+    const ROOF = '#cdc5b9';
+
+    /** A building opacity of the style's 3D scene (`fill3d` / `lod1`), if the switch is on and the style has one. */
+    function styleOpacity(part, property) {
+      if (!$('opacity').checked) return undefined;
+      return map.getStyle().metadata?.['maptoolkit:scene3d']?.[part]?.paint?.[property];
+    }
+
+    function addFill3D() {
+      if (map.getLayer('fill-3d')) map.removeLayer('fill-3d');
+      const ext = $('ext').checked;
+      map.setLayoutProperty('buildings-lod1', 'visibility', ext ? 'none' : 'visible');
+      map.setPaintProperty('buildings-lod1', 'fill-extrusion-opacity', styleOpacity('lod1', 'fill-extrusion-opacity') ?? 1);
+      const paint = {
+        'fill-3d-color': ['match', ['get', 'type'], 'roof', ROOF, WALL],
+        'fill-3d-ambient-occlusion-intensity': ['global-state', 'aoIntensity'],
+        'fill-3d-ambient-occlusion-radius': +$('radius').value,
+        'fill-3d-ambient-occlusion-ground-radius': +$('ground').value,
+      };
+      // Only when set: the property alone makes the layer transparent.
+      const opacity = styleOpacity('fill3d', 'fill-3d-opacity');
+      if (opacity !== undefined) paint['fill-3d-opacity'] = opacity;
+      const layer = new Fill3DLayer({
+        id: 'fill-3d',
+        source: 'buildings3d',
+        'source-layer': 'buildings3d',
+        extrusion: ext ? { 'source-layer': 'buildings2d', filter: ['!=', ['get', 'extrude'], false] } : undefined,
+        paint,
+      });
+      map.addLayer(layer, firstSymbolLayer());
+      window.fill3d = layer;
+    }
+
+    /** Draw below the labels, like a style would (the skirt darkens what's under it). */
+    function firstSymbolLayer() {
+      return map.getStyle().layers.find((l) => l.type === 'symbol')?.id;
+    }
+
+    function syncLabels() {
+      $('intensityVal').textContent = $('intensity').value;
+      $('radiusVal').textContent = $('radius').value;
+      $('groundVal').textContent = $('ground').value;
+    }
+
+    function setTerrain() {
+      map.setTerrain($('terrain').checked ? { source: 'mtk-terrain', exaggeration: 1 } : null);
+    }
+
+    map.on('load', () => {
+      // Replace the style's own OSM 3D buildings — else they z-fight our meshes.
+      for (const id of ['building_3d', 'building_3d_multicolored']) {
+        if (map.getLayer(id)) map.removeLayer(id);
+      }
+      map.addSource('mtk-terrain', {
+        type: 'raster-dem',
+        url: 'https://tiles.maptoolkit.org/terrainrgb.json',
+        encoding: 'terrarium',
+        tileSize: 512,
+      });
+      setTerrain();
+      map.addSource('buildings3d', {
+        type: 'vector',
+        url: 'https://dataconnector.maptoolkit.net/maptoolkit/buildings3d2.json?api_key=iib',
+        maxzoom: 15,
+      });
+      // Native LOD1 — shown when the extrusions are NOT drawn by three.js.
+      map.addLayer({
+        id: 'buildings-lod1',
+        type: 'fill-extrusion',
+        source: 'buildings3d',
+        'source-layer': 'buildings2d',
+        filter: ['!=', ['get', 'extrude'], false],
+        paint: {
+          'fill-extrusion-height': ['get', 'height'],
+          'fill-extrusion-base': ['coalesce', ['get', 'min_height'], 0],
+          'fill-extrusion-color': WALL,
+        },
+      }, firstSymbolLayer());
+      map.setGlobalStateProperty('aoIntensity', +$('intensity').value);
+      // The style's opacities fade with the pitch, which they read from the global state.
+      const syncPitch = () => map.setGlobalStateProperty('pitch', map.getPitch());
+      map.on('pitch', syncPitch);
+      syncPitch();
+      syncLabels();
+      addFill3D();
+    });
+
+    $('intensity').addEventListener('input', () => {
+      syncLabels();
+      map.setGlobalStateProperty('aoIntensity', +$('intensity').value);
+      map.triggerRepaint();
+    });
+    for (const id of ['radius', 'ground']) {
+      $(id).addEventListener('input', syncLabels);
+      $(id).addEventListener('change', addFill3D);
+    }
+    $('ext').addEventListener('change', addFill3D);
+    $('opacity').addEventListener('change', addFill3D);
+    $('terrain').addEventListener('change', setTerrain);
+
+    // ---- Stats: GPU buffer bytes of the visible z15 tiles, three.js vs native.
+    const fmt = (b) => (b / 1e6).toFixed(2) + ' MB';
+    function stats() {
+      const out = { f3: 0, f3v: 0, skirt: 0, skirtV: 0, tiles: 0, nat: 0, natV: 0 };
+      const tiles = window.fill3d?.manager?.tiles;
+      if (tiles) {
+        for (const e of tiles.values()) {
+          if (e.state !== 'ready') continue;
+          out.tiles++;
+          const g = e.geometry;
+          for (const a of Object.values(g.attributes)) out.f3 += a.array.byteLength;
+          out.f3 += g.index.array.byteLength;
+          // The tile's AO edge tables (four small integer textures).
+          if (e.ao) for (const t of Object.values(e.ao)) out.f3 += t.image.data.byteLength;
+          out.f3v += g.attributes.position.count;
+          if (e.skirtGeometry) {
+            const s = e.skirtGeometry;
+            for (const a of Object.values(s.attributes)) out.skirt += a.array.byteLength;
+            out.skirt += s.index.array.byteLength;
+            out.skirtV += s.attributes.position.count;
+          }
+        }
+      }
+      const cache = map.style?.tileManagers?.['buildings3d'];
+      const bytes = (a) => (a ? a.length * a.bytesPerElement : 0);
+      if (cache && map.getLayoutProperty('buildings-lod1', 'visibility') !== 'none') {
+        for (const t of Object.values(cache._inViewTiles._tiles)) {
+          const b = t.buckets?.['buildings-lod1'];
+          if (!b) continue;
+          out.nat += bytes(b.layoutVertexArray) + bytes(b.centroidVertexArray) + bytes(b.indexArray);
+          for (const pc of Object.values(b.programConfigurations.programConfigurations))
+            for (const bd of Object.values(pc.binders)) out.nat += bytes(bd.paintVertexArray);
+          out.natV += b.layoutVertexArray.length;
+        }
+      }
+      $('stats').textContent =
+        `three.js meshes ${fmt(out.f3)}  (${(out.f3v / 1e3).toFixed(0)}k verts, ${out.tiles} tiles)\n` +
+        `ground skirt    ${fmt(out.skirt)}  (${(out.skirtV / 1e3).toFixed(0)}k verts)\n` +
+        `native LOD1     ${fmt(out.nat)}  (${(out.natV / 1e3).toFixed(0)}k verts)` +
+        (bench ? `\n\n${bench}` : '');
+    }
+    let bench = '';
+    setInterval(stats, 1000);
+
+    // ---- Benchmark: frame times while rotating 360° in 10 s.
+    $('bench').addEventListener('click', () => {
+      const times = [];
+      let last = performance.now();
+      const onRender = () => {
+        const now = performance.now();
+        times.push(now - last);
+        last = now;
+      };
+      map.on('render', onRender);
+      bench = 'running…';
+      map.rotateTo(map.getBearing() + 359, { duration: 10000, easing: (t) => t });
+      map.once('moveend', () => {
+        map.off('render', onRender);
+        times.shift();
+        times.sort((a, b) => a - b);
+        const avg = times.reduce((s, t) => s + t, 0) / times.length;
+        const p95 = times[Math.floor(times.length * 0.95)];
+        bench = `rotate 360°: ${(1000 / avg).toFixed(0)} fps avg, ${avg.toFixed(1)} ms avg, ${p95.toFixed(1)} ms p95`;
+      });
+    });
+  </script>
+</body>
+</html>

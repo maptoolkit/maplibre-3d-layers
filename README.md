@@ -124,11 +124,12 @@ instead of an `api_key` in the URL.
 the source gives their heights in one frame and each building's base (its
 lowest point), and the group is fitted to the terrain at all its wall feet
 standing on the ground (the median of terrain height − foot height). Neighbours
-so stay as they stand to each other in the data, and a building stepping up a
-slope isn't lifted by the terrain at its centre. A building without a base
-height in the source's frame (bodies generated from OSM) sits on the terrain
-height of its centre. Either way the vertices at a building's base follow the
-ground down on a slope. The
+so stay as they stand to each other in the data — a building stepping up a
+slope isn't lifted by the terrain at its centre, and an inner edge sits on the
+roof it belongs to. A building without a base height in the source's frame
+(bodies generated from OSM, extrusions) sits on the terrain height of its
+centre. Either way the vertices at a building's base follow the ground down on
+a slope. The
 source also sinks the walls standing on a building's base 10 m below it as a
 reserve for slopes (buildings3d `MTK_BUILDINGS3D_GROUND_DEPTH`); the terrain
 surface hides that reserve. Without terrain the meshes sit on the flat map,
@@ -151,6 +152,70 @@ the terrain on or off re-bakes the loaded tiles.
 Colour and opacity are evaluated per feature against its properties, the
 current zoom and the map's [global state](#global-state). An opacity that is the
 same for every feature (zoom and global state only) is evaluated every frame.
+
+### Experimental: fake ambient occlusion, extrusions, ground skirt
+
+> Experimental: names and behaviour may still change. Try it on `ao.html`
+> (`npm run dev`, then `/ao.html`); it takes the buildings' opacity from the
+> style's 3D scene, or draws them opaque.
+
+| option | default | description |
+|---|---|---|
+| `paint['fill-3d-ambient-occlusion-intensity']` | `0` (off) | `0..1`; constant, zoom or global-state expression (not per feature), evaluated every frame |
+| `paint['fill-3d-ambient-occlusion-radius']` | `3` | metres: how far up the wall foot and out from an inner edge the darkening reaches |
+| `paint['fill-3d-ambient-occlusion-ground-radius']` | `3` | metres: width of the darkened ground around the building feet; `0` = none |
+| `extrusion` | — | `{ 'source-layer', filter?, height?, base? }`: also extrude a layer of 2D footprints from the same tiles (e.g. `buildings2d`); `height` defaults to `['get', 'height']`, `base` to `['coalesce', ['get', 'min_height'], 0]` |
+
+- **Walls** darken towards their foot, and every face towards its inner
+  (concave) edges: inner corners, roof valleys, walls rising from a lower roof.
+  An inner edge is an edge two faces — of one building or of neighbours —
+  share while each runs off to the front of the other: with exactly the same
+  end points, or, for vertical edges, on the same column where they overlap
+  (neighbours of different height). That needs tiles whose CityGML part is
+  topologically clean, every contact of two faces an edge pair — as the
+  buildings3d build makes it with its topology cleanup (vts branch
+  `prototype/buildings3d-topology`, `MTK_BUILDINGS3D_TOPOLOGY=all`). On tiles
+  as served today about a third of Vienna's inner edges get no darkening. OSM
+  bodies and extrusions need no cleanup, except that a lower roof against a
+  wall running on above it gets none. An inner edge darkens as much as the
+  other face hides the sky: 1 + cos of the opening angle between the two
+  faces, relative to a right angle — hardly at a shallow valley (0.13 at
+  150°), half at 120°, as before at 90°, 1.7 times at 45°. A face darkens
+  towards **all** its inner edges, however many: the worker lists them per
+  tile in four small integer textures — per face a 4 m grid in its plane
+  (faces with up to 4 edges: none, the fragment checks them all), per cell the edges whose reach
+  (fill-3d-ambient-occlusion-radius) touches it — and each fragment checks the
+  edges of its cell (1.6 on average in Vienna) exactly, from its position in
+  the face's plane. Where foot and inner edge meet, the stronger of the two
+  counts (no doubling).
+- **Ground skirt:** a strip along every wall foot on the ground, draped on the
+  terrain, mitred at corners and rounded at free ends. Wall feet facing each
+  other (party walls, also where the neighbours split them differently) get
+  none. Where strips overlap, only the strongest darkening counts: the skirt is
+  drawn twice, first keeping the darkest shade per pixel in the framebuffer's
+  alpha, then applying it once (a canvas without alpha falls back to
+  multiplying). Add the layer below the labels, or they are darkened too.
+- **Extrusions** replace a native `fill-extrusion` on the same footprints (hide
+  that one). The footprints are clipped to the tile; roof and wall carry
+  `type: 'roof' | 'wall'`, so `fill-3d-color` expressions work as on the 3D layer.
+- **Cost:** with the intensity a constant `0` (the default) no inner edges
+  are searched and no AO data is built or uploaded. With AO on, a vertex
+  carries 8 more bytes (height above ground, face, plane position) and the
+  tile its edge tables (dense Vienna tile ~1.4 MB), the worker searches the
+  whole tile for inner edges; changing the AO radius rebuilds the tables,
+  and terrain is sampled once per ground column (shared by a wall's top and
+  bottom, the roof above and the skirt below), not per vertex. Per frame an
+  opaque layer draws its buildings in one pass; a transparent one
+  (`fill-3d-opacity` set) first lays down their depth, so that only the
+  frontmost surface blends. Measured on an Intel Arc at 2560×1262 in dense
+  Vienna, GPU time of the layer: 3.3 ms without AO, 4.0 ms with AO and skirt,
+  5.1 ms with both when transparent — and 4.7 ms before, without AO, when
+  every layer drew the pre-pass.
+  `bench.html` compares all of this against `main` (`sh scripts/bench-baseline.sh`
+  once), with the GPU time per pass where the browser has timer queries.
+- **Known limits:** on steep, stepped terrain the skirt partly sinks into the
+  ground (stripes). The extrusion expressions see the tile zoom and no global
+  state. The intensity can't vary per feature.
 
 ---
 
