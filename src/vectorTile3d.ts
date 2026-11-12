@@ -92,6 +92,49 @@ export class VectorTileFeature {
     }
     return polygons;
   }
+
+  /**
+   * A standard 2D MVT geometry (`buildings2d` polygons, two varints per point,
+   * command 7 = ClosePath) as rings, NOT closed by a repeated first point.
+   */
+  loadRings2D(): { x: number; y: number }[][] {
+    const pbf = this._pbf;
+    pbf.pos = this._geometry;
+
+    const end = pbf.readVarint() + pbf.pos;
+    let cmd = 1;
+    let length = 0;
+    let x = 0;
+    let y = 0;
+    const rings: { x: number; y: number }[][] = [];
+    let ring: { x: number; y: number }[] | null = null;
+
+    while (pbf.pos < end) {
+      if (length <= 0) {
+        const cmdLen = pbf.readVarint();
+        cmd = cmdLen & 0x7;
+        length = cmdLen >> 3;
+      }
+      length--;
+
+      if (cmd === 1 || cmd === 2) {
+        x += pbf.readSVarint();
+        y += pbf.readSVarint();
+        if (cmd === 1) {
+          if (ring) rings.push(ring);
+          ring = [];
+        }
+        ring!.push({ x, y });
+      } else if (cmd === 7) {
+        if (ring) rings.push(ring);
+        ring = null;
+      } else {
+        throw new Error(`unknown command ${cmd}`);
+      }
+    }
+    if (ring) rings.push(ring);
+    return rings;
+  }
 }
 
 function readFeature(tag: number, feature: VectorTileFeature, pbf: Pbf) {
