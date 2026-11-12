@@ -4,7 +4,7 @@ import * as THREE from 'three';
 import type { ElevationCache } from './ElevationCache';
 import { createMercatorElevationSampler, tileBounds } from './ElevationCache';
 import type { GeoBounds } from './ElevationCache';
-import type { ExtrusionRequest, TileRequest, TileResult, FeatureSpan, AoTables, TerrainAnchors } from './mvt3dGeometry';
+import type { ExtrusionRequest, TileRequest, TileResult, AoResult, SkirtResult, FeatureSpan, AoTables, TerrainAnchors } from './mvt3dGeometry';
 import { AO_CELL_M, AO_NO_FACE, AO_TEXTURE_SHIFT, AO_TEXTURE_WIDTH, AO_UV_UNIT_M } from './mvt3dGeometry';
 import type { ColorEval, OpacityEval } from './paint';
 import type { Evaluator } from './expression';
@@ -29,6 +29,9 @@ const SKIRT_LIFT_M = 0.4;
 /** Strength of the two fake-AO terms at intensity 1: darkening at the wall foot / in an inner corner. */
 const AO_GROUND_WEIGHT = 0.6;
 const AO_CORNER_WEIGHT = 0.5;
+
+/** A tile's fake AO fades in over this long (ms) once its data has arrived. */
+const AO_FADE_MS = 500;
 
 // Replicates MapLibre's fill-extrusion vertex lighting (a flat directional ramp,
 // NOT PBR) so the 3D meshes shade like the native fill-extrusion LOD1. Works in
@@ -89,6 +92,7 @@ const FILL3D_VERTEX = /* glsl */ `
 // linear, so the interpolated value is exact per fragment.
 const AO_FUNCTIONS = /* glsl */ `
   uniform float u_ao_intensity;
+  uniform float u_ao_tile; // 0..1: this tile's AO fading in once its AO data has arrived
   uniform float u_ao_radius;
   // 1 at the edge, falling off to 0 at the radius.
   float occlusion(float d) {
@@ -163,12 +167,13 @@ const FILL3D_FRAGMENT = /* glsl */ `
   varying float v_aoh;
   void main() {
     vec4 color = v_color;
-    if (u_ao_intensity > 0.0) {
+    float ao = u_ao_intensity * u_ao_tile;
+    if (ao > 0.0) {
       float ground = occlusion(max(v_aoh, 0.0));
       float corner = innerEdges();
       // The stronger term wins: an inner corner at the wall foot is no darker
       // than either alone (no doubling where edges meet).
-      color.rgb *= 1.0 - u_ao_intensity * max(${AO_GROUND_WEIGHT.toFixed(2)} * ground, ${AO_CORNER_WEIGHT.toFixed(2)} * corner);
+      color.rgb *= 1.0 - ao * max(${AO_GROUND_WEIGHT.toFixed(2)} * ground, ${AO_CORNER_WEIGHT.toFixed(2)} * corner);
     }
     gl_FragColor = color;
   }
@@ -189,12 +194,13 @@ const SKIRT_VERTEX = /* glsl */ `
 const SKIRT_FRAGMENT = /* glsl */ `
   precision mediump float;
   uniform float u_ao_intensity;
+  uniform float u_ao_tile; // 0..1: this tile's AO fading in
   uniform float u_opacity;
   uniform int u_mode; // 0 multiply, 1 collect the darkest shade in alpha, 2 apply it
   varying vec2 v_coord;
   void main() {
     float t = clamp(length(v_coord), 0.0, 1.0); // distance from the foot, in radii
-    float shade = 1.0 - u_ao_intensity * ${AO_GROUND_WEIGHT.toFixed(2)} * u_opacity * (1.0 - t) * (1.0 - t);
+    float shade = 1.0 - u_ao_intensity * u_ao_tile * ${AO_GROUND_WEIGHT.toFixed(2)} * u_opacity * (1.0 - t) * (1.0 - t);
     gl_FragColor = u_mode == 0 ? vec4(vec3(shade), 1.0) : u_mode == 1 ? vec4(0.0, 0.0, 0.0, shade) : vec4(0.0, 0.0, 0.0, 1.0);
   }
 `;
@@ -284,6 +290,7 @@ function createFill3DMaterial(transparent: boolean, ao: AoTextures): THREE.Shade
       u_ao_intensity: { value: 0 },
       u_ao_radius: { value: 3 },
       // Swapped per tile (bindAo).
+      u_ao_tile: { value: 0 },
       u_ao_faces: { value: ao.faces },
       u_ao_cells: { value: ao.cells },
       u_ao_lists: { value: ao.lists },
@@ -317,6 +324,7 @@ function createSkirtMaterial(): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     uniforms: {
       u_ao_intensity: { value: 0 },
+      u_ao_tile: { value: 0 }, // per tile, see bindSkirt
       u_opacity: { value: 1 },
       u_mode: { value: 0 },
     },
@@ -363,6 +371,17 @@ export interface Fill3DConfig {
    * framebuffer's alpha channel). False for a canvas without alpha: they multiply.
    */
   skirtMax: boolean;
+  /** At most this many tile workers (they start as tiles queue up). */
+  workers: number;
+}
+
+/** One tile worker and the tiles it is working on, by request number. */
+interface PoolWorker {
+  worker: Worker;
+  /** Tiles waiting for their geometry. */
+  geometry: Set<number>;
+  /** Tiles whose geometry is out and whose AO data is still to come. */
+  ao: Set<number>;
 }
 
 /** Scene anchor in mercator + the metric at its latitude. */
@@ -389,6 +408,13 @@ interface TileEntry {
   skirtGeometry?: THREE.BufferGeometry;
   /** The tile's AO tables (inner edges), bound before its mesh draws. */
   ao?: AoTextures;
+  /** When the tile's AO data arrived (ms), while it
+   *  fades in; and how far it has faded in (0..1; undefined: no AO data yet). */
+  aoSince?: number;
+  aoFade?: number;
+  /** The worker that has the tile, and the request's number. */
+  worker?: number;
+  seq?: number;
   /** Per vertex: the worker's y, the height above the feature base (no terrain
    *  yet). x and z never change, so only y is kept for re-baking. */
   baseY?: Float32Array;
@@ -432,7 +458,9 @@ export class Fill3DManager {
   private readonly skirtMaterial: THREE.ShaderMaterial;
   private readonly elevation: ElevationCache;
   private readonly terrainSourceId: string;
-  private readonly worker: Worker;
+  /** Tiles are parsed side by side; a worker keeps a tile until its AO data is out. */
+  private readonly pool: PoolWorker[] = [];
+  private seq = 0;
   private readonly tiles = new globalThis.Map<string, TileEntry>();
   private readonly material: THREE.ShaderMaterial;
   private readonly depthMaterial: THREE.ShaderMaterial;
@@ -485,8 +513,6 @@ export class Fill3DManager {
     this.material.uniforms.u_ao_radius.value = config.ao.radius;
     this.skirtMaterial = createSkirtMaterial();
 
-    this.worker = new Mvt3dWorker();
-    this.worker.onmessage = (e: MessageEvent<TileResult>) => this.onTileParsed(e.data);
 
     // DEM tiles stream in → re-bake feature heights against the new terrain.
     this.onData = (ev) => {
@@ -598,6 +624,11 @@ export class Fill3DManager {
       if (wanted.has(key)) continue;
       this.freeTile(entry);
       this.tiles.delete(key);
+      if (entry.worker !== undefined) {
+        const w = this.pool[entry.worker];
+        w.worker.postMessage({ cancel: key, seq: entry.seq }); // its AO pass, if still to come
+        if (entry.seq !== undefined) w.ao.delete(entry.seq);
+      }
     }
   }
 
@@ -609,16 +640,74 @@ export class Fill3DManager {
     if (entry.ao) for (const t of Object.values(entry.ao)) t.dispose();
   }
 
+  /**
+   * The worker for the next tile — an idle one, else a
+   * new one while the pool may grow, else the one with the least to do (tiles
+   * waiting for their geometry weigh more than AO passes, which give way to them).
+   */
+  private pickWorker(): number {
+    let best = -1;
+    let bestLoad = Infinity;
+    this.pool.forEach((w, i) => {
+      const load = w.geometry.size * 1000 + w.ao.size;
+      if (load < bestLoad) {
+        best = i;
+        bestLoad = load;
+      }
+    });
+    if (best >= 0 && (bestLoad === 0 || this.pool.length >= this.config.workers)) return best;
+
+    const index = this.pool.length;
+    const w: PoolWorker = { worker: new Mvt3dWorker(), geometry: new Set(), ao: new Set() };
+    w.worker.onmessage = (e: MessageEvent<TileResult | AoResult>) => {
+      const seq = e.data.seq;
+      if ('phase' in e.data) {
+        if (seq !== undefined) w.ao.delete(seq);
+        this.onAoParsed(e.data);
+      } else {
+        if (seq !== undefined) w.geometry.delete(seq);
+        this.onTileParsed(e.data, w);
+      }
+    };
+    this.pool.push(w);
+    return index;
+  }
+
   /** Bind a tile's AO tables to the shared material before its mesh draws. */
   private bindAo(entry: TileEntry) {
     const t = entry.ao ?? this.aoEmpty;
+    const fade = entry.aoFade ?? 0;
     const u = this.material.uniforms;
-    if (u.u_ao_faces.value === t.faces) return;
+    if (u.u_ao_faces.value === t.faces && u.u_ao_tile.value === fade) return;
+    u.u_ao_tile.value = fade;
     u.u_ao_faces.value = t.faces;
     u.u_ao_cells.value = t.cells;
     u.u_ao_lists.value = t.lists;
     u.u_ao_edges.value = t.edges;
     this.material.uniformsNeedUpdate = true;
+  }
+
+  /** The tile's AO fade for its skirt, before the skirt draws. */
+  private bindSkirt(entry: TileEntry) {
+    const fade = entry.aoFade ?? 0;
+    const u = this.skirtMaterial.uniforms;
+    if (u.u_ao_tile.value === fade) return;
+    u.u_ao_tile.value = fade;
+    this.skirtMaterial.uniformsNeedUpdate = true;
+  }
+
+  private addSkirt(entry: TileEntry, skirt: SkirtResult) {
+    const sg = new THREE.BufferGeometry();
+    sg.setAttribute('position', new THREE.BufferAttribute(skirt.position, 3));
+    sg.setAttribute('coord', new THREE.BufferAttribute(skirt.coord, 2, true));
+    sg.setIndex(new THREE.BufferAttribute(skirt.index, 1));
+    const skirtMesh = new THREE.Mesh(sg, this.skirtMaterial);
+    skirtMesh.frustumCulled = true;
+    skirtMesh.onBeforeRender = () => this.bindSkirt(entry);
+    this.skirtGroup.add(skirtMesh);
+    entry.skirtMesh = skirtMesh;
+    entry.skirtGeometry = sg;
+    entry.skirtColumn = skirt.column;
   }
 
   /** Fetch a canonical tile's original pbf and hand it to the worker. */
@@ -642,8 +731,14 @@ export class Fill3DManager {
       .then((buffer) => {
         const e = this.tiles.get(key);
         if (e?.state !== 'loading') return; // evicted mid-flight
+        const seq = ++this.seq;
+        e.worker = this.pickWorker();
+        e.seq = seq;
+        const w = this.pool[e.worker];
+        w.geometry.add(seq);
         const req: TileRequest = {
           key,
+          seq,
           x,
           y,
           z,
@@ -653,9 +748,10 @@ export class Fill3DManager {
           extrusion: this.config.extrusion,
           skirtRadius: this.aoEnabled ? this.config.ao.groundRadius : 0,
           ao: this.aoEnabled,
+          aoLater: this.aoEnabled, // The geometry first, the AO data in a second message
           aoRadius: this.config.ao.radius,
         };
-        this.worker.postMessage(req, [buffer]);
+        w.worker.postMessage(req, [buffer]);
       })
       .catch(() => {
         const entry = this.tiles.get(key);
@@ -680,9 +776,9 @@ export class Fill3DManager {
     }
   }
 
-  private onTileParsed(result: TileResult) {
+  private onTileParsed(result: TileResult, from: PoolWorker) {
     const entry = this.tiles.get(result.key);
-    if (!entry || entry.state !== 'loading') return; // evicted mid-flight
+    if (!entry || entry.state !== 'loading' || entry.seq !== result.seq) return; // evicted mid-flight
 
     if (result.index.length === 0) {
       entry.state = 'empty';
@@ -706,6 +802,8 @@ export class Fill3DManager {
       geometry.setAttribute('aouv', new THREE.BufferAttribute(result.aoUV, 2));
     }
     if (result.aoTables) entry.ao = aoTextures(result.aoTables);
+    if (result.aoh.length) entry.aoFade = 1; // AO data in one go: nothing to fade in
+    else if (this.aoEnabled && result.seq !== undefined) from.ao.add(result.seq); // its AO pass is due in that worker
     geometry.setIndex(new THREE.BufferAttribute(result.index, 1));
 
     const mesh = new THREE.Mesh(geometry, this.material);
@@ -713,17 +811,7 @@ export class Fill3DManager {
     mesh.onBeforeRender = () => this.bindAo(entry);
     this.group.add(mesh);
 
-    if (result.skirt) {
-      const sg = new THREE.BufferGeometry();
-      sg.setAttribute('position', new THREE.BufferAttribute(result.skirt.position, 3));
-      sg.setAttribute('coord', new THREE.BufferAttribute(result.skirt.coord, 2, true));
-      sg.setIndex(new THREE.BufferAttribute(result.skirt.index, 1));
-      const skirtMesh = new THREE.Mesh(sg, this.skirtMaterial);
-      skirtMesh.frustumCulled = true;
-      this.skirtGroup.add(skirtMesh);
-      entry.skirtMesh = skirtMesh;
-      entry.skirtGeometry = sg;
-    }
+    if (result.skirt) this.addSkirt(entry, result.skirt);
 
     entry.state = 'ready';
     entry.tileScale = result.tileScale;
@@ -732,9 +820,38 @@ export class Fill3DManager {
     entry.baseY = baseY;
     entry.column = result.column;
     entry.columnXZ = result.columnXZ;
-    entry.skirtColumn = result.skirt?.column;
     entry.features = result.features;
     entry.anchors = result.anchors;
+
+    this.placeMesh(entry);
+    this.bake(entry);
+    this.map.triggerRepaint();
+  }
+
+  /**
+   * The AO data of a tile that is on the map
+   * already. Its vertices are the ones of the first pass (the worker builds the
+   * tile again, with AO), so the attributes go onto the existing geometry; the
+   * AO then fades in (see syncAo).
+   */
+  private onAoParsed(result: AoResult) {
+    const entry = this.tiles.get(result.key);
+    if (!entry || entry.state !== 'ready' || !entry.geometry || !entry.baseY || entry.seq !== result.seq) return; // evicted meanwhile
+    const vertexCount = entry.baseY.length;
+    if (result.aoFace.length !== vertexCount || entry.aoFade !== undefined) {
+      if (entry.aoFade === undefined) console.warn(`Fill3DLayer: AO data of tile ${result.key} does not fit its geometry — ignored`);
+      return;
+    }
+    entry.geometry.setAttribute('aoh', new THREE.BufferAttribute(new Int16Array(vertexCount), 1)); // filled by bake
+    entry.geometry.setAttribute('aoface', new THREE.BufferAttribute(result.aoFace, 1));
+    entry.geometry.setAttribute('aouv', new THREE.BufferAttribute(result.aoUV, 2));
+    if (result.aoTables) entry.ao = aoTextures(result.aoTables);
+    // The columns now include the skirt's.
+    entry.columnXZ = result.columnXZ;
+    entry.groundCache = undefined;
+    if (result.skirt) this.addSkirt(entry, result.skirt);
+    entry.aoSince = performance.now();
+    entry.aoFade = 0;
 
     this.placeMesh(entry);
     this.bake(entry);
@@ -845,6 +962,17 @@ export class Fill3DManager {
     this.material.uniforms.u_ao_intensity.value = value;
     this.skirtMaterial.uniforms.u_ao_intensity.value = value;
     this.skirtMaterial.uniforms.u_opacity.value = this.material.uniforms.u_opacity.value;
+
+    // Tiles whose AO data has just arrived fade in.
+    const now = performance.now();
+    let fading = false;
+    for (const entry of this.tiles.values()) {
+      if (entry.aoSince === undefined) continue;
+      entry.aoFade = Math.min(1, (now - entry.aoSince) / AO_FADE_MS);
+      if (entry.aoFade < 1) fading = true;
+      else entry.aoSince = undefined;
+    }
+    if (fading) this.map.triggerRepaint();
   }
 
   /**
@@ -954,11 +1082,30 @@ export class Fill3DManager {
     // reach: up to its radius, plus headroom for the ground falling away on a slope.
     const aoReach = this.aoEnabled ? this.config.ao.radius + 10 : -Infinity;
     const fits = flat || !scale || !entry.anchors ? undefined : anchorFits(entry.anchors, groundOf);
+    // The flat map's ground under the vertices of rigid models.
+    const rigidGround = flat && ao && entry.features.some((b) => b.rigid) ? flatGroundOfRigid(entry.features, column, baseY, xz.length / 2) : undefined;
 
     for (const b of entry.features) {
+      const end = b.start + b.count;
+      if (b.rigid) {
+        // A model built against the terrain around its anchor
+        // (b.lng, b.lat) goes to the terrain height there as one rigid body, like a
+        // GltfLayer model. Its feet reach below the ground on purpose (the generator's
+        // skirt, lower ground than at the anchor): nothing follows the ground down,
+        // and on the flat map nothing is clamped — what lies below it shows through.
+        const ele = flat ? 0 : elevationAt(new LngLat(b.lng, b.lat));
+        for (let v = b.start; v < end; v++) {
+          const rel = baseY[v];
+          const y = rel + ele;
+          pos[v * 3 + 1] = y;
+          if (!ao) continue;
+          const aboveGround = rigidGround ? rel - rigidGround[column[v]] : !flat && scale && rel < aoReach ? y - groundOf(column[v]) : rel;
+          ao[v] = Math.max(-32766, Math.min(32766, Math.round(aboveGround * 10)));
+        }
+        continue;
+      }
       const fit = fits && b.anchor !== undefined ? fits[b.anchor] : NaN;
       const ele = flat ? 0 : fit === fit ? b.base! + fit : elevationAt(new LngLat(b.lng, b.lat));
-      const end = b.start + b.count;
       for (let v = b.start; v < end; v++) {
         const rel = baseY[v];
         let y: number;
@@ -1039,7 +1186,7 @@ export class Fill3DManager {
     if (this.rebakeRafId !== undefined) cancelAnimationFrame(this.rebakeRafId);
     if (this.recolorRafId !== undefined) cancelAnimationFrame(this.recolorRafId);
     this.unwatchGlobalState();
-    this.worker.terminate();
+    for (const w of this.pool) w.worker.terminate();
     for (const entry of this.tiles.values()) this.freeTile(entry);
     this.tiles.clear();
     this.scene.remove(this.group);
@@ -1085,6 +1232,24 @@ function anchorFits(anchors: TerrainAnchors, groundOf: (column: number) => numbe
     fits[g] = fit;
   }
   return fits;
+}
+
+/**
+ * The flat map's ground under the vertices of rigid models,
+ * per ground column, relative to the map: the map itself, or the model's lowest
+ * point in that column where it reaches below the map (a wall foot on lower
+ * ground shows through the flat map, and the wall darkens towards that foot).
+ */
+function flatGroundOfRigid(features: FeatureSpan[], column: Uint32Array, baseY: Float32Array, columns: number): Float32Array {
+  const ground = new Float32Array(columns); // 0: the map
+  for (const b of features) {
+    if (!b.rigid) continue;
+    for (let v = b.start, end = b.start + b.count; v < end; v++) {
+      const c = column[v];
+      if (baseY[v] < ground[c]) ground[c] = baseY[v];
+    }
+  }
+  return ground;
 }
 
 function toOrigin(lngLat: LngLat): SceneOrigin {

@@ -25,6 +25,11 @@ export interface Fill3DLayerOptions {
   /** raster-dem source id for elevation; defaults to the map's active terrain. */
   terrainSourceId?: string;
   /**
+   * At most this many tile workers. Default: half the logical
+   * processors, at least 1 and at most 4. They start as tiles queue up.
+   */
+  workers?: number;
+  /**
    * EXPERIMENTAL: also draw a layer of 2D footprints from the same tiles as
    * extruded prisms (instead of a native `fill-extrusion`), so they get the
    * same fake AO. Roof and wall spans carry `type: 'roof' | 'wall'` for the
@@ -104,6 +109,7 @@ export class Fill3DLayer implements CustomLayerInterface {
   private readonly opacityEval: ReturnType<typeof compileOpacity>;
   private readonly transparent: boolean;
   private readonly extrusion?: ExtrusionRequest;
+  private readonly workers: number;
   private readonly ao: { intensity: ReturnType<typeof compileNumber>; radius: number; groundRadius: number };
 
   private camera!: THREE.Camera;
@@ -124,6 +130,8 @@ export class Fill3DLayer implements CustomLayerInterface {
 
     this.id = options.id;
     this.terrainSourceIdOption = options.terrainSourceId;
+    const cores = typeof navigator !== 'undefined' && navigator.hardwareConcurrency ? navigator.hardwareConcurrency : 4;
+    this.workers = Math.max(1, Math.min(8, Math.floor(options.workers ?? Math.min(4, cores / 2))));
     this.sourceId = options.source;
     this.sourceLayer = options['source-layer'];
     this.filter = options.filter;
@@ -189,6 +197,7 @@ export class Fill3DLayer implements CustomLayerInterface {
         ao: this.ao,
         // The strongest-shade-wins skirt keeps its shade in the framebuffer's alpha.
         skirtMax: gl.getContextAttributes()?.alpha !== false,
+        workers: this.workers,
       },
     );
     if (this.visible) this.manager.update();

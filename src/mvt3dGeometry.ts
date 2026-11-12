@@ -36,6 +36,15 @@ export interface TileRequest {
   skirtRadius: number;
   /** Fake AO can be on: find inner edges and emit the AO attributes. */
   ao: boolean;
+  /**
+   * With `ao`, answer with the geometry alone first
+   * (a {@link TileResult} without AO data and without the skirt), and send the AO
+   * data in a second message ({@link AoResult}) once no tile waits for its geometry.
+   * The worker keeps the parsed tile for that.
+   */
+  aoLater?: boolean;
+  /** Echoed in the results: tells a tile's results from those of an earlier request for the same key. */
+  seq?: number;
   /** Metres the inner-edge darkening reaches (fill-3d-ambient-occlusion-radius): the AO grid lists edges that far. */
   aoRadius: number;
 }
@@ -56,6 +65,12 @@ export interface FeatureSpan {
    */
   anchor?: number;
   base?: number;
+  /**
+   * A model built against the terrain around its anchor.
+   * (lng, lat) is that anchor, and the whole feature goes to the terrain height
+   * there as one rigid body (see Fill3DManager.bake).
+   */
+  rigid?: boolean;
 }
 
 /**
@@ -91,6 +106,8 @@ export interface SkirtResult {
 
 export interface TileResult {
   key: string;
+  /** The request's {@link TileRequest.seq}. */
+  seq?: number;
   /**
    * xyz per vertex in TRUE METRES relative to the tile's NW corner:
    * x=east, y=height-above-base, z=north. Scene-origin independent.
@@ -131,6 +148,22 @@ export interface TileResult {
   anchors?: TerrainAnchors;
   /** meterInMercatorCoordinateUnits at the tile's latitude (for placement). */
   tileScale: number;
+  skirt?: SkirtResult;
+}
+
+/**
+ * The AO data of a tile whose geometry was sent
+ * before — per vertex of that geometry (same vertices, same order), plus the
+ * tables, the skirt and the columns including the skirt's.
+ */
+export interface AoResult {
+  key: string;
+  seq?: number;
+  phase: 'ao';
+  aoFace: Uint16Array;
+  aoUV: Int16Array;
+  aoTables?: AoTables;
+  columnXZ: Float32Array;
   skirt?: SkirtResult;
 }
 
@@ -385,6 +418,8 @@ interface Building {
   lat: number;
   anchor?: number;
   base?: number;
+  /** Placed rigidly at (lng, lat), see {@link FeatureSpan.rigid}. */
+  rigid?: boolean;
 }
 
 /** A wall foot on the ground, in tile-local metres, with the wall's outward direction. */
@@ -473,6 +508,8 @@ class MeshBuilder {
   /** Emit the fake-AO attributes at all, and how far inner edges reach. */
   withAo = true;
   aoRadius = 3;
+  /** The second pass — AO attributes, tables and columns only, no triangles. */
+  aoOnly = false;
   indices: number[] = [];
   /** Per vertex its ground column, and per column its x, z. */
   column: number[] = [];
@@ -482,7 +519,7 @@ class MeshBuilder {
   ground: GroundEdge[] = [];
 
   get vertexCount() {
-    return this.positions.length / 3;
+    return this.column.length; // one column entry per vertex, also in the AO-only pass
   }
 
   /** The ground column at (x, z), positions within a millimetre sharing one. */
@@ -499,8 +536,30 @@ class MeshBuilder {
   }
 }
 
-/** Parse + triangulate one tile's 3D-feature layer into tile-local metre geometry. */
-export function buildTile(
+/**
+ * A tile's buildings, parsed. {@link emitTile} turns them into geometry; kept by
+ * the worker, {@link emitAo} later derives the AO data from the same faces
+ * (fake AO in two passes).
+ */
+export interface ParsedTile {
+  buildings: Building[];
+  /** meterInMercatorCoordinateUnits at the tile's latitude. */
+  tileScale: number;
+  /** The inner edges are on the faces already (findInnerEdges adds to them). */
+  innerFound?: boolean;
+}
+
+function lapOf(stats?: BuildStats) {
+  let t = performance.now();
+  return (key: Exclude<keyof BuildStats, 'innerPairs'>) => {
+    const now = performance.now();
+    if (stats) stats[key] += now - t;
+    t = now;
+  };
+}
+
+/** Parse one tile's 3D-feature layer (and the footprints to extrude) into buildings of faces, tile-local metres. */
+export function parseTile(
   tx: number,
   ty: number,
   tz: number,
@@ -508,23 +567,14 @@ export function buildTile(
   sourceLayer: string,
   filter?: FilterSpecification,
   extrusion?: ExtrusionRequest,
-  skirtRadius = 0,
-  ao = true,
   stats?: BuildStats,
-  aoRadius = 3,
-): Omit<TileResult, 'key'> {
-  let t = performance.now();
-  const lap = (key: Exclude<keyof BuildStats, 'innerPairs'>) => {
-    const now = performance.now();
-    if (stats) stats[key] += now - t;
-    t = now;
-  };
+): ParsedTile {
+  const lap = lapOf(stats);
   const pow = 2 ** tz;
   // Metric at the tile's centre latitude (geometry is stored relative to the corner).
   const tileLat = mercToLngLat((tx + 0.5) / pow, (ty + 0.5) / pow)[1];
   const tileScale = mercatorScaleAtLat(tileLat);
 
-  const out = new MeshBuilder();
   // All buildings of the tile are collected first: inner edges are searched
   // tile-wide, also between neighbouring buildings.
   const buildings: Building[] = [];
@@ -563,7 +613,14 @@ export function buildTile(
     for (const group of byId.values()) {
       const extent = group[0].extent;
       const tolerance = PART_GAP_M * extent * pow * tileScale; // metres → extent units
-      for (const part of connectedParts(group, tolerance)) {
+      // A landmark is one rigid body at its anchor, so its
+      // parts need not be told apart — and it is one id with tens of thousands of
+      // faces, for which the search for connected parts is not made (Vienna's
+      // Hofburg, 78,000 faces: 1.2 of 1.8 s). It is drawn in the tile that holds
+      // the centre of its bounding box.
+      const tags0 = group[0].properties;
+      const landmark = typeof tags0.anchor_lng === 'number' && typeof tags0.anchor_lat === 'number';
+      for (const part of landmark ? [wholePart(group)] : connectedParts(group, tolerance)) {
         const cx = (part.minX + part.maxX) / 2;
         const cy = (part.minY + part.maxY) / 2;
 
@@ -576,14 +633,20 @@ export function buildTile(
         // Half-open [0, extent) → an exact partition.
         if (cx < 0 || cx >= extent || cy < 0 || cy >= extent) continue;
 
-        const [lng, lat] = mercToLngLat((tx + cx / extent) / pow, (ty + cy / extent) / pow);
+        // A feature carrying `anchor_lng` / `anchor_lat` is a
+        // model built against the terrain around that anchor (a landmark from the
+        // generator). Every part of it is placed at the anchor, not at its own centre.
+        const rigid = landmark;
+        const [lng, lat] = rigid
+          ? [tags0.anchor_lng as number, tags0.anchor_lat as number]
+          : mercToLngLat((tx + cx / extent) / pow, (ty + cy / extent) / pow);
         const members: Member[] = part.members.map(({ feature: src, polygons }) => ({
           properties: src.properties,
           faces: polygons.map((polygon) =>
             newFace(polygon.map((ring) => ring.map((v) => toTileLocal(v, src.baseZ, src.extent, pow, tileScale))), 0, src.baseZ / 10),
           ),
         }));
-        buildings.push({ members, lng, lat });
+        buildings.push(rigid ? { members, lng, lat, rigid } : { members, lng, lat });
       }
     }
   }
@@ -591,12 +654,24 @@ export function buildTile(
 
   if (extrusion) addExtrusions(buildings, tile, extrusion, tx, ty, tz, pow, tileScale);
   lap('extrusionMs');
+  return { buildings, tileScale };
+}
 
+/** Find the tile's inner edges once (they are added to the faces). */
+function findInner(parsed: ParsedTile, stats?: BuildStats) {
+  if (parsed.innerFound) return;
+  const pairs = findInnerEdges(parsed.buildings.flatMap((b) => b.members.flatMap((m) => m.faces)));
+  parsed.innerFound = true;
+  if (stats) stats.innerPairs += pairs;
+}
+
+/** Triangulate a parsed tile into tile-local metre geometry — with `ao` including the AO data, with `skirtRadius` the skirt. */
+export function emitTile(parsed: ParsedTile, skirtRadius = 0, ao = true, stats?: BuildStats, aoRadius = 3): Omit<TileResult, 'key'> {
+  const lap = lapOf(stats);
+  const { buildings, tileScale } = parsed;
+  const out = new MeshBuilder();
   // Without AO there is nothing to find, and no AO attributes to emit.
-  if (ao) {
-    const pairs = findInnerEdges(buildings.flatMap((b) => b.members.flatMap((m) => m.faces)));
-    if (stats) stats.innerPairs += pairs;
-  }
+  if (ao) findInner(parsed, stats);
   out.withAo = ao;
   out.aoRadius = aoRadius;
   lap('innerMs');
@@ -626,6 +701,47 @@ export function buildTile(
   return { ...result, columnXZ: new Float32Array(out.columnXZ), skirt };
 }
 
+/**
+ * The AO data of a tile whose geometry
+ * {@link emitTile} gave out before (without AO) — per vertex of that geometry,
+ * in its order — plus the tables, the skirt and the columns including the
+ * skirt's. Walks the faces as emitTile does (same vertices, same columns), but
+ * builds no positions and no triangles.
+ */
+export function emitAo(parsed: ParsedTile, skirtRadius: number, aoRadius: number, stats?: BuildStats): Omit<AoResult, 'key' | 'phase'> {
+  const lap = lapOf(stats);
+  findInner(parsed, stats);
+  lap('innerMs');
+  const out = new MeshBuilder();
+  out.withAo = true;
+  out.aoOnly = true;
+  out.aoRadius = aoRadius;
+  terrainAnchors(parsed.buildings, out); // the columns of the wall feet first, as in emitTile
+  for (const b of parsed.buildings) emitBuilding(out, b);
+  const result = { aoFace: new Uint16Array(out.aoFace), aoUV: new Int16Array(out.aoUV), aoTables: out.aoTables.pack() };
+  lap('emitMs');
+  const skirt = skirtRadius > 0 && out.ground.length ? buildSkirt(out.ground, skirtRadius, out) : undefined;
+  lap('skirtMs');
+  return { ...result, columnXZ: new Float32Array(out.columnXZ), skirt };
+}
+
+/** Parse + triangulate one tile's 3D-feature layer into tile-local metre geometry. */
+export function buildTile(
+  tx: number,
+  ty: number,
+  tz: number,
+  buffer: ArrayBuffer,
+  sourceLayer: string,
+  filter?: FilterSpecification,
+  extrusion?: ExtrusionRequest,
+  skirtRadius = 0,
+  ao = true,
+  stats?: BuildStats,
+  aoRadius = 3,
+): Omit<TileResult, 'key'> {
+  return emitTile(parseTile(tx, ty, tz, buffer, sourceLayer, filter, extrusion, stats), skirtRadius, ao, stats, aoRadius);
+}
+
 /** A face with its Newell normal, in a height frame for edge matching. */
 function newFace(rings: P[][], frame: number, yOff: number): Face {
   return { rings, frame, yOff, n: newellNormal(rings[0]), inner: [] };
@@ -652,6 +768,7 @@ function emitBuilding(out: MeshBuilder, building: Building) {
       span.anchor = anchor;
       span.base = base;
     }
+    if (building.rigid) span.rigid = true;
     out.features.push(span);
   }
 
@@ -697,7 +814,7 @@ function terrainAnchors(buildings: Building[], mesh: MeshBuilder): TerrainAnchor
     parent.push(i);
     feet.push([]);
     const first = b.members[0]?.faces[0];
-    if (!first || first.frame !== 0 || first.yOff === 0) return;
+    if (!first || first.frame !== 0 || first.yOff === 0 || b.rigid) return;
     const base = first.yOff;
     if (!b.members.every((m) => m.faces.every((f) => f.frame === 0 && f.yOff === base))) return;
     b.base = base;
@@ -1065,6 +1182,22 @@ function emitFace(out: MeshBuilder, face: Face) {
       aoIndex = r.index;
       if (aoIndex !== AO_NO_FACE) toPlane = r.toPlane;
     }
+  }
+
+  if (out.aoOnly) {
+    // The second pass of a tile whose geometry is out: per vertex, in the same
+    // order, the column (for the skirt's) and the AO attributes.
+    for (const ring of face.rings) {
+      for (const p of ring) {
+        out.column.push(out.columnAt(p.x, p.z));
+        out.aoFace.push(aoIndex);
+        if (toPlane) {
+          const [a, b] = toPlane(p);
+          out.aoUV.push(uvUnits(a), uvUnits(b));
+        } else out.aoUV.push(0, 0);
+      }
+    }
+    return;
   }
 
   const polyVertexBase = out.vertexCount;
@@ -1522,6 +1655,23 @@ function ringCentroid2D(ring: { x: number; y: number }[]): { x: number; y: numbe
  * transitively. A sweep over the boxes sorted by x keeps large city-model
  * buildings (thousands of faces) cheap.
  */
+/** All faces of a building id's features as one part. */
+function wholePart(group: SourceFeature[]): Part {
+  const part: Part = { members: [], minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+  for (const feature of group) {
+    part.members.push({ feature, polygons: feature.polygons });
+    for (const polygon of feature.polygons) {
+      for (const v of polygon[0]) {
+        if (v.x < part.minX) part.minX = v.x;
+        if (v.y < part.minY) part.minY = v.y;
+        if (v.x > part.maxX) part.maxX = v.x;
+        if (v.y > part.maxY) part.maxY = v.y;
+      }
+    }
+  }
+  return part;
+}
+
 function connectedParts(group: SourceFeature[], tolerance: number): Part[] {
   const faces: { feature: SourceFeature; polygon: Polygon; box: [number, number, number, number] }[] = [];
   for (const feature of group) {
