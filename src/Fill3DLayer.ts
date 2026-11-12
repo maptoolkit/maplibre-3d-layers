@@ -165,10 +165,13 @@ export class Fill3DLayer implements CustomLayerInterface {
     this.manager!.syncLight(); // match fill-extrusion shading (light follows bearing)
     this.camera.projectionMatrix.multiplyMatrices(this.mainMat, this.originMat);
     this.renderer.resetState();
-    // Depth pre-pass then colour pass: only the frontmost surface blends, so
-    // semi-transparent buildings don't show their interior/back walls.
-    this.manager!.setPass('depth');
-    this.renderer.render(this.scene, this.camera);
+    // A transparent layer: depth pre-pass, then the colour pass — only the
+    // frontmost surface blends, so semi-transparent buildings don't show their
+    // interior/back walls. An opaque layer: the colour pass alone.
+    if (this.manager!.depthPrepass) {
+      this.manager!.setPass('depth');
+      this.renderer.render(this.scene, this.camera);
+    }
     this.manager!.setPass('color');
     this.renderer.render(this.scene, this.camera);
     // No triggerRepaint() here: that re-renders the map every frame even when

@@ -80,6 +80,20 @@ function createFill3DMaterial(transparent: boolean): THREE.ShaderMaterial {
     // BackSide is the outer shell here (source winding + scale(1,1,-1) reflection).
     side: THREE.BackSide,
     transparent,
+    // A transparent layer draws after a depth pre-pass and blends only what lies
+    // at that depth; an opaque one writes its own depth (see setPass).
+    depthFunc: THREE.LessEqualDepth,
+    depthWrite: !transparent,
+  });
+}
+
+/** The depth pre-pass of a transparent layer: a program that only places the vertices. */
+function createDepthMaterial(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    vertexShader: 'void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: 'void main() {}',
+    side: THREE.BackSide, // as the colour material
+    colorWrite: false,
   });
 }
 
@@ -159,6 +173,7 @@ export class Fill3DManager {
   private readonly worker: Worker;
   private readonly tiles = new globalThis.Map<string, TileEntry>();
   private readonly material: THREE.ShaderMaterial;
+  private readonly depthMaterial: THREE.ShaderMaterial;
   private readonly config: Fill3DConfig;
   private readonly onData: (ev: unknown) => void;
   private readonly onMoveEnd: () => void;
@@ -199,6 +214,7 @@ export class Fill3DManager {
     // Shades like MapLibre's fill-extrusion (flat directional ramp). Per-vertex
     // sRGB colour (fill-3d-color) + alpha (fill-3d-opacity) via the `color` attr.
     this.material = createFill3DMaterial(config.transparent);
+    this.depthMaterial = createDepthMaterial();
 
     this.worker = new Mvt3dWorker();
     this.worker.onmessage = (e: MessageEvent<TileResult>) => this.onTileParsed(e.data);
@@ -462,23 +478,25 @@ export class Fill3DManager {
   }
 
   /**
-   * Switch the shared material between the two rendering passes. A depth-only
+   * Whether the layer needs a depth pre-pass: only when it is transparent. The
    * pre-pass establishes the nearest surface per pixel; the colour pass then only
    * blends fragments at that depth — so interior/back walls of semi-transparent
    * buildings are hidden (like fill-extrusion's opaque-then-composite), while the
-   * frontmost outer shell keeps its smooth per-feature alpha.
+   * frontmost outer shell keeps its smooth per-feature alpha. An opaque layer
+   * draws in one pass and writes its depth itself: a second pass over all the
+   * geometry costs more than shading the fragments that end up hidden.
+   */
+  get depthPrepass(): boolean {
+    return this.config.transparent;
+  }
+
+  /**
+   * Set the scene up for one rendering pass. The depth pre-pass (see
+   * {@link depthPrepass}) draws the buildings with a program that only places
+   * the vertices.
    */
   setPass(pass: 'depth' | 'color') {
-    const m = this.material;
-    m.depthTest = true;
-    m.depthFunc = THREE.LessEqualDepth;
-    if (pass === 'depth') {
-      m.colorWrite = false;
-      m.depthWrite = true;
-    } else {
-      m.colorWrite = true;
-      m.depthWrite = false;
-    }
+    this.scene.overrideMaterial = pass === 'depth' ? this.depthMaterial : null;
   }
 
   /**
@@ -652,6 +670,7 @@ export class Fill3DManager {
     this.tiles.clear();
     this.scene.remove(this.group);
     this.material.dispose();
+    this.depthMaterial.dispose();
   }
 }
 
