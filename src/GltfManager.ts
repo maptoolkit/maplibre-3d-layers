@@ -103,6 +103,26 @@ const MAX_OPEN_EDGE_SHARE = 0.1;
 /** Quiet time (ms) after the last source tile before a data-driven rebuild. */
 const DATA_SETTLE_MS = 150;
 
+/**
+ * A camera that is set on every frame (`jumpTo` in an animation loop) ends a move
+ * on every frame, and a rebuild costs more than a frame (tens of ms). So while
+ * `moveend`s keep coming closer together than this (ms), the layer rebuilds at
+ * most this often, only when the view has shifted noticeably, and once more when
+ * they stop. A single `moveend` (a move that ended) rebuilds at once, as ever.
+ */
+const MOVE_SERIES_MS = 500;
+
+/**
+ * "Shifted noticeably" since the last build: the instances are built for the
+ * frame plus FRAME_PAD on each side, so a shift well inside that pad shows
+ * nothing new. The centre in shares of the smaller canvas side, the bearing as
+ * the same share of the half diagonal, zoom and pitch in their own units.
+ */
+const SHIFT_CENTER = FRAME_PAD / 2;
+const SHIFT_BEARING_DEG = (FRAME_PAD / 2) * (180 / Math.PI);
+const SHIFT_ZOOM = 0.07;
+const SHIFT_PITCH_DEG = 2;
+
 /** Headroom on the last build's thinning scale when pre-filtering candidates. */
 const THIN_HINT_SLACK = 1.5;
 
@@ -361,6 +381,13 @@ export class GltfManager {
   private readonly onData: (ev: unknown) => void;
   private readonly onMoveEnd: () => void;
   private readonly unwatchGlobalState: (() => void)[];
+  /** When the last `moveend` came and when one last made the layer refresh (ms). */
+  private lastMoveEnd = -Infinity;
+  private lastMoveRefresh = -Infinity;
+  /** Pending refresh for the end of a series of `moveend`s. */
+  private moveTimer?: ReturnType<typeof setTimeout>;
+  /** The view the instances were last built for. */
+  private builtView?: ViewState;
   private paintRafId?: number;
   private needsRead = false;
   private needsBuild = false;
@@ -418,7 +445,32 @@ export class GltfManager {
     };
     // A whole-dataset source only needs re-culling when the view moves; a tiled
     // one has to be re-queried, because its result IS the viewport.
-    this.onMoveEnd = () => (this.wholeDataset ? this.schedule(false, true) : this.refresh());
+    const refreshForView = () => {
+      this.lastMoveRefresh = performance.now();
+      if (this.wholeDataset) this.schedule(false, true);
+      else this.refresh();
+    };
+    this.onMoveEnd = () => {
+      const now = performance.now();
+      const series = now - this.lastMoveEnd < MOVE_SERIES_MS;
+      this.lastMoveEnd = now;
+      if (this.moveTimer !== undefined) clearTimeout(this.moveTimer);
+      this.moveTimer = undefined;
+      // A move ended: refresh at once.
+      if (!series) return refreshForView();
+      // `moveend`s in quick succession (see MOVE_SERIES_MS): at most one refresh
+      // per interval, and only for a view that shows something new …
+      const view = viewState(map);
+      if (now - this.lastMoveRefresh >= MOVE_SERIES_MS && (!this.builtView || viewShifted(this.builtView, view))) {
+        return refreshForView();
+      }
+      // … and one when the series ends, for the view the camera rests at.
+      this.moveTimer = setTimeout(() => {
+        this.moveTimer = undefined;
+        if (this.disposed) return;
+        if (!this.builtView || !sameView(this.builtView, viewState(map))) refreshForView();
+      }, MOVE_SERIES_MS);
+    };
     map.on('data', this.onData);
     map.on('moveend', this.onMoveEnd);
 
@@ -617,6 +669,7 @@ export class GltfManager {
 
   /** Re-anchor the origin and rebuild every instance from the cached features. */
   private build() {
+    this.builtView = viewState(this.map);
     const zoom = this.map.getZoom();
     const state = globalStateOf(this.map);
     const om = MercatorCoordinate.fromLngLat(this.map.getCenter(), 0);
@@ -1407,6 +1460,7 @@ export class GltfManager {
     if (this.paintRafId !== undefined) cancelAnimationFrame(this.paintRafId);
     for (const unwatch of this.unwatchGlobalState) unwatch();
     if (this.settleTimer !== undefined) clearTimeout(this.settleTimer);
+    if (this.moveTimer !== undefined) clearTimeout(this.moveTimer);
     for (const [modelId, batch] of this.batches) this.disposeBatch(modelId, batch);
     for (const model of this.models.values()) {
       for (const proto of model.protos) {
@@ -1638,6 +1692,43 @@ function mercY(lat: number): number {
  * shifts points a little, which the padding absorbs), with MapLibre's
  * (internal) pixel matrix; undefined when that isn't available.
  */
+/** What of the camera decides which instances a build places. */
+interface ViewState {
+  /** Map centre in mercator units, zoom, bearing and pitch in degrees, canvas size in px. */
+  x: number;
+  y: number;
+  zoom: number;
+  bearing: number;
+  pitch: number;
+  width: number;
+  height: number;
+}
+
+function viewState(map: Map): ViewState {
+  const c = MercatorCoordinate.fromLngLat(map.getCenter(), 0);
+  const canvas = map.getCanvas();
+  return { x: c.x, y: c.y, zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch(),
+    width: canvas.clientWidth, height: canvas.clientHeight };
+}
+
+/** Smallest turn between two bearings, degrees. */
+const turn = (a: number, b: number) => Math.abs(((a - b + 540) % 360) - 180);
+
+function sameView(a: ViewState, b: ViewState): boolean {
+  return a.x === b.x && a.y === b.y && a.zoom === b.zoom && a.bearing === b.bearing && a.pitch === b.pitch
+    && a.width === b.width && a.height === b.height;
+}
+
+/** Whether view `b` shows noticeably more than the instances built for view `a` cover (see SHIFT_*). */
+function viewShifted(a: ViewState, b: ViewState): boolean {
+  if (a.width !== b.width || a.height !== b.height) return true;
+  if (Math.abs(a.zoom - b.zoom) > SHIFT_ZOOM || Math.abs(a.pitch - b.pitch) > SHIFT_PITCH_DEG) return true;
+  if (turn(a.bearing, b.bearing) > SHIFT_BEARING_DEG) return true;
+  // centre shift in screen pixels at the built zoom (512 px tiles)
+  const px = Math.hypot(b.x - a.x, b.y - a.y) * 512 * 2 ** a.zoom;
+  return px > SHIFT_CENTER * Math.min(a.width, a.height);
+}
+
 function frameTest(map: Map, pad: number): ((x: number, y: number) => boolean) | undefined {
   type T = { worldSize: number; width: number; height: number; elevation?: number;
     _pixelMatrix?: ArrayLike<number>; _pixelMatrix3D?: ArrayLike<number> };

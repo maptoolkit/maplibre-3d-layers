@@ -23,6 +23,13 @@ const BASE_EPSILON_M = 0.05;
 /** Re-anchor the scene origin once the map centre drifts this far from it (metres). */
 const REBASE_DISTANCE_M = 3000;
 
+/**
+ * While the map moves, look for tiles to load (and to drop) at most this often
+ * (ms): a long flight or drag gets its buildings on the way, not only once the
+ * move has ended.
+ */
+const MOVE_UPDATE_MS = 250;
+
 /** The skirt floats this far (metres) above the ground, against z-fighting with the terrain. */
 const SKIRT_LIFT_M = 0.4;
 
@@ -355,7 +362,7 @@ export interface Fill3DAoConfig {
 export interface Fill3DConfig {
   color: ColorEval;
   opacity: OpacityEval;
-  /** Whether opacity/color can be < 1 (→ transparent material). */
+  /** Whether opacity/color can be < 1 (→ the layer may blend; whether a frame does, see syncOpacity). */
   transparent: boolean;
   /** Id of the MapLibre vector source to read tiles from. */
   sourceId: string;
@@ -408,6 +415,8 @@ interface TileEntry {
   skirtGeometry?: THREE.BufferGeometry;
   /** The tile's AO tables (inner edges), bound before its mesh draws. */
   ao?: AoTextures;
+  /** Whether any of its vertices carries an alpha below 1 (see colorAttribute). */
+  translucent?: boolean;
   /** When the tile's AO data arrived (ms), while it
    *  fades in; and how far it has faded in (0..1; undefined: no AO data yet). */
   aoSince?: number;
@@ -463,12 +472,17 @@ export class Fill3DManager {
   private seq = 0;
   private readonly tiles = new globalThis.Map<string, TileEntry>();
   private readonly material: THREE.ShaderMaterial;
+  /** Whether the current frame blends (set by syncOpacity; starts as the material is created). */
+  private blends: boolean;
   private readonly depthMaterial: THREE.ShaderMaterial;
   /** Empty AO tables, bound for tiles without inner edges. */
   private readonly aoEmpty: AoTextures;
   private readonly config: Fill3DConfig;
   private readonly onData: (ev: unknown) => void;
   private readonly onMoveEnd: () => void;
+  private readonly onMove: () => void;
+  /** When update() last ran (ms), for the throttle while the map moves. */
+  private lastUpdate = -Infinity;
   private readonly onTerrain: () => void;
   private onSourceData?: (ev: unknown) => void;
   private readonly unwatchGlobalState: () => void;
@@ -509,6 +523,7 @@ export class Fill3DManager {
     // sRGB colour (fill-3d-color) + alpha (fill-3d-opacity) via the `color` attr.
     this.aoEmpty = emptyAoTextures();
     this.material = createFill3DMaterial(config.transparent, this.aoEmpty);
+    this.blends = config.transparent;
     this.depthMaterial = createDepthMaterial();
     this.material.uniforms.u_ao_radius.value = config.ao.radius;
     this.skirtMaterial = createSkirtMaterial();
@@ -531,6 +546,11 @@ export class Fill3DManager {
       this.maybeRebase();
       this.update();
     };
+    this.onMove = () => {
+      if (performance.now() - this.lastUpdate < MOVE_UPDATE_MS) return;
+      this.maybeRebase();
+      this.update();
+    };
     // Terrain switched on, off or re-set: the cached elevations are stale, and
     // without terrain the sunk wall bases must come up to the map (see bake).
     this.onTerrain = () => {
@@ -539,6 +559,7 @@ export class Fill3DManager {
     };
     map.on('data', this.onData);
     map.on('moveend', this.onMoveEnd);
+    map.on('move', this.onMove);
     map.on('terrain', this.onTerrain);
 
     // `["global-state", …]`: a per-feature value is baked into the vertices, so
@@ -604,6 +625,7 @@ export class Fill3DManager {
    */
   update() {
     if (this.tileTemplate == null || this.minzoom == null || this.maxzoom == null) return;
+    this.lastUpdate = performance.now();
 
     const wanted = new Set<string>();
     for (const id of this.map.coveringTiles({
@@ -793,7 +815,9 @@ export class Fill3DManager {
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(result.position, 3));
     geometry.setAttribute('normal', new THREE.BufferAttribute(result.normal, 3, true));
-    geometry.setAttribute('color', this.colorAttribute(vertexCount, result.features));
+    const colors = this.colorAttribute(vertexCount, result.features);
+    geometry.setAttribute('color', colors.color);
+    entry.translucent = colors.translucent;
     // Integers, read as floats (not normalized). Without AO the worker sends
     // none (the shader then reads a constant and skips the AO anyway).
     if (result.aoh.length) {
@@ -861,16 +885,20 @@ export class Fill3DManager {
   /** Evaluate fill-3d-color / fill-3d-opacity per feature into a per-vertex RGBA attribute.
    *  Colours stay sRGB — the shader shades and outputs in sRGB, matching fill-extrusion.
    *  8 bits per channel (normalized), like the colour itself; a quarter of float32.
-   *  A feature-constant opacity is left out here: it's the `u_opacity` uniform. */
-  private colorAttribute(vertexCount: number, features: FeatureSpan[]): THREE.BufferAttribute {
+   *  A feature-constant opacity is left out here: it's the `u_opacity` uniform.
+   *  `translucent`: whether any vertex got an alpha below 1 (a colour with alpha, a
+   *  per-feature opacity) — such a tile needs blending whatever the uniform says. */
+  private colorAttribute(vertexCount: number, features: FeatureSpan[]): { color: THREE.BufferAttribute; translucent: boolean } {
     const zoom = this.map.getZoom();
     const state = globalStateOf(this.map);
     const { color, opacity } = this.config;
     const rgba = new Uint8Array(vertexCount * 4);
+    let translucent = false;
     for (const b of features) {
       const [r, g, bl, ca] = color(zoom, b.properties, undefined, state);
       const a = opacity.featureConstant ? ca : ca * opacity(zoom, b.properties, undefined, state);
       const R = Math.round(r * 255), G = Math.round(g * 255), B = Math.round(bl * 255), A = Math.round(a * 255);
+      if (A < 255) translucent = true;
       const end = b.start + b.count;
       for (let v = b.start; v < end; v++) {
         rgba[v * 4] = R;
@@ -879,12 +907,18 @@ export class Fill3DManager {
         rgba[v * 4 + 3] = A;
       }
     }
-    return new THREE.BufferAttribute(rgba, 4, true);
+    return { color: new THREE.BufferAttribute(rgba, 4, true), translucent };
   }
 
   /**
    * Evaluate a feature-constant fill-3d-opacity for this frame (call each frame),
    * so zoom fades and global state apply smoothly. Returns the opacity in effect.
+   *
+   * Also decides whether this frame blends at all. A layer with a
+   * `fill-3d-opacity` may be transparent, but while that opacity is 1 for every
+   * feature (a pitch or zoom fade that has run its course) and no colour carries
+   * an alpha, nothing is: the frame then draws like an opaque layer, in one pass
+   * and writing its depth, without the depth pre-pass over all the geometry.
    */
   syncOpacity(): number {
     const { opacity } = this.config;
@@ -892,6 +926,20 @@ export class Fill3DManager {
       ? opacity(this.map.getZoom(), {}, undefined, globalStateOf(this.map))
       : 1;
     this.material.uniforms.u_opacity.value = value;
+
+    let blends = this.config.transparent && value < 1;
+    if (this.config.transparent && !blends) {
+      for (const entry of this.tiles.values()) {
+        if (entry.translucent) { blends = true; break; }
+      }
+    }
+    if (blends !== this.blends) {
+      this.blends = blends;
+      // Blending and depth writes are render state, not part of the program:
+      // switching them needs no recompile.
+      this.material.transparent = blends;
+      this.material.depthWrite = !blends;
+    }
     return value;
   }
 
@@ -902,14 +950,16 @@ export class Fill3DManager {
       this.recolorRafId = undefined;
       for (const entry of this.tiles.values()) {
         if (entry.state !== 'ready' || !entry.geometry || !entry.baseY || !entry.features) continue;
-        entry.geometry.setAttribute('color', this.colorAttribute(entry.baseY.length, entry.features));
+        const colors = this.colorAttribute(entry.baseY.length, entry.features);
+        entry.geometry.setAttribute('color', colors.color);
+        entry.translucent = colors.translucent;
       }
       this.map.triggerRepaint();
     });
   }
 
   /**
-   * Whether the layer needs a depth pre-pass: only when it is transparent. The
+   * Whether this frame needs a depth pre-pass: only when it blends (see syncOpacity). The
    * pre-pass establishes the nearest surface per pixel; the colour pass then only
    * blends fragments at that depth — so interior/back walls of semi-transparent
    * buildings are hidden (like fill-extrusion's opaque-then-composite), while the
@@ -919,7 +969,7 @@ export class Fill3DManager {
    * in Vienna on an Intel Arc: 3.9 instead of 5.0 ms for the layer).
    */
   get depthPrepass(): boolean {
-    return this.config.transparent;
+    return this.blends;
   }
 
   /**
@@ -1181,6 +1231,7 @@ export class Fill3DManager {
   dispose() {
     this.map.off('data', this.onData);
     this.map.off('moveend', this.onMoveEnd);
+    this.map.off('move', this.onMove);
     this.map.off('terrain', this.onTerrain);
     if (this.onSourceData) this.map.off('sourcedata', this.onSourceData);
     if (this.rebakeRafId !== undefined) cancelAnimationFrame(this.rebakeRafId);

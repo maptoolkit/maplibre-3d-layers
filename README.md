@@ -118,7 +118,7 @@ The layer fetches the source's original tiles itself (above `maxzoom` MapLibre
 would only hand it re-encoded, overzoomed ones). Those requests go through the
 map's `transformRequest` like MapLibre's own, so credentials and headers set
 there apply to them too, e.g. a session cookie with `credentials: 'include'`
-instead of an `api_key` in the URL.
+instead of an `api_key` in the URL. It looks for the tiles of the view when a move ends and, while the map moves, every 250 ms, so a long flight or drag gets its buildings on the way.
 
 **Vertical placement.** With terrain, buildings that touch go onto it together:
 the source gives their heights in one frame and each building's base (its
@@ -260,7 +260,10 @@ costs little on the tiles without a landmark.
   bottom, the roof above and the skirt below), not per vertex. Per frame an
   opaque layer draws its buildings in one pass; a transparent one
   (`fill-3d-opacity` set) first lays down their depth, so that only the
-  frontmost surface blends. Measured on an Intel Arc at 2560×1262 in dense
+  frontmost surface blends. Whether a layer is transparent is decided per frame:
+  while its opacity is 1 for every feature (a zoom or pitch fade that has run its
+  course) and no colour carries an alpha, it draws in the one pass of an opaque
+  layer. Measured on an Intel Arc at 2560×1262 in dense
   Vienna, GPU time of the layer: 3.3 ms without AO, 4.0 ms with AO and skirt,
   5.1 ms with both when transparent — and 4.7 ms before, without AO, when
   every layer drew the pre-pass.
@@ -510,7 +513,7 @@ All of these are optional; the defaults are shown.
 ```js
 new GltfLayer({
   // …
-  maxInstances: 20000,  // more = denser far away, but each rebuild (on moveend) takes longer
+  maxInstances: 20000,  // more = denser far away, but each rebuild (when a move ends) takes longer
   doubleSided: undefined, // true/false forces both/front faces instead of auto-detecting
   layout: {
     // full density up to this many metres from the camera; ~2.5 km at z16
@@ -540,7 +543,12 @@ new GltfLayer({
 ### When instances update
 
 The layer refreshes when the map stops moving and when the source's data changes
-(once a burst of tiles has settled, and never mid-move).
+(once a burst of tiles has settled, and never mid-move). A camera that is set on
+every frame (`jumpTo` in an animation loop, where every frame ends a move) does not
+rebuild on every frame: while `moveend`s come less than 500 ms apart, the layer
+rebuilds at most every 500 ms, only when the view shows something new (the centre
+moved by more than 5 % of the canvas, the bearing by about 3°, the zoom by 0.07,
+the pitch by 2°), and once more when they stop.
 Positions jump straight to their new location — there is no interpolation between
 updates. `paint`, `layout` and `visibility` are read once when the layer is added;
 custom layers have no `setPaintProperty`.
