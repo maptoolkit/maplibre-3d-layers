@@ -23,6 +23,13 @@ const BASE_EPSILON_M = 0.05;
 /** Re-anchor the scene origin once the map centre drifts this far from it (metres). */
 const REBASE_DISTANCE_M = 3000;
 
+/**
+ * While the map moves, look for tiles to load (and to drop) at most this often
+ * (ms): a long flight or drag gets its buildings on the way, not only once the
+ * move has ended.
+ */
+const MOVE_UPDATE_MS = 250;
+
 /** The skirt floats this far (metres) above the ground, against z-fighting with the terrain. */
 const SKIRT_LIFT_M = 0.4;
 
@@ -469,6 +476,9 @@ export class Fill3DManager {
   private readonly config: Fill3DConfig;
   private readonly onData: (ev: unknown) => void;
   private readonly onMoveEnd: () => void;
+  private readonly onMove: () => void;
+  /** When update() last ran (ms), for the throttle while the map moves. */
+  private lastUpdate = -Infinity;
   private readonly onTerrain: () => void;
   private onSourceData?: (ev: unknown) => void;
   private readonly unwatchGlobalState: () => void;
@@ -531,6 +541,11 @@ export class Fill3DManager {
       this.maybeRebase();
       this.update();
     };
+    this.onMove = () => {
+      if (performance.now() - this.lastUpdate < MOVE_UPDATE_MS) return;
+      this.maybeRebase();
+      this.update();
+    };
     // Terrain switched on, off or re-set: the cached elevations are stale, and
     // without terrain the sunk wall bases must come up to the map (see bake).
     this.onTerrain = () => {
@@ -539,6 +554,7 @@ export class Fill3DManager {
     };
     map.on('data', this.onData);
     map.on('moveend', this.onMoveEnd);
+    map.on('move', this.onMove);
     map.on('terrain', this.onTerrain);
 
     // `["global-state", …]`: a per-feature value is baked into the vertices, so
@@ -604,6 +620,7 @@ export class Fill3DManager {
    */
   update() {
     if (this.tileTemplate == null || this.minzoom == null || this.maxzoom == null) return;
+    this.lastUpdate = performance.now();
 
     const wanted = new Set<string>();
     for (const id of this.map.coveringTiles({
@@ -1181,6 +1198,7 @@ export class Fill3DManager {
   dispose() {
     this.map.off('data', this.onData);
     this.map.off('moveend', this.onMoveEnd);
+    this.map.off('move', this.onMove);
     this.map.off('terrain', this.onTerrain);
     if (this.onSourceData) this.map.off('sourcedata', this.onSourceData);
     if (this.rebakeRafId !== undefined) cancelAnimationFrame(this.rebakeRafId);
