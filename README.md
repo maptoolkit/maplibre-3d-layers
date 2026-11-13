@@ -260,7 +260,10 @@ costs little on the tiles without a landmark.
   bottom, the roof above and the skirt below), not per vertex. Per frame an
   opaque layer draws its buildings in one pass; a transparent one
   (`fill-3d-opacity` set) first lays down their depth, so that only the
-  frontmost surface blends. Measured on an Intel Arc at 2560×1262 in dense
+  frontmost surface blends. Whether a layer is transparent is decided per frame:
+  while its opacity is 1 for every feature (a zoom or pitch fade that has run its
+  course) and no colour carries an alpha, it draws in the one pass of an opaque
+  layer. Measured on an Intel Arc at 2560×1262 in dense
   Vienna, GPU time of the layer: 3.3 ms without AO, 4.0 ms with AO and skirt,
   5.1 ms with both when transparent — and 4.7 ms before, without AO, when
   every layer drew the pre-pass.
