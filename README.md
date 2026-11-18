@@ -146,7 +146,8 @@ own way, see [Landmarks](#landmarks-models-in-the-tiles).
 | `source-layer` | ✅ | vector-tile layer to read (e.g. `buildings3d`) |
 | `filter` | — | MapLibre filter expression; features that fail are dropped |
 | `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's active terrain |
-| `workers` | — | at most this many tile workers (default: half the logical processors, at least 1, at most 4). They start as tiles queue up |
+| `workers` | — | at most this many tile workers (default: half the logical processors, at least 1, at most 4). They start as tiles queue up; the layers of one source share them |
+| `tileCache` | — | megabytes of tiles to keep, hidden, after they left the view (default `64`; `0` keeps nothing). See [Loading](#loading) |
 | `layout.visibility` | — | `'visible'` (default) / `'none'` |
 | `paint['fill-3d-color']` | — | colour, constant or expression (default white) |
 | `paint['fill-3d-opacity']` | — | `0..1`, constant or expression (default `1`) |
@@ -155,9 +156,42 @@ Colour and opacity are evaluated per feature against its properties, the
 current zoom and the map's [global state](#global-state). An opacity that is the
 same for every feature (zoom and global state only) is evaluated every frame.
 
+### Loading
+
 Tiles are parsed and triangulated in web workers, several side by side (see
 `workers`): each tile goes to an idle worker, or to a new one while the pool
 may grow, else to the one with the least to do.
+
+- **One load per tile.** All `Fill3DLayer`s on a source (the buildings and the
+  landmarks, say) share a tile's fetch and its pass through a worker, which reads
+  the tile once and builds each layer's geometry from it.
+- **Only the zoom levels that hold something.** In a pitched view MapLibre covers
+  the distance with tiles of lower zoom levels. The layer leaves out the levels
+  where it has nothing to draw: where the source's TileJSON (`vector_layers`) does
+  not list its `source-layer`, and where its `filter` cannot pass (comparisons of
+  `["zoom"]` with a number, also inside `["all", …]`); likewise for `extrusion`.
+  With `buildings3d` at zoom 15 only, that is about half of the tiles.
+- **Prepared in the worker.** Colours, and on a map without terrain the final
+  heights and bounds, come ready from the worker; the main thread wraps the
+  buffers and no longer walks the vertices. Arriving tiles are put on the map one
+  per frame.
+- **Tiles are kept.** A tile that leaves the view stays in memory, hidden, within
+  `tileCache` megabytes (oldest given up first), and is on screen without loading
+  when the view comes back — after a pan back, a turn, a zoom out and in again.
+  `layer.setTileCache(megabytes)` changes the size later. Tiles that turned out
+  to hold nothing for the layer are remembered and not loaded again.
+- **Loading ahead.** `layer.preload({ center, zoom, pitch, bearing, padding })`
+  loads the tiles that camera would show, without showing them; when the map
+  gets there (a jump, the end of a flight) they are on screen at once. The next
+  call replaces the view loaded ahead; it may exceed `tileCache` until it has been
+  shown. Returns the number of tiles it asked for (0 with `tileCache: 0`). It
+  uses MapLibre internals (a copy of the map's transform); where they are missing
+  it does nothing.
+
+  ```js
+  // a tour: while the camera circles one stop, load the next
+  for (const layer of fill3dLayers) layer.preload({ center: next.center, zoom: 16.5, pitch: 60, bearing: 120 });
+  ```
 
 ### Landmarks: models in the tiles
 
@@ -549,6 +583,11 @@ rebuild on every frame: while `moveend`s come less than 500 ms apart, the layer
 rebuilds at most every 500 ms, only when the view shows something new (the centre
 moved by more than 5 % of the canvas, the bearing by about 3°, the zoom by 0.07,
 the pitch by 2°), and once more when they stop.
+A rebuild does not block the frame it starts in: it takes at most 3 ms of a frame
+and goes on in the next ones; the instances on screen stay until the new ones are
+complete. The features of a tiled source are read once per tile, not on every
+rebuild (via MapLibre internals; where they are missing, through
+`map.querySourceFeatures` as before).
 Positions jump straight to their new location — there is no interpolation between
 updates. `paint`, `layout` and `visibility` are read once when the layer is added;
 custom layers have no `setPaintProperty`.

@@ -4,18 +4,39 @@ import * as THREE from 'three';
 import type { ElevationCache } from './ElevationCache';
 import { createMercatorElevationSampler, tileBounds } from './ElevationCache';
 import type { GeoBounds } from './ElevationCache';
-import type { ExtrusionRequest, TileRequest, TileResult, AoResult, SkirtResult, FeatureSpan, AoTables, TerrainAnchors } from './mvt3dGeometry';
-import { AO_CELL_M, AO_NO_FACE, AO_TEXTURE_SHIFT, AO_TEXTURE_WIDTH, AO_UV_UNIT_M } from './mvt3dGeometry';
-import type { ColorEval, OpacityEval } from './paint';
+import type { ExtrusionRequest, TileResult, TileSpec, AoResult, SkirtResult, FeatureTable, AoTables, TerrainAnchors } from './mvt3dGeometry';
+import {
+  AO_CELL_M,
+  AO_NO_FACE,
+  AO_TEXTURE_SHIFT,
+  AO_TEXTURE_WIDTH,
+  AO_UV_UNIT_M,
+  SKIRT_LIFT_M,
+  flatGroundOfRigid,
+  vertexColors,
+} from './mvt3dGeometry';
+import type { ColorEval, OpacityEval, PaintValue } from './paint';
 import type { Evaluator } from './expression';
 import { globalStateOf, watchGlobalState } from './globalState';
 import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
-// Inlined as a base64 blob so the built bundle stays single-file — no separate
-// worker asset to host. Works for both the ESM package and the <script> build.
-import Mvt3dWorker from './mvt3dWorker.ts?worker&inline';
+import { TileHub } from './TileHub';
+import type { PoolWorker, TileConsumer } from './TileHub';
+import { dataZooms } from './dataZooms';
+import type { PreloadCamera } from './Fill3DLayer';
 
-/** The parts of MapLibre's `RequestParameters` a tile fetch uses. */
-type TileRequestParameters = { url: string; credentials?: RequestCredentials; headers?: HeadersInit };
+/** What preload sets on a copy of MapLibre's transform (internal API). */
+interface Transform {
+  setCenter(center: LngLat): void;
+  setZoom(zoom: number): void;
+  setPitch(pitch: number): void;
+  setBearing(bearing: number): void;
+  setPadding(padding: { top: number; bottom: number; left: number; right: number }): void;
+}
+
+/** Wait this long (ms) at most for the source's layer list before loading tiles of every zoom level. */
+const LAYER_ZOOMS_WAIT_MS = 1500;
+/** Remember this many tiles that turned out to hold nothing for the layer. */
+const EMPTY_KEYS_MAX = 4096;
 
 /** Vertices this close (metres) above a building's base count as its base. */
 const BASE_EPSILON_M = 0.05;
@@ -29,9 +50,6 @@ const REBASE_DISTANCE_M = 3000;
  * move has ended.
  */
 const MOVE_UPDATE_MS = 250;
-
-/** The skirt floats this far (metres) above the ground, against z-fighting with the terrain. */
-const SKIRT_LIFT_M = 0.4;
 
 /** Strength of the two fake-AO terms at intensity 1: darkening at the wall foot / in an inner corner. */
 const AO_GROUND_WEIGHT = 0.6;
@@ -380,15 +398,11 @@ export interface Fill3DConfig {
   skirtMax: boolean;
   /** At most this many tile workers (they start as tiles queue up). */
   workers: number;
-}
-
-/** One tile worker and the tiles it is working on, by request number. */
-interface PoolWorker {
-  worker: Worker;
-  /** Tiles waiting for their geometry. */
-  geometry: Set<number>;
-  /** Tiles whose geometry is out and whose AO data is still to come. */
-  ao: Set<number>;
+  /** `fill-3d-color` / `fill-3d-opacity` as given to the layer: the worker evaluates them per tile. */
+  colorSpec?: PaintValue<string>;
+  opacitySpec?: PaintValue<number>;
+  /** Keep up to this many bytes of tiles that left the view (0: none). */
+  cacheBytes: number;
 }
 
 /** Scene anchor in mercator + the metric at its latitude. */
@@ -421,9 +435,13 @@ interface TileEntry {
    *  fades in; and how far it has faded in (0..1; undefined: no AO data yet). */
   aoSince?: number;
   aoFade?: number;
-  /** The worker that has the tile, and the request's number. */
-  worker?: number;
+  /** The request's number at the {@link TileHub}. */
   seq?: number;
+  /** What the tile holds in memory (bytes), once it is ready. */
+  bytes?: number;
+  /** The terrain and paint states (see terrainEpoch, colorEpoch) its heights and colours were made for. */
+  terrainEpoch?: number;
+  colorEpoch?: number;
   /** Per vertex: the worker's y, the height above the feature base (no terrain
    *  yet). x and z never change, so only y is kept for re-baking. */
   baseY?: Float32Array;
@@ -433,7 +451,9 @@ interface TileEntry {
   skirtColumn?: Uint32Array;
   columnXZ?: Float32Array;
   groundCache?: Float32Array;
-  features?: FeatureSpan[];
+  /** The features' vertex spans, and — only if the paint has to be evaluated again on a global-state change — their properties. */
+  table?: FeatureTable;
+  properties?: Record<string, unknown>[];
   /** The wall feet per group of touching buildings (see anchorFits). */
   anchors?: TerrainAnchors;
 }
@@ -454,8 +474,14 @@ interface TileEntry {
  * whenever new DEM tiles stream in (via the shared {@link ElevationCache}) or the
  * map's terrain is switched. Without terrain the meshes sit on the flat map,
  * nothing below it: the source sinks ground walls 10 m for slopes (see bake).
+ *
+ * Loading: tiles come through the source's {@link TileHub} (one fetch and one
+ * worker pass per tile for all layers of the source), only from the zoom levels
+ * that can hold something for this layer (see dataZooms). A tile that leaves
+ * the view is kept, hidden, within `cacheBytes` and shown again without
+ * loading; {@link preload} loads a view ahead into that store.
  */
-export class Fill3DManager {
+export class Fill3DManager implements TileConsumer {
   /** Current scene anchor; read by the layer to build the projection matrix. */
   origin: SceneOrigin;
 
@@ -467,10 +493,33 @@ export class Fill3DManager {
   private readonly skirtMaterial: THREE.ShaderMaterial;
   private readonly elevation: ElevationCache;
   private readonly terrainSourceId: string;
-  /** Tiles are parsed side by side; a worker keeps a tile until its AO data is out. */
-  private readonly pool: PoolWorker[] = [];
-  private seq = 0;
+  private hub?: TileHub;
+  private consumerId = 0;
+  /** The view's tiles are being loaded: the source and the zoom levels of its layers are known. */
+  private started = false;
+  /** The tile zoom levels this layer has anything at (undefined: all of the source's). */
+  private zooms?: [number, number];
+  /** No zoom level has anything for this layer. */
+  private nothing = false;
+  private disposed = false;
+  /** The tiles of the view. */
   private readonly tiles = new globalThis.Map<string, TileEntry>();
+  /**
+   * Tiles outside the view, hidden: those that left it (oldest first) and
+   * those loaded ahead (see preload). Ready ones count against `cacheBytes`.
+   */
+  private readonly kept = new globalThis.Map<string, TileEntry>();
+  private keptBytes = 0;
+  private cacheBytes: number;
+  /** Loaded ahead for the view to come: not given up for memory until it has been shown or another view is loaded ahead. */
+  private pins = new Set<string>();
+  /** Tiles that hold nothing for this layer: not loaded again. */
+  private readonly emptyKeys = new Set<string>();
+  /** Counted up when the terrain / the paint's global state changes: a kept tile is brought up to date when it is shown again. */
+  private terrainEpoch = 0;
+  private colorEpoch = 0;
+  /** The paint reads global state per feature: it is evaluated again when that changes (needs the features' properties). */
+  private readonly repaints: boolean;
   private readonly material: THREE.ShaderMaterial;
   /** Whether the current frame blends (set by syncOpacity; starts as the material is created). */
   private blends: boolean;
@@ -512,6 +561,7 @@ export class Fill3DManager {
     this.elevation = elevation;
     this.terrainSourceId = terrainSourceId;
     this.config = config;
+    this.cacheBytes = config.cacheBytes;
     this.origin = toOrigin(sceneOrigin);
 
     this.group = new THREE.Group();
@@ -555,6 +605,7 @@ export class Fill3DManager {
     // without terrain the sunk wall bases must come up to the map (see bake).
     this.onTerrain = () => {
       this.elevation.clear();
+      this.terrainEpoch++;
       this.rebakeAll();
     };
     map.on('data', this.onData);
@@ -566,6 +617,7 @@ export class Fill3DManager {
     // re-bake it; a feature-constant opacity is a uniform read every frame.
     const { color, opacity } = config;
     const baked = [...color.globalStateRefs, ...(opacity.featureConstant ? [] : opacity.globalStateRefs)];
+    this.repaints = baked.length > 0;
     this.unwatchGlobalState = watchGlobalState(map, [...baked, ...opacity.globalStateRefs], () => {
       if (baked.length) this.scheduleRecolor();
       else map.triggerRepaint();
@@ -603,7 +655,7 @@ export class Fill3DManager {
       return;
     }
     if (tryRead()) {
-      this.update();
+      this.start();
       return;
     }
     this.onSourceData = (ev) => {
@@ -611,20 +663,59 @@ export class Fill3DManager {
       if (tryRead()) {
         this.map.off('sourcedata', this.onSourceData!);
         this.onSourceData = undefined;
-        this.update();
+        this.start();
       }
     };
     this.map.on('sourcedata', this.onSourceData);
   }
 
   /**
+   * The source is known: join its {@link TileHub} and find the zoom levels the
+   * layer has anything at (the source's layer list is waited for, briefly),
+   * then load the view.
+   */
+  private start() {
+    this.hub = TileHub.for(this.map, this.config.sourceId);
+    this.consumerId = this.hub.attach(this, this.config.workers);
+    const go = () => {
+      if (this.started || this.disposed) return;
+      this.started = true;
+      this.update();
+    };
+    const timer = setTimeout(go, LAYER_ZOOMS_WAIT_MS);
+    void this.hub.layerZooms().then((layers) => {
+      clearTimeout(timer);
+      if (this.disposed) return;
+      const c = this.config;
+      this.zooms = dataZooms(layers, c.sourceLayer, c.filter, c.extrusion, this.minzoom!, this.maxzoom!);
+      this.nothing = !this.zooms;
+      if (this.started) this.update(); // came late: tiles of other zoom levels are given up
+      else go();
+    });
+  }
+
+  /** The tile workers (the source's, shared by its layers) with what each still has to answer. */
+  get pool(): readonly PoolWorker[] {
+    return this.hub?.pool ?? [];
+  }
+
+  /** Whether a tile of this zoom level can hold anything for the layer. */
+  private hasData(z: number): boolean {
+    return !this.nothing && (!this.zooms || (z >= this.zooms[0] && z <= this.zooms[1]));
+  }
+
+  /**
    * Load the ORIGINAL tiles covering the current view (clamped to the source's
-   * zoom range) and drop tiles that left the view. Uses `coveringTiles` so above
+   * zoom range) and retire tiles that left the view. Uses `coveringTiles` so above
    * `maxzoom` we fetch the canonical maxzoom tile (not MapLibre's overzoomed,
    * re-encoded one). Same tile URLs as MapLibre → deduped by the browser cache.
+   *
+   * In a pitched view MapLibre covers the distance with tiles of lower zoom
+   * levels. Those the layer has nothing at are left out — the covering itself
+   * stays the source's, so the layer still ends where its zoom levels end.
    */
   update() {
-    if (this.tileTemplate == null || this.minzoom == null || this.maxzoom == null) return;
+    if (!this.started || this.tileTemplate == null || this.minzoom == null || this.maxzoom == null) return;
     this.lastUpdate = performance.now();
 
     const wanted = new Set<string>();
@@ -636,63 +727,160 @@ export class Fill3DManager {
       terrain: this.map.terrain,
     } as CoveringTilesOptions)) {
       const { x, y, z } = id.canonical;
+      if (!this.hasData(z)) continue;
       const key = `${z}/${x}/${y}`;
       wanted.add(key);
-      if (!this.tiles.has(key)) this.loadTile(key, x, y, z);
+      if (!this.tiles.has(key)) this.showTile(key, x, y, z);
     }
 
-    // Evict tiles no longer covered.
     for (const [key, entry] of this.tiles) {
       if (wanted.has(key)) continue;
-      this.freeTile(entry);
       this.tiles.delete(key);
-      if (entry.worker !== undefined) {
-        const w = this.pool[entry.worker];
-        w.worker.postMessage({ cancel: key, seq: entry.seq }); // its AO pass, if still to come
-        if (entry.seq !== undefined) w.ao.delete(entry.seq);
-      }
+      this.retire(key, entry);
     }
-  }
-
-  private freeTile(entry: TileEntry) {
-    if (entry.mesh) this.group.remove(entry.mesh);
-    if (entry.skirtMesh) this.skirtGroup.remove(entry.skirtMesh);
-    entry.geometry?.dispose();
-    entry.skirtGeometry?.dispose();
-    if (entry.ao) for (const t of Object.values(entry.ao)) t.dispose();
   }
 
   /**
-   * The worker for the next tile — an idle one, else a
-   * new one while the pool may grow, else the one with the least to do (tiles
-   * waiting for their geometry weigh more than AO passes, which give way to them).
+   * Load the tiles a camera would show, without showing them: they wait,
+   * hidden, until the map gets there (see `kept`) and are then on screen without
+   * loading. A further call replaces the view loaded ahead. Returns how many of
+   * the view's tiles were not there yet; 0 also when nothing can be loaded ahead
+   * (no tile cache, or MapLibre's internals this needs are not there).
    */
-  private pickWorker(): number {
-    let best = -1;
-    let bestLoad = Infinity;
-    this.pool.forEach((w, i) => {
-      const load = w.geometry.size * 1000 + w.ao.size;
-      if (load < bestLoad) {
-        best = i;
-        bestLoad = load;
-      }
-    });
-    if (best >= 0 && (bestLoad === 0 || this.pool.length >= this.config.workers)) return best;
+  preload(camera: PreloadCamera): number {
+    if (!this.started || this.cacheBytes <= 0 || this.tileTemplate == null) return 0;
+    let ids: { canonical: { x: number; y: number; z: number } }[];
+    try {
+      // MapLibre has no API for the tiles of a view the camera is not at: a
+      // copy of its transform is set to that camera and handed to coveringTiles.
+      const map = this.map as unknown as { transform?: { clone(): Transform }; _camera?: { transform?: { clone(): Transform } } };
+      const tr = (map._camera?.transform ?? map.transform)!.clone();
+      const c = camera.center;
+      tr.setCenter(Array.isArray(c) ? new LngLat(c[0], c[1]) : new LngLat(c.lng, c.lat));
+      tr.setZoom(camera.zoom);
+      tr.setPitch(camera.pitch ?? 0);
+      tr.setBearing(camera.bearing ?? 0);
+      if (camera.padding) tr.setPadding({ top: 0, bottom: 0, left: 0, right: 0, ...camera.padding });
+      ids = this.map.coveringTiles.call({ transform: tr, _camera: { transform: tr } } as unknown as Map, {
+        tileSize: 512,
+        minzoom: this.minzoom,
+        maxzoom: this.maxzoom,
+        roundZoom: false,
+        terrain: this.map.terrain,
+      } as CoveringTilesOptions);
+    } catch {
+      return 0;
+    }
+    const pins = new Set<string>();
+    let asked = 0;
+    for (const { canonical: { x, y, z } } of ids) {
+      if (!this.hasData(z)) continue;
+      const key = `${z}/${x}/${y}`;
+      if (this.tiles.has(key) || this.emptyKeys.has(key)) continue;
+      pins.add(key);
+      if (this.kept.has(key)) continue;
+      this.loadTile(key, x, y, z, this.kept);
+      asked++;
+    }
+    this.pins = pins;
+    this.trim();
+    return asked;
+  }
 
-    const index = this.pool.length;
-    const w: PoolWorker = { worker: new Mvt3dWorker(), geometry: new Set(), ao: new Set() };
-    w.worker.onmessage = (e: MessageEvent<TileResult | AoResult>) => {
-      const seq = e.data.seq;
-      if ('phase' in e.data) {
-        if (seq !== undefined) w.ao.delete(seq);
-        this.onAoParsed(e.data);
-      } else {
-        if (seq !== undefined) w.geometry.delete(seq);
-        this.onTileParsed(e.data, w);
+  /** How many bytes of tiles outside the view are kept (see `kept`); less gives up kept tiles at once. */
+  setCacheBytes(bytes: number) {
+    this.cacheBytes = Math.max(0, bytes);
+    this.trim();
+  }
+
+  /** A tile enters the view: from the kept ones, known to be empty, or to be loaded. */
+  private showTile(key: string, x: number, y: number, z: number) {
+    const kept = this.kept.get(key);
+    if (kept) {
+      this.kept.delete(key);
+      this.pins.delete(key);
+      this.tiles.set(key, kept);
+      if (kept.state !== 'ready') return; // loaded ahead and still on its way: shown when it arrives
+      this.keptBytes -= kept.bytes ?? 0;
+      if (this.map.terrain) {
+        // Onto the terrain as this view loads it, so in the next frame: right now
+        // the map still holds the terrain tiles of the view it comes from (coarser
+        // ones for this place, as a rule), and tiles it takes from its cache
+        // arrive without a `data` event.
+        this.pendingDemRegions.push(kept.bounds);
+        this.scheduleRebake();
+      } else if (kept.terrainEpoch !== this.terrainEpoch) {
+        this.bake(kept);
       }
-    };
-    this.pool.push(w);
-    return index;
+      if (kept.colorEpoch !== this.colorEpoch) this.recolor(kept);
+      this.show(kept);
+      this.map.triggerRepaint();
+      return;
+    }
+    if (this.emptyKeys.has(key)) {
+      const pow = 2 ** z;
+      this.tiles.set(key, { state: 'empty', tileMx: x / pow, tileMy: y / pow, bounds: tileBounds(x, y, z) });
+      return;
+    }
+    this.loadTile(key, x, y, z, this.tiles);
+  }
+
+  /** A tile left the view: kept (hidden) if it is ready and there is a tile cache, else given up. */
+  private retire(key: string, entry: TileEntry) {
+    const keep = this.cacheBytes > 0;
+    if (entry.state === 'empty') {
+      if (keep) this.rememberEmpty(key);
+      return;
+    }
+    if (entry.state !== 'ready' || !keep) {
+      this.freeTile(entry);
+      return;
+    }
+    this.hide(entry);
+    this.kept.set(key, entry);
+    this.keptBytes += entry.bytes ?? 0;
+    this.trim();
+  }
+
+  /**
+   * Give up kept tiles, oldest first, until they fit `cacheBytes`. The view
+   * loaded ahead stays even beyond that: it is about to be shown.
+   */
+  private trim() {
+    if (this.keptBytes <= this.cacheBytes) return;
+    for (const [key, entry] of this.kept) {
+      if (entry.state !== 'ready' || this.pins.has(key)) continue;
+      this.kept.delete(key);
+      this.keptBytes -= entry.bytes ?? 0;
+      this.freeTile(entry);
+      if (this.keptBytes <= this.cacheBytes) return;
+    }
+  }
+
+  private rememberEmpty(key: string) {
+    if (this.emptyKeys.size >= EMPTY_KEYS_MAX) this.emptyKeys.clear();
+    this.emptyKeys.add(key);
+  }
+
+  /** Put a ready tile's meshes into the scene / take them out (they keep their buffers). */
+  private show(entry: TileEntry) {
+    if (entry.mesh) this.group.add(entry.mesh);
+    if (entry.skirtMesh) this.skirtGroup.add(entry.skirtMesh);
+    this.placeMesh(entry);
+  }
+
+  private hide(entry: TileEntry) {
+    if (entry.mesh) this.group.remove(entry.mesh);
+    if (entry.skirtMesh) this.skirtGroup.remove(entry.skirtMesh);
+  }
+
+  /** Give a tile up for good: whatever of it is still on its way is called off, its buffers are freed. */
+  private freeTile(entry: TileEntry) {
+    if (entry.seq !== undefined) this.hub?.cancel(entry.seq);
+    this.hide(entry);
+    entry.geometry?.dispose();
+    entry.skirtGeometry?.dispose();
+    if (entry.ao) for (const t of Object.values(entry.ao)) t.dispose();
   }
 
   /** Bind a tile's AO tables to the shared material before its mesh draws. */
@@ -718,6 +906,7 @@ export class Fill3DManager {
     this.skirtMaterial.uniformsNeedUpdate = true;
   }
 
+  /** A tile's ground skirt (not in the scene yet, see show). */
   private addSkirt(entry: TileEntry, skirt: SkirtResult) {
     const sg = new THREE.BufferGeometry();
     sg.setAttribute('position', new THREE.BufferAttribute(skirt.position, 3));
@@ -726,98 +915,92 @@ export class Fill3DManager {
     const skirtMesh = new THREE.Mesh(sg, this.skirtMaterial);
     skirtMesh.frustumCulled = true;
     skirtMesh.onBeforeRender = () => this.bindSkirt(entry);
-    this.skirtGroup.add(skirtMesh);
     entry.skirtMesh = skirtMesh;
     entry.skirtGeometry = sg;
     entry.skirtColumn = skirt.column;
   }
 
-  /** Fetch a canonical tile's original pbf and hand it to the worker. */
-  private loadTile(key: string, x: number, y: number, z: number) {
+  /** What a tile is to be made of, as its worker needs to know it. */
+  private spec(): TileSpec {
+    const c = this.config;
+    const ao = this.aoEnabled;
+    return {
+      sourceLayer: c.sourceLayer,
+      filter: c.filter,
+      extrusion: c.extrusion,
+      skirtRadius: ao ? c.ao.groundRadius : 0,
+      ao,
+      aoLater: ao, // The geometry first, the AO data in a second message
+      aoRadius: c.ao.radius,
+      prep: {
+        color: c.colorSpec,
+        opacity: c.opacitySpec,
+        zoom: this.map.getZoom(),
+        globalState: { ...globalStateOf(this.map) },
+        flat: !this.map.terrain,
+        properties: this.repaints,
+      },
+    };
+  }
+
+  /** Ask the hub for a canonical tile — for the view (`tiles`) or ahead of it (`kept`). */
+  private loadTile(key: string, x: number, y: number, z: number, into: globalThis.Map<string, TileEntry>) {
     const pow = 2 ** z;
-    this.tiles.set(key, {
+    const entry: TileEntry = {
       state: 'loading',
       tileMx: x / pow,
       tileMy: y / pow,
       bounds: tileBounds(x, y, z),
-    });
-
+      colorEpoch: this.colorEpoch,
+    };
+    into.set(key, entry);
     const url = this.tileTemplate!
       .replace('{z}', String(z))
       .replace('{x}', String(x))
       .replace('{y}', String(y));
-
-    this.tileRequest(url)
-      .then((req) => fetch(req.url, { credentials: req.credentials, headers: req.headers }))
-      .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(String(r.status)))))
-      .then((buffer) => {
-        const e = this.tiles.get(key);
-        if (e?.state !== 'loading') return; // evicted mid-flight
-        const seq = ++this.seq;
-        e.worker = this.pickWorker();
-        e.seq = seq;
-        const w = this.pool[e.worker];
-        w.geometry.add(seq);
-        const req: TileRequest = {
-          key,
-          seq,
-          x,
-          y,
-          z,
-          buffer,
-          sourceLayer: this.config.sourceLayer,
-          filter: this.config.filter,
-          extrusion: this.config.extrusion,
-          skirtRadius: this.aoEnabled ? this.config.ao.groundRadius : 0,
-          ao: this.aoEnabled,
-          aoLater: this.aoEnabled, // The geometry first, the AO data in a second message
-          aoRadius: this.config.ao.radius,
-        };
-        w.worker.postMessage(req, [buffer]);
-      })
-      .catch(() => {
-        const entry = this.tiles.get(key);
-        if (entry) entry.state = 'empty';
-      });
+    entry.seq = this.hub!.request(this.consumerId, key, x, y, z, url, this.spec());
   }
 
-  /**
-   * A tile request as MapLibre sends its own: through the map's `transformRequest`
-   * (rewritten URL, credentials such as a session cookie, headers). `_requestManager`
-   * is MapLibre-internal; without it, or if the transform fails, the URL is fetched as is.
-   */
-  private async tileRequest(url: string): Promise<TileRequestParameters> {
-    const manager = (this.map as unknown as {
-      _requestManager?: { transformRequest(url: string, type: string): TileRequestParameters | Promise<TileRequestParameters> };
-    })._requestManager;
-    if (!manager) return { url };
-    try {
-      return await manager.transformRequest(url, 'Tile');
-    } catch {
-      return { url };
-    }
+  onTileFailed(key: string, seq: number) {
+    const shown = this.tiles.get(key);
+    const entry = shown ?? this.kept.get(key);
+    if (entry?.state !== 'loading' || entry.seq !== seq) return;
+    entry.state = 'empty';
+    if (!shown) this.kept.delete(key); // loaded ahead: the view asks again
   }
 
-  private onTileParsed(result: TileResult, from: PoolWorker) {
-    const entry = this.tiles.get(result.key);
-    if (!entry || entry.state !== 'loading' || entry.seq !== result.seq) return; // evicted mid-flight
+  onTileParsed(result: TileResult) {
+    const shown = this.tiles.get(result.key);
+    const entry = shown ?? this.kept.get(result.key);
+    if (!entry || entry.state !== 'loading' || entry.seq !== result.seq) return; // given up mid-flight
 
-    if (result.index.length === 0) {
+    // The worker has done the per-vertex work (colours, on a map without terrain
+    // the heights and the bounds): nothing of that here.
+    const prepared = result.prepared;
+    if (result.index.length === 0 || !prepared) {
       entry.state = 'empty';
+      if (!shown) {
+        this.kept.delete(result.key);
+        this.rememberEmpty(result.key);
+      }
       return;
     }
 
-    const vertexCount = result.position.length / 3;
-    // Keep the base-relative Y for re-baking (bake() overwrites it in `position`).
-    const baseY = new Float32Array(vertexCount);
-    for (let v = 0; v < vertexCount; v++) baseY[v] = result.position[v * 3 + 1];
+    entry.table = prepared.table;
+    entry.properties = prepared.properties;
+    // The base-relative Y, kept for re-baking (bake() overwrites it in `position`).
+    entry.baseY = prepared.baseY;
 
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(result.position, 3));
     geometry.setAttribute('normal', new THREE.BufferAttribute(result.normal, 3, true));
-    const colors = this.colorAttribute(vertexCount, result.features);
-    geometry.setAttribute('color', colors.color);
-    entry.translucent = colors.translucent;
+    entry.geometry = geometry;
+    if (entry.colorEpoch === this.colorEpoch) {
+      geometry.setAttribute('color', new THREE.BufferAttribute(prepared.color, 4, true));
+      entry.translucent = prepared.translucent;
+    } else {
+      this.recolor(entry); // the global state the worker's colours were made for has changed
+    }
     // Integers, read as floats (not normalized). Without AO the worker sends
     // none (the shader then reads a constant and skips the AO anyway).
     if (result.aoh.length) {
@@ -827,46 +1010,56 @@ export class Fill3DManager {
     }
     if (result.aoTables) entry.ao = aoTextures(result.aoTables);
     if (result.aoh.length) entry.aoFade = 1; // AO data in one go: nothing to fade in
-    else if (this.aoEnabled && result.seq !== undefined) from.ao.add(result.seq); // its AO pass is due in that worker
     geometry.setIndex(new THREE.BufferAttribute(result.index, 1));
 
     const mesh = new THREE.Mesh(geometry, this.material);
     mesh.frustumCulled = true;
     mesh.onBeforeRender = () => this.bindAo(entry);
-    this.group.add(mesh);
 
     if (result.skirt) this.addSkirt(entry, result.skirt);
 
     entry.state = 'ready';
     entry.tileScale = result.tileScale;
     entry.mesh = mesh;
-    entry.geometry = geometry;
-    entry.baseY = baseY;
     entry.column = result.column;
     entry.columnXZ = result.columnXZ;
-    entry.features = result.features;
     entry.anchors = result.anchors;
 
-    this.placeMesh(entry);
-    this.bake(entry);
-    this.map.triggerRepaint();
+    if (prepared.flat && !this.map.terrain) {
+      geometry.boundingSphere = toSphere(prepared.flat.sphere);
+      if (entry.skirtGeometry && prepared.flat.skirtSphere) entry.skirtGeometry.boundingSphere = toSphere(prepared.flat.skirtSphere);
+      entry.terrainEpoch = this.terrainEpoch;
+    } else {
+      this.bake(entry);
+    }
+    entry.bytes = bytesOf(entry);
+    if (shown) {
+      this.show(entry);
+      this.map.triggerRepaint();
+    } else {
+      this.keptBytes += entry.bytes;
+      this.trim();
+    }
   }
 
   /**
    * The AO data of a tile that is on the map
-   * already. Its vertices are the ones of the first pass (the worker builds the
-   * tile again, with AO), so the attributes go onto the existing geometry; the
-   * AO then fades in (see syncAo).
+   * already (or kept, hidden). Its vertices are the ones of the first pass (the
+   * worker walks the tile again, for the AO), so the attributes go onto the
+   * existing geometry; the AO then fades in (see syncAo).
    */
-  private onAoParsed(result: AoResult) {
-    const entry = this.tiles.get(result.key);
-    if (!entry || entry.state !== 'ready' || !entry.geometry || !entry.baseY || entry.seq !== result.seq) return; // evicted meanwhile
+  onAoParsed(result: AoResult) {
+    const shown = this.tiles.get(result.key);
+    const entry = shown ?? this.kept.get(result.key);
+    if (!entry || entry.state !== 'ready' || !entry.geometry || !entry.baseY || entry.seq !== result.seq) return; // given up meanwhile
     const vertexCount = entry.baseY.length;
     if (result.aoFace.length !== vertexCount || entry.aoFade !== undefined) {
       if (entry.aoFade === undefined) console.warn(`Fill3DLayer: AO data of tile ${result.key} does not fit its geometry — ignored`);
       return;
     }
-    entry.geometry.setAttribute('aoh', new THREE.BufferAttribute(new Int16Array(vertexCount), 1)); // filled by bake
+    // On a map without terrain the worker has the heights above the ground already.
+    const flatDone = result.aoh?.length === vertexCount && !this.map.terrain && entry.terrainEpoch === this.terrainEpoch;
+    entry.geometry.setAttribute('aoh', new THREE.BufferAttribute(flatDone ? result.aoh! : new Int16Array(vertexCount), 1)); // else filled by bake
     entry.geometry.setAttribute('aoface', new THREE.BufferAttribute(result.aoFace, 1));
     entry.geometry.setAttribute('aouv', new THREE.BufferAttribute(result.aoUV, 2));
     if (result.aoTables) entry.ao = aoTextures(result.aoTables);
@@ -877,37 +1070,37 @@ export class Fill3DManager {
     entry.aoSince = performance.now();
     entry.aoFade = 0;
 
-    this.placeMesh(entry);
-    this.bake(entry);
-    this.map.triggerRepaint();
+    if (flatDone) {
+      if (entry.skirtGeometry && result.skirtSphere) entry.skirtGeometry.boundingSphere = toSphere(result.skirtSphere);
+    } else {
+      this.bake(entry);
+    }
+    const bytes = bytesOf(entry);
+    if (shown) {
+      this.show(entry);
+      this.map.triggerRepaint();
+    } else {
+      this.keptBytes += bytes - (entry.bytes ?? 0);
+    }
+    entry.bytes = bytes;
+    if (!shown) this.trim();
   }
 
-  /** Evaluate fill-3d-color / fill-3d-opacity per feature into a per-vertex RGBA attribute.
-   *  Colours stay sRGB — the shader shades and outputs in sRGB, matching fill-extrusion.
-   *  8 bits per channel (normalized), like the colour itself; a quarter of float32.
-   *  A feature-constant opacity is left out here: it's the `u_opacity` uniform.
-   *  `translucent`: whether any vertex got an alpha below 1 (a colour with alpha, a
-   *  per-feature opacity) — such a tile needs blending whatever the uniform says. */
-  private colorAttribute(vertexCount: number, features: FeatureSpan[]): { color: THREE.BufferAttribute; translucent: boolean } {
-    const zoom = this.map.getZoom();
-    const state = globalStateOf(this.map);
+  /**
+   * Evaluate fill-3d-color / fill-3d-opacity per feature into the tile's per-vertex RGBA
+   * attribute, here on the main thread: whenever the global state the paint reads has
+   * changed (the worker does it for an arriving tile, see vertexColors). `translucent`: whether any vertex
+   * got an alpha below 1 (a colour with alpha, a per-feature opacity) — such a tile needs
+   * blending whatever the opacity uniform says.
+   */
+  private recolor(entry: TileEntry) {
+    if (!entry.geometry || !entry.baseY || !entry.table) return;
     const { color, opacity } = this.config;
-    const rgba = new Uint8Array(vertexCount * 4);
-    let translucent = false;
-    for (const b of features) {
-      const [r, g, bl, ca] = color(zoom, b.properties, undefined, state);
-      const a = opacity.featureConstant ? ca : ca * opacity(zoom, b.properties, undefined, state);
-      const R = Math.round(r * 255), G = Math.round(g * 255), B = Math.round(bl * 255), A = Math.round(a * 255);
-      if (A < 255) translucent = true;
-      const end = b.start + b.count;
-      for (let v = b.start; v < end; v++) {
-        rgba[v * 4] = R;
-        rgba[v * 4 + 1] = G;
-        rgba[v * 4 + 2] = B;
-        rgba[v * 4 + 3] = A;
-      }
-    }
-    return { color: new THREE.BufferAttribute(rgba, 4, true), translucent };
+    const properties = entry.properties ?? NO_PROPERTIES;
+    const colors = vertexColors(entry.baseY.length, entry.table, properties, color, opacity, this.map.getZoom(), globalStateOf(this.map));
+    entry.geometry.setAttribute('color', new THREE.BufferAttribute(colors.color, 4, true));
+    entry.translucent = colors.translucent;
+    entry.colorEpoch = this.colorEpoch;
   }
 
   /**
@@ -943,16 +1136,14 @@ export class Fill3DManager {
     return value;
   }
 
-  /** Re-bake every tile's colours after a global-state change (one per frame at most). */
+  /** Re-bake the colours of the view's tiles after a global-state change (one per frame at most); kept tiles follow when they are shown. */
   private scheduleRecolor() {
     if (this.recolorRafId !== undefined) return;
     this.recolorRafId = requestAnimationFrame(() => {
       this.recolorRafId = undefined;
+      this.colorEpoch++;
       for (const entry of this.tiles.values()) {
-        if (entry.state !== 'ready' || !entry.geometry || !entry.baseY || !entry.features) continue;
-        const colors = this.colorAttribute(entry.baseY.length, entry.features);
-        entry.geometry.setAttribute('color', colors.color);
-        entry.translucent = colors.translucent;
+        if (entry.state === 'ready') this.recolor(entry);
       }
       this.map.triggerRepaint();
     });
@@ -1107,7 +1298,9 @@ export class Fill3DManager {
    * base — else every wall shows 10 m too deep on a pitched map.
    */
   private bake(entry: TileEntry) {
-    if (!entry.geometry || !entry.baseY || !entry.features) return;
+    if (!entry.geometry || !entry.baseY || !entry.table) return;
+    entry.terrainEpoch = this.terrainEpoch;
+    const table = entry.table;
     const attr = entry.geometry.getAttribute('position') as THREE.BufferAttribute;
     const pos = attr.array as Float32Array;
     const baseY = entry.baseY;
@@ -1133,18 +1326,19 @@ export class Fill3DManager {
     const aoReach = this.aoEnabled ? this.config.ao.radius + 10 : -Infinity;
     const fits = flat || !scale || !entry.anchors ? undefined : anchorFits(entry.anchors, groundOf);
     // The flat map's ground under the vertices of rigid models.
-    const rigidGround = flat && ao && entry.features.some((b) => b.rigid) ? flatGroundOfRigid(entry.features, column, baseY, xz.length / 2) : undefined;
+    const rigidGround = flat && ao ? flatGroundOfRigid(table, column, baseY, xz.length / 2) : undefined;
 
-    for (const b of entry.features) {
-      const end = b.start + b.count;
-      if (b.rigid) {
+    for (let i = 0; i < table.start.length; i++) {
+      const start = table.start[i];
+      const end = start + table.count[i];
+      if (table.rigid[i]) {
         // A model built against the terrain around its anchor
         // (b.lng, b.lat) goes to the terrain height there as one rigid body, like a
         // GltfLayer model. Its feet reach below the ground on purpose (the generator's
         // skirt, lower ground than at the anchor): nothing follows the ground down,
         // and on the flat map nothing is clamped — what lies below it shows through.
-        const ele = flat ? 0 : elevationAt(new LngLat(b.lng, b.lat));
-        for (let v = b.start; v < end; v++) {
+        const ele = flat ? 0 : elevationAt(new LngLat(table.lng[i], table.lat[i]));
+        for (let v = start; v < end; v++) {
           const rel = baseY[v];
           const y = rel + ele;
           pos[v * 3 + 1] = y;
@@ -1154,9 +1348,9 @@ export class Fill3DManager {
         }
         continue;
       }
-      const fit = fits && b.anchor !== undefined ? fits[b.anchor] : NaN;
-      const ele = flat ? 0 : fit === fit ? b.base! + fit : elevationAt(new LngLat(b.lng, b.lat));
-      for (let v = b.start; v < end; v++) {
+      const fit = fits && table.anchor[i] >= 0 ? fits[table.anchor[i]] : NaN;
+      const ele = flat ? 0 : fit === fit ? table.base[i] + fit : elevationAt(new LngLat(table.lng[i], table.lat[i]));
+      for (let v = start; v < end; v++) {
         const rel = baseY[v];
         let y: number;
         let aboveGround: number;
@@ -1216,11 +1410,15 @@ export class Fill3DManager {
     const regions = this.pendingDemRegions;
     this.pendingDemRegions = [];
     if (regions.length === 0) return;
+    this.terrainEpoch++; // kept tiles are baked again when they are shown
 
     let changed = 0;
     for (const entry of this.tiles.values()) {
       if (entry.state !== 'ready') continue;
-      if (!regions.some((r) => overlaps(r, entry.bounds))) continue;
+      if (!regions.some((r) => overlaps(r, entry.bounds))) {
+        entry.terrainEpoch = this.terrainEpoch; // the changed terrain is not under this tile
+        continue;
+      }
       this.bake(entry);
       changed++;
     }
@@ -1237,9 +1435,12 @@ export class Fill3DManager {
     if (this.rebakeRafId !== undefined) cancelAnimationFrame(this.rebakeRafId);
     if (this.recolorRafId !== undefined) cancelAnimationFrame(this.recolorRafId);
     this.unwatchGlobalState();
-    for (const w of this.pool) w.worker.terminate();
+    this.disposed = true;
     for (const entry of this.tiles.values()) this.freeTile(entry);
     this.tiles.clear();
+    for (const entry of this.kept.values()) this.freeTile(entry);
+    this.kept.clear();
+    this.hub?.detach(this.consumerId);
     this.scene.remove(this.group);
     this.scene.remove(this.skirtGroup);
     this.material.dispose();
@@ -1285,22 +1486,25 @@ function anchorFits(anchors: TerrainAnchors, groundOf: (column: number) => numbe
   return fits;
 }
 
-/**
- * The flat map's ground under the vertices of rigid models,
- * per ground column, relative to the map: the map itself, or the model's lowest
- * point in that column where it reaches below the map (a wall foot on lower
- * ground shows through the flat map, and the wall darkens towards that foot).
- */
-function flatGroundOfRigid(features: FeatureSpan[], column: Uint32Array, baseY: Float32Array, columns: number): Float32Array {
-  const ground = new Float32Array(columns); // 0: the map
-  for (const b of features) {
-    if (!b.rigid) continue;
-    for (let v = b.start, end = b.start + b.count; v < end; v++) {
-      const c = column[v];
-      if (baseY[v] < ground[c]) ground[c] = baseY[v];
-    }
+/** A bounding sphere the worker computed (x, y, z, radius). */
+function toSphere(s: Float32Array): THREE.Sphere {
+  return new THREE.Sphere(new THREE.Vector3(s[0], s[1], s[2]), s[3]);
+}
+
+const NO_PROPERTIES: Record<string, unknown>[] = new Proxy([], { get: () => EMPTY_PROPERTIES }) as never;
+const EMPTY_PROPERTIES: Record<string, unknown> = {};
+
+/** What a ready tile holds in memory: its vertex and index buffers, the skirt's, the AO tables, and what baking reads. */
+function bytesOf(entry: TileEntry): number {
+  let bytes = 0;
+  for (const g of [entry.geometry, entry.skirtGeometry]) {
+    if (!g) continue;
+    for (const a of Object.values(g.attributes)) bytes += (a.array as ArrayBufferView).byteLength;
+    if (g.index) bytes += (g.index.array as ArrayBufferView).byteLength;
   }
-  return ground;
+  if (entry.ao) for (const t of Object.values(entry.ao)) bytes += ((t as THREE.DataTexture).image.data as ArrayBufferView).byteLength;
+  for (const a of [entry.baseY, entry.column, entry.columnXZ, entry.skirtColumn]) bytes += a?.byteLength ?? 0;
+  return bytes;
 }
 
 function toOrigin(lngLat: LngLat): SceneOrigin {

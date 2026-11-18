@@ -24,7 +24,7 @@
 //     paint: { 'model-rotation': [0, 0, ['get', 'bearing']] },
 //   }));
 export { Fill3DLayer } from './Fill3DLayer';
-export type { Fill3DLayerOptions } from './Fill3DLayer';
+export type { Fill3DLayerOptions, PreloadCamera } from './Fill3DLayer';
 export { GltfLayer } from './GltfLayer';
 export type { GltfLayerOptions } from './GltfLayer';
 export type { Placement } from './GltfLayer';

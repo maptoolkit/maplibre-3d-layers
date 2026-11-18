@@ -3,9 +3,9 @@ import earcut from 'earcut';
 import { featureFilter } from '@maplibre/maplibre-gl-style-spec';
 import type { FilterSpecification, Feature, GlobalProperties } from '@maplibre/maplibre-gl-style-spec';
 import { VectorTile } from './vectorTile3d';
-import type { Polygon } from './vectorTile3d';
-import { compileNumber } from './expression';
-import type { Evaluator, StyleValue } from './expression';
+import type { Polygon, VectorTileFeature } from './vectorTile3d';
+import { compileColor, compileNumber } from './expression';
+import type { Evaluator, Rgba, StyleValue } from './expression';
 
 /** Flat 2D footprints to extrude into prisms alongside the 3D layer (EXPERIMENTAL). */
 export interface ExtrusionRequest {
@@ -18,14 +18,44 @@ export interface ExtrusionRequest {
   base?: StyleValue<number>;
 }
 
-/** Request: the fetched tile plus which layer to read and an optional filter.
- *  Geometry is stored tile-locally, so the scene origin is NOT needed here. */
+/**
+ * What the worker prepares besides the geometry, so that the main thread has no
+ * per-vertex work when the tile arrives (see {@link Prepared}).
+ */
+export interface TilePrep {
+  /** `fill-3d-color` / `fill-3d-opacity` as given to the layer, and what they are evaluated against. */
+  color?: StyleValue<string>;
+  opacity?: StyleValue<number>;
+  zoom: number;
+  globalState: Record<string, unknown>;
+  /** The map has no terrain: the heights can be final (see Fill3DManager.bake). */
+  flat: boolean;
+  /** Also send the features' properties: the main thread re-evaluates the paint on a global-state change. */
+  properties: boolean;
+}
+
+/**
+ * Request: the fetched tile and what each layer of the source wants from it —
+ * the layers of one source share a tile's fetch and its pass through the worker
+ * (see TileHub). Geometry is stored tile-locally, so the scene origin is NOT needed here.
+ */
 export interface TileRequest {
   key: string;
   x: number;
   y: number;
   z: number;
   buffer: ArrayBuffer;
+  consumers: ConsumerRequest[];
+}
+
+/** One layer's share of a {@link TileRequest}; `consumer` and `seq` come back in its results. */
+export interface ConsumerRequest extends TileSpec {
+  consumer: number;
+  seq: number;
+}
+
+/** Which layer to read from a tile, with an optional filter, and what to build from it. */
+export interface TileSpec {
   /** Vector-tile layer name to read (the `source-layer`). */
   sourceLayer: string;
   /** Optional MapLibre filter expression; features that fail are dropped. */
@@ -43,10 +73,45 @@ export interface TileRequest {
    * The worker keeps the parsed tile for that.
    */
   aoLater?: boolean;
-  /** Echoed in the results: tells a tile's results from those of an earlier request for the same key. */
-  seq?: number;
   /** Metres the inner-edge darkening reaches (fill-3d-ambient-occlusion-radius): the AO grid lists edges that far. */
   aoRadius: number;
+  /** What the worker prepares besides the geometry (see {@link TilePrep}). */
+  prep: TilePrep;
+}
+
+/** What placing a tile on a map without terrain needs of its {@link FeatureTable}. */
+export type FlatSpans = Pick<FeatureTable, 'start' | 'count' | 'rigid'>;
+
+/** The features' vertex spans as columns ({@link FeatureSpan} without the properties): transferred, not cloned. */
+export interface FeatureTable {
+  start: Uint32Array;
+  count: Uint32Array;
+  lng: Float64Array;
+  lat: Float64Array;
+  /** -1: none. */
+  anchor: Int32Array;
+  /** NaN: none. */
+  base: Float32Array;
+  rigid: Uint8Array;
+}
+
+/**
+ * What the worker prepared for the main thread (see {@link TilePrep}): the
+ * per-vertex work of a tile's arrival. With `flat`, `position` (and `aoh`, the
+ * skirt) carry the final heights for a map without terrain, and the bounding
+ * spheres come along (x, y, z, radius).
+ */
+export interface Prepared {
+  /** Per vertex: its height as emitted, relative to the feature's base (baking overwrites `position`'s). */
+  baseY: Float32Array;
+  /** Per vertex RGBA, 8 bits each: fill-3d-color, with a per-feature fill-3d-opacity in the alpha. */
+  color: Uint8Array;
+  /** Whether any vertex got an alpha below 1. */
+  translucent: boolean;
+  table: FeatureTable;
+  /** Per feature, with {@link TilePrep.properties}. */
+  properties?: Record<string, number | string | boolean>[];
+  flat?: { sphere: Float32Array; skirtSphere?: Float32Array };
 }
 
 /** One feature's vertex span, so the main thread can bake terrain + colour per feature. */
@@ -106,8 +171,11 @@ export interface SkirtResult {
 
 export interface TileResult {
   key: string;
-  /** The request's {@link TileRequest.seq}. */
+  /** The request's {@link ConsumerRequest.consumer} and {@link ConsumerRequest.seq}. */
+  consumer?: number;
   seq?: number;
+  /** From the worker, for a tile with geometry; `features` is empty then (see {@link Prepared.table}). */
+  prepared?: Prepared;
   /**
    * xyz per vertex in TRUE METRES relative to the tile's NW corner:
    * x=east, y=height-above-base, z=north. Scene-origin independent.
@@ -158,8 +226,13 @@ export interface TileResult {
  */
 export interface AoResult {
   key: string;
+  consumer?: number;
   seq?: number;
   phase: 'ao';
+  /** With {@link TilePrep.flat}: per vertex its height above the ground (dm), final for a map without terrain. */
+  aoh?: Int16Array;
+  /** With {@link TilePrep.flat}: the skirt's bounding sphere (its heights are final too). */
+  skirtSphere?: Float32Array;
   aoFace: Uint16Array;
   aoUV: Int16Array;
   aoTables?: AoTables;
@@ -558,12 +631,39 @@ function lapOf(stats?: BuildStats) {
   };
 }
 
+/**
+ * A fetched tile, opened once for all layers that read it: each of a layer's
+ * features is decoded (its properties) only once, however many layers filter it.
+ */
+export interface TileReader {
+  tile: VectorTile;
+  featuresOf(sourceLayer: string): VectorTileFeature[];
+}
+
+export function readTile(buffer: ArrayBuffer): TileReader {
+  const tile = new VectorTile(new Pbf(new Uint8Array(buffer)));
+  const decoded = new globalThis.Map<string, VectorTileFeature[]>();
+  return {
+    tile,
+    featuresOf(sourceLayer) {
+      let features = decoded.get(sourceLayer);
+      if (!features) {
+        const layer = tile.layers[sourceLayer];
+        features = [];
+        if (layer) for (let i = 0; i < layer.length; i++) features.push(layer.feature(i));
+        decoded.set(sourceLayer, features);
+      }
+      return features;
+    },
+  };
+}
+
 /** Parse one tile's 3D-feature layer (and the footprints to extrude) into buildings of faces, tile-local metres. */
 export function parseTile(
   tx: number,
   ty: number,
   tz: number,
-  buffer: ArrayBuffer,
+  source: ArrayBuffer | TileReader,
   sourceLayer: string,
   filter?: FilterSpecification,
   extrusion?: ExtrusionRequest,
@@ -578,7 +678,8 @@ export function parseTile(
   // All buildings of the tile are collected first: inner edges are searched
   // tile-wide, also between neighbouring buildings.
   const buildings: Building[] = [];
-  const tile = new VectorTile(new Pbf(new Uint8Array(buffer)));
+  const reader = source instanceof ArrayBuffer ? readTile(source) : source;
+  const tile = reader.tile;
   const layer = tile.layers[sourceLayer];
 
   const ff = filter ? featureFilter(filter, 'filter') : null;
@@ -594,8 +695,9 @@ export function parseTile(
     // features sharing an id, split them into connected parts, and anchor each
     // part at its own centre — roof and walls of one house share that anchor.
     const byId = new globalThis.Map<unknown, SourceFeature[]>();
-    for (let i = 0; i < layer.length; i++) {
-      const feature = layer.feature(i);
+    const features = reader.featuresOf(sourceLayer);
+    for (let i = 0; i < features.length; i++) {
+      const feature = features[i];
       if (feature.type !== 0) continue; // only the custom 3D geometry
       if (ff && !ff.filter(globals, feature as unknown as Feature)) continue;
 
@@ -708,7 +810,12 @@ export function emitTile(parsed: ParsedTile, skirtRadius = 0, ao = true, stats?:
  * skirt's. Walks the faces as emitTile does (same vertices, same columns), but
  * builds no positions and no triangles.
  */
-export function emitAo(parsed: ParsedTile, skirtRadius: number, aoRadius: number, stats?: BuildStats): Omit<AoResult, 'key' | 'phase'> {
+export function emitAo(
+  parsed: ParsedTile,
+  skirtRadius: number,
+  aoRadius: number,
+  stats?: BuildStats,
+): Omit<AoResult, 'key' | 'phase'> & { column: number[] } {
   const lap = lapOf(stats);
   findInner(parsed, stats);
   lap('innerMs');
@@ -722,7 +829,185 @@ export function emitAo(parsed: ParsedTile, skirtRadius: number, aoRadius: number
   lap('emitMs');
   const skirt = skirtRadius > 0 && out.ground.length ? buildSkirt(out.ground, skirtRadius, out) : undefined;
   lap('skirtMs');
-  return { ...result, columnXZ: new Float32Array(out.columnXZ), skirt };
+  // `column`: per vertex its ground column, as in emitTile's result (not sent to the main thread again).
+  return { ...result, columnXZ: new Float32Array(out.columnXZ), skirt, column: out.column };
+}
+
+// ------------------------------------------------------------------ prepare
+
+/** The skirt floats this far (metres) above the ground, against z-fighting with the terrain. */
+export const SKIRT_LIFT_M = 0.4;
+
+const NEUTRAL_COLOR: Rgba = [1, 1, 1, 1];
+/** Compiled paint, per request text: a layer sends the same paint with every tile. */
+const paints = new globalThis.Map<string, { color: Evaluator<Rgba>; opacity: Evaluator<number> }>();
+function paintOf(prep: TilePrep) {
+  const key = JSON.stringify([prep.color, prep.opacity]);
+  let paint = paints.get(key);
+  if (!paint) {
+    paint = {
+      color: compileColor(prep.color, 'fill-3d-color', NEUTRAL_COLOR, 3),
+      opacity: compileNumber(prep.opacity, 'fill-3d-opacity', 1, 3),
+    };
+    paints.set(key, paint);
+  }
+  return paint;
+}
+
+export function featureTable(features: FeatureSpan[]): FeatureTable {
+  const n = features.length;
+  const table: FeatureTable = {
+    start: new Uint32Array(n),
+    count: new Uint32Array(n),
+    lng: new Float64Array(n),
+    lat: new Float64Array(n),
+    anchor: new Int32Array(n),
+    base: new Float32Array(n),
+    rigid: new Uint8Array(n),
+  };
+  for (let i = 0; i < n; i++) {
+    const b = features[i];
+    table.start[i] = b.start;
+    table.count[i] = b.count;
+    table.lng[i] = b.lng;
+    table.lat[i] = b.lat;
+    table.anchor[i] = b.anchor ?? -1;
+    table.base[i] = b.base ?? NaN;
+    table.rigid[i] = b.rigid ? 1 : 0;
+  }
+  return table;
+}
+
+/**
+ * Per-vertex RGBA of a tile: fill-3d-color per feature, with a per-feature
+ * fill-3d-opacity in the alpha (a feature-constant opacity is the layer's
+ * `u_opacity` uniform instead). Colours stay sRGB — the shader shades and
+ * outputs in sRGB, like fill-extrusion.
+ */
+export function vertexColors(
+  vertexCount: number,
+  table: FeatureTable,
+  properties: Record<string, unknown>[],
+  color: Evaluator<Rgba>,
+  opacity: Evaluator<number>,
+  zoom: number,
+  state: Record<string, unknown>,
+): { color: Uint8Array; translucent: boolean } {
+  const rgba = new Uint8Array(vertexCount * 4);
+  let translucent = false;
+  for (let i = 0; i < table.start.length; i++) {
+    const [r, g, bl, ca] = color(zoom, properties[i], undefined, state);
+    const a = opacity.featureConstant ? ca : ca * opacity(zoom, properties[i], undefined, state);
+    const R = Math.round(r * 255), G = Math.round(g * 255), B = Math.round(bl * 255), A = Math.round(a * 255);
+    if (A < 255) translucent = true;
+    for (let v = table.start[i], end = v + table.count[i]; v < end; v++) {
+      rgba[v * 4] = R;
+      rgba[v * 4 + 1] = G;
+      rgba[v * 4 + 2] = B;
+      rgba[v * 4 + 3] = A;
+    }
+  }
+  return { color: rgba, translucent };
+}
+
+/**
+ * The flat map's ground under the vertices of rigid models,
+ * per ground column, relative to the map: the map itself, or the model's lowest
+ * point in that column where it reaches below the map (a wall foot on lower
+ * ground shows through the flat map, and the wall darkens towards that foot).
+ * Undefined without rigid models.
+ */
+export function flatGroundOfRigid(table: FlatSpans, column: ArrayLike<number>, baseY: Float32Array, columns: number): Float32Array | undefined {
+  let ground: Float32Array | undefined;
+  for (let i = 0; i < table.start.length; i++) {
+    if (!table.rigid[i]) continue;
+    ground ??= new Float32Array(columns); // 0: the map
+    for (let v = table.start[i], end = v + table.count[i]; v < end; v++) {
+      const c = column[v];
+      if (baseY[v] < ground[c]) ground[c] = baseY[v];
+    }
+  }
+  return ground;
+}
+
+/**
+ * A map without terrain: the heights as Fill3DManager.bake gives them there.
+ * `position` gets its final y (ground walls come up to the map, a rigid model
+ * stays as built), `aoh` each vertex's height above the ground in decimetres.
+ */
+export function bakeFlat(
+  position: Float32Array | undefined,
+  aoh: Int16Array | undefined,
+  baseY: Float32Array,
+  table: FlatSpans,
+  column: ArrayLike<number>,
+  columns: number,
+) {
+  const rigidGround = aoh ? flatGroundOfRigid(table, column, baseY, columns) : undefined;
+  for (let i = 0; i < table.start.length; i++) {
+    const rigid = table.rigid[i] === 1;
+    for (let v = table.start[i], end = v + table.count[i]; v < end; v++) {
+      const rel = baseY[v];
+      const y = rigid ? rel : Math.max(rel, 0);
+      if (position) position[v * 3 + 1] = y;
+      if (!aoh) continue;
+      const aboveGround = rigid ? (rigidGround ? rel - rigidGround[column[v]] : rel) : y;
+      aoh[v] = Math.max(-32766, Math.min(32766, Math.round(aboveGround * 10)));
+    }
+  }
+}
+
+/** A bounding sphere as three.js computes it: around the bounding box's centre. x, y, z, radius. */
+export function boundingSphere(position: Float32Array): Float32Array {
+  let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (let i = 0; i < position.length; i += 3) {
+    const x = position[i], y = position[i + 1], z = position[i + 2];
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z;
+    if (z > maxZ) maxZ = z;
+  }
+  if (minX > maxX) return new Float32Array(4);
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
+  let r2 = 0;
+  for (let i = 0; i < position.length; i += 3) {
+    const dx = position[i] - cx, dy = position[i + 1] - cy, dz = position[i + 2] - cz;
+    const d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 > r2) r2 = d2;
+  }
+  return new Float32Array([cx, cy, cz, Math.sqrt(r2)]);
+}
+
+/** A skirt on the flat map: its heights and its bounding sphere. */
+export function flatSkirt(skirt: SkirtResult): Float32Array {
+  for (let i = 1; i < skirt.position.length; i += 3) skirt.position[i] = SKIRT_LIFT_M;
+  return boundingSphere(skirt.position);
+}
+
+/**
+ * Do on the worker what the main thread did per vertex when a tile arrived
+ * (see {@link TilePrep}); changes `result` in place: its `features` are emptied
+ * (the spans go as columns), and with `prep.flat` its heights are final.
+ */
+export function prepare(result: Omit<TileResult, 'key'>, prep: TilePrep): Prepared {
+  const vertexCount = result.position.length / 3;
+  const table = featureTable(result.features);
+  const properties = result.features.map((f) => f.properties);
+  const baseY = new Float32Array(vertexCount);
+  for (let v = 0; v < vertexCount; v++) baseY[v] = result.position[v * 3 + 1];
+  const paint = paintOf(prep);
+  const colors = vertexColors(vertexCount, table, properties, paint.color, paint.opacity, prep.zoom, prep.globalState);
+  const prepared: Prepared = { baseY, color: colors.color, translucent: colors.translucent, table };
+  if (prep.properties) prepared.properties = properties;
+  if (prep.flat && vertexCount) {
+    bakeFlat(result.position, result.aoh.length ? result.aoh : undefined, baseY, table, result.column, result.columnXZ.length / 2);
+    prepared.flat = { sphere: boundingSphere(result.position) };
+    if (result.skirt) prepared.flat.skirtSphere = flatSkirt(result.skirt);
+  }
+  result.features = [];
+  return prepared;
 }
 
 /** Parse + triangulate one tile's 3D-feature layer into tile-local metre geometry. */
