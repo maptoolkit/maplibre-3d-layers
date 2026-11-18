@@ -37,6 +37,13 @@ interface Transform {
 const LAYER_ZOOMS_WAIT_MS = 1500;
 /** Tiles are looked at for changed terrain (see terrainMoved) for at most this much of a frame (ms). */
 const TERRAIN_CHECK_MS = 4;
+/**
+ * One tile is baked per frame while frames come at least this often (ms). Where
+ * they take longer (a slow device, software rendering), one per frame would
+ * leave the buildings off the terrain for seconds: as many as the time since
+ * the step before has room for, and the time for checks grows with it.
+ */
+const BAKE_EVERY_MS = 50;
 
 /** Remember this many tiles that turned out to hold nothing for the layer. */
 const EMPTY_KEYS_MAX = 4096;
@@ -590,6 +597,8 @@ export class Fill3DManager implements TileConsumer {
   // rebake on the next animation frame, touching only overlapping building tiles.
   private pendingDemRegions: GeoBounds[] = [];
   private rebakeRafId?: number;
+  /** When the rebake step before ran, or the first one was asked for (ms). */
+  private lastRebake = 0;
   /** Tiles whose terrain may have changed: checked, and baked anew if it has, one tile per frame. */
   private readonly rebakeQueue = new Set<TileEntry>();
 
@@ -1526,6 +1535,7 @@ export class Fill3DManager implements TileConsumer {
   /** Coalesce a burst of DEM `data` events into one look at the tiles on the next frame. */
   private scheduleRebake() {
     if (this.rebakeRafId !== undefined) return;
+    this.lastRebake = performance.now();
     this.rebakeRafId = requestAnimationFrame(() => this.rebakeStep());
   }
 
@@ -1556,8 +1566,11 @@ export class Fill3DManager implements TileConsumer {
 
     const centre = MercatorCoordinate.fromLngLat(this.map.getCenter(), 0);
     const t0 = performance.now();
+    const frame = t0 - this.lastRebake;
+    let bakes = Math.max(1, Math.floor(frame / BAKE_EVERY_MS));
+    const checks = Math.max(TERRAIN_CHECK_MS, frame / 4);
     let baked = false;
-    while (this.rebakeQueue.size && !baked && performance.now() - t0 < TERRAIN_CHECK_MS) {
+    while (this.rebakeQueue.size && bakes > 0 && performance.now() - t0 < checks) {
       let next: TileEntry | undefined;
       let nearest = Infinity;
       for (const entry of this.rebakeQueue) {
@@ -1575,9 +1588,13 @@ export class Fill3DManager implements TileConsumer {
       }
       this.bake(next!, true);
       baked = true;
+      bakes--;
     }
     if (baked) this.map.triggerRepaint();
-    if (this.rebakeQueue.size) this.scheduleRebake();
+    if (this.rebakeQueue.size) {
+      this.scheduleRebake();
+      this.lastRebake = t0; // from step to step: the frame's length
+    }
   }
 
   /**

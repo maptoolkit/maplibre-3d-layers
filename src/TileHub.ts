@@ -51,6 +51,14 @@ interface Sent {
 
 /** Arriving AO data is handed to its layers within this much main-thread time per frame (ms). */
 const ARRIVAL_BUDGET_MS = 4;
+/**
+ * A tile's geometry is handed over about this often (ms): one per frame at 60
+ * frames a second and above. Where frames take longer (a slow device, software
+ * rendering), one per frame would hold a view's tiles back for seconds — so as
+ * many as the time since the step before has room for, and the AO budget grows
+ * with it.
+ */
+const ARRIVAL_EVERY_MS = 16;
 
 const hubs = new WeakMap<Map, globalThis.Map<string, TileHub>>();
 
@@ -84,6 +92,8 @@ export class TileHub {
   private readonly sent = new globalThis.Map<number, Sent>();
   private readonly arrivals: { run: () => void; geometry: boolean }[] = [];
   private arrivalRaf?: number;
+  /** When the step before ran, or the first one was asked for (ms). */
+  private lastArrival = 0;
   private zooms?: Promise<LayerZooms | undefined>;
   private disposed = false;
 
@@ -297,14 +307,19 @@ export class TileHub {
     const step = () => {
       this.arrivalRaf = undefined;
       const t0 = performance.now();
+      const frame = t0 - this.lastArrival;
+      this.lastArrival = t0;
+      let geometries = Math.max(1, Math.floor(frame / ARRIVAL_EVERY_MS));
+      const budget = Math.max(ARRIVAL_BUDGET_MS, frame / 4);
       while (this.arrivals.length) {
         const next = this.arrivals.shift()!;
         next.run();
-        // One tile's geometry per frame; AO data (onto geometry that is drawn already) while there is time.
-        if (next.geometry || performance.now() - t0 >= ARRIVAL_BUDGET_MS) break;
+        // One tile's geometry per frame (see ARRIVAL_EVERY_MS); AO data (onto geometry that is drawn already) while there is time.
+        if (next.geometry ? --geometries <= 0 : performance.now() - t0 >= budget) break;
       }
       if (this.arrivals.length) this.arrivalRaf = requestAnimationFrame(step);
     };
+    this.lastArrival = performance.now();
     this.arrivalRaf = requestAnimationFrame(step);
   }
 }

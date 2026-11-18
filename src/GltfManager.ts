@@ -120,6 +120,12 @@ const MOVE_SERIES_MS = 500;
  * tenth time over 50 ms).
  */
 const BUILD_SLICE_MS = 3;
+/**
+ * … or this share of the time since the slice before, where frames take longer
+ * than a sixtieth of a second: on a slow device (or in software rendering) 3 ms
+ * a frame would stretch a rebuild over seconds.
+ */
+const BUILD_SLICE_SHARE = BUILD_SLICE_MS / (1000 / 60);
 
 /**
  * "Shifted noticeably" since the last build: the instances are built for the
@@ -844,12 +850,15 @@ export class GltfManager {
   private runBuild() {
     const steps = this.workSteps();
     this.building = steps;
+    let before: number | undefined;
     const slice = () => {
       this.buildRaf = undefined;
       if (this.disposed) return;
       let done = this.hidden(); // out of the zoom range meanwhile: flush drops everything
       const t0 = performance.now();
-      while (!done && performance.now() - t0 < BUILD_SLICE_MS) done = steps.next().done === true;
+      const budget = before === undefined ? BUILD_SLICE_MS : Math.max(BUILD_SLICE_MS, (t0 - before) * BUILD_SLICE_SHARE);
+      before = t0;
+      while (!done && performance.now() - t0 < budget) done = steps.next().done === true;
       if (!done) {
         this.buildRaf = requestAnimationFrame(slice);
         return;

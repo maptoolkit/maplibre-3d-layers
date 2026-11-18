@@ -174,7 +174,8 @@ may grow, else to the one with the least to do.
 - **Prepared in the worker.** Colours, and on a map without terrain the final
   heights and bounds, come ready from the worker; the main thread wraps the
   buffers and no longer walks the vertices. Arriving tiles are put on the map one
-  per frame.
+  per frame — more where frames take longer than a sixtieth of a second, so a
+  slow device does not wait a frame per tile.
 - **Memory.** What goes to the GPU once and is never written again (normals,
   colours, AO attributes and tables, indices) is not held in memory after its
   upload; what stays are the positions and what baking onto terrain reads. A
