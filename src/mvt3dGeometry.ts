@@ -1307,10 +1307,11 @@ function terrainAnchors(buildings: Building[], columns: Columns): TerrainAnchors
  * Stretches are recorded on both faces. Returns the number of pairs found.
  */
 function findInnerEdges(faces: Face[]): number {
-  // The non-vertical edges, by their end points in millimetres (y in the frame),
-  // the lexicographically smaller end first, so that both faces of an edge get
-  // one key. In columns (six ints per edge) and chained per hash, not as an
-  // object per edge in a list per hash: a tile has millions of edges.
+  // The edges in columns (six ints per edge) and chained per hash, not as an
+  // object per edge in a list per hash: a tile has millions of edges. A
+  // non-vertical edge has its end points in millimetres (y in the frame), the
+  // lexicographically smaller end first, so that both faces of an edge get
+  // one key; a vertical one x and z of its column.
   let capacity = 0;
   for (const f of faces) capacity += f.count;
   const ends = new Int32Array(capacity * 6);
@@ -1318,6 +1319,8 @@ function findInnerEdges(faces: Face[]): number {
   const edgeFace = new Int32Array(capacity);
   const edgeA = new Int32Array(capacity);
   const edgeB = new Int32Array(capacity);
+  /** Per vertical edge the range it covers on its line (see {@link EdgeRef}): t0, t1. */
+  const span = new Float64Array(capacity * 2);
   /**
    * Per hash the first edge with it, in an open-addressing table (-1: free).
    * `next` chains the others in the order they came, `last[first]` is where
@@ -1330,7 +1333,6 @@ function findInnerEdges(faces: Face[]): number {
   const next = new Int32Array(capacity).fill(-1);
   const last = new Int32Array(capacity).fill(-1);
   let count = 0;
-  const columns = new globalThis.Map<number, EdgeRef[]>();
   for (let fi = 0; fi < faces.length; fi++) {
     const f = faces[fi];
     if (f.n[0] === 0 && f.n[1] === 0 && f.n[2] === 0) continue; // degenerate
@@ -1353,23 +1355,28 @@ function findInnerEdges(faces: Face[]): number {
         bx = closing ? sx : mm(xyz[b]);
         by = closing ? sy : mm(xyz[b + 1] + yOff);
         bz = closing ? sz : mm(xyz[b + 2]);
-        if (ax === bx && az === bz) {
-          const e = edgeRef(f, a, b);
-          if (e) pushTo(columns, hash4(frame, ax, az, 0x7c1), e);
-          continue;
-        }
-        const swap = ax > bx || (ax === bx && (ay > by || (ay === by && az > bz)));
         const o = count * 6;
-        ends[o] = swap ? bx : ax;
-        ends[o + 1] = swap ? by : ay;
-        ends[o + 2] = swap ? bz : az;
-        ends[o + 3] = swap ? ax : bx;
-        ends[o + 4] = swap ? ay : by;
-        ends[o + 5] = swap ? az : bz;
+        let h: number;
+        if (ax === bx && az === bz) {
+          if (!edgeLine(f, a, b)) continue;
+          ends[o] = ax;
+          ends[o + 1] = az;
+          span[count * 2] = LINE[3];
+          span[count * 2 + 1] = LINE[4];
+          h = hash4(frame, ax, az, 0x7c1) | VERTICAL;
+        } else {
+          const swap = ax > bx || (ax === bx && (ay > by || (ay === by && az > bz)));
+          ends[o] = swap ? bx : ax;
+          ends[o + 1] = swap ? by : ay;
+          ends[o + 2] = swap ? bz : az;
+          ends[o + 3] = swap ? ax : bx;
+          ends[o + 4] = swap ? ay : by;
+          ends[o + 5] = swap ? az : bz;
+          h = hash4(hash4(frame, ends[o], ends[o + 1], ends[o + 2]), ends[o + 3], ends[o + 4], ends[o + 5]);
+        }
         edgeFace[count] = fi;
         edgeA[count] = a;
         edgeB[count] = b;
-        const h = hash4(hash4(frame, ends[o], ends[o + 1], ends[o + 2]), ends[o + 3], ends[o + 4], ends[o + 5]);
         hashOf[count] = h;
         for (let slot = h & (slots - 1); ; slot = (slot + 1) & (slots - 1)) {
           const head = firstAt[slot];
@@ -1414,7 +1421,7 @@ function findInnerEdges(faces: Face[]): number {
   // Same end points (a hash may be shared by others: compare them). The
   // firsts in the order they came.
   for (let head = 0; head < count; head++) {
-    if (last[head] === -1 || next[head] === -1) continue;
+    if (last[head] === -1 || next[head] === -1 || (hashOf[head] & VERTICAL) !== 0) continue;
     for (let i = head; i !== -1; i = next[i]) {
       const f = faces[edgeFace[i]];
       const o = i * 6;
@@ -1427,30 +1434,41 @@ function findInnerEdges(faces: Face[]): number {
         if (!isInnerEdge(f, edgeA[i], edgeB[i], g, edgeA[j], edgeB[j])) continue;
         const e = refOf(i);
         const h = refOf(j);
-        if (!e || !h) continue;
-        record(e, e.t0, e.t1, h);
+        if (e && h) record(e, e.t0, e.t1, h);
       }
     }
   }
 
   // Columns: sweep up each one, comparing overlapping edges only.
-  for (const list of columns.values()) {
-    if (list.length < 2) continue;
-    list.sort((p, q) => p.t0 - q.t0);
-    for (let i = 0; i < list.length; i++) {
+  const list: number[] = [];
+  for (let head = 0; head < count; head++) {
+    if (last[head] === -1 || next[head] === -1 || (hashOf[head] & VERTICAL) === 0) continue;
+    // By where they start, those starting at one height in the order they came.
+    let n = 0;
+    for (let i = head; i !== -1; i = next[i]) {
+      let at = n++;
+      for (; at > 0 && span[list[at - 1] * 2] > span[i * 2]; at--) list[at] = list[at - 1];
+      list[at] = i;
+    }
+    for (let i = 0; i < n; i++) {
       const e = list[i];
-      for (let j = i + 1; j < list.length && list[j].t0 < e.t1 - MIN_SHARED_M; j++) {
+      const f = faces[edgeFace[e]];
+      for (let j = i + 1; j < n && span[list[j] * 2] < span[e * 2 + 1] - MIN_SHARED_M; j++) {
         const g = list[j];
-        if (g.f === e.f || g.f.frame !== e.f.frame || mm(g.f.xyz[g.a]) !== mm(e.f.xyz[e.a]) || mm(g.f.xyz[g.a + 2]) !== mm(e.f.xyz[e.a + 2])) continue;
-        const lo = Math.max(e.t0, g.t0);
-        const hi = Math.min(e.t1, g.t1);
-        if (hi - lo < MIN_SHARED_M || !isInnerEdge(e.f, e.a, e.b, g.f, g.a, g.b)) continue;
-        record(e, lo, hi, g);
+        const gf = faces[edgeFace[g]];
+        if (gf === f || gf.frame !== f.frame || ends[g * 6] !== ends[e * 6] || ends[g * 6 + 1] !== ends[e * 6 + 1]) continue;
+        const lo = Math.max(span[e * 2], span[g * 2]);
+        const hi = Math.min(span[e * 2 + 1], span[g * 2 + 1]);
+        if (hi - lo < MIN_SHARED_M || !isInnerEdge(f, edgeA[e], edgeB[e], gf, edgeA[g], edgeB[g])) continue;
+        record(refOf(e)!, lo, hi, refOf(g)!); // not degenerate: those are not listed
       }
     }
   }
   return pairs;
 }
+
+/** Marks the hash of a vertical edge: those are compared among themselves only. */
+const VERTICAL = 1 << 29;
 
 /**
  * How much of the sky one face hides from the other at their inner edge,
@@ -1468,15 +1486,14 @@ function mm(v: number): number {
   return Math.round(v * 1000);
 }
 
-/** Append to the list under key k. */
-function pushTo<K, V>(map: globalThis.Map<K, V[]>, k: K, v: V) {
-  const list = map.get(k);
-  if (list) list.push(v);
-  else map.set(k, [v]);
-}
+/**
+ * Scratch of edgeLine: the line's unit direction (canonical sign), the
+ * parameter range the edge covers on it, its point at parameter 0.
+ */
+const LINE = new Float64Array(8);
 
-/** An edge on its line, or undefined if degenerate. */
-function edgeRef(f: Face, a: number, b: number): EdgeRef | undefined {
+/** Put an edge's line into LINE (see {@link EdgeRef}); false if the edge is degenerate. */
+function edgeLine(f: Face, a: number, b: number): boolean {
   // Work in the face's height frame, from the lexicographically smaller end, so
   // that two faces computing the same edge get bit-identical lines.
   const xyz = f.xyz;
@@ -1494,14 +1511,26 @@ function edgeRef(f: Face, a: number, b: number): EdgeRef | undefined {
   let dy = (swap ? ay : by) - y0;
   let dz = (swap ? az : bz) - z0;
   const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  if (len < MIN_SHARED_M) return undefined;
+  if (len < MIN_SHARED_M) return false;
   dx /= len;
   dy /= len;
   dz /= len;
-  const d: Vec3 = [dx, dy, dz];
   const t0 = x0 * dx + y0 * dy + z0 * dz;
-  const origin: Vec3 = [x0 - t0 * dx, y0 - t0 * dy, z0 - t0 * dz];
-  return { f, a, b, dir: d, t0, t1: t0 + len, origin, m: undefined };
+  LINE[0] = dx;
+  LINE[1] = dy;
+  LINE[2] = dz;
+  LINE[3] = t0;
+  LINE[4] = t0 + len;
+  LINE[5] = x0 - t0 * dx;
+  LINE[6] = y0 - t0 * dy;
+  LINE[7] = z0 - t0 * dz;
+  return true;
+}
+
+/** An edge on its line, or undefined if degenerate. */
+function edgeRef(f: Face, a: number, b: number): EdgeRef | undefined {
+  if (!edgeLine(f, a, b)) return undefined;
+  return { f, a, b, dir: [LINE[0], LINE[1], LINE[2]], t0: LINE[3], t1: LINE[4], origin: [LINE[5], LINE[6], LINE[7]], m: undefined };
 }
 
 /**
