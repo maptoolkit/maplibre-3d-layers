@@ -280,6 +280,24 @@ interface AoTextures {
   edges: THREE.DataTexture;
 }
 
+/** What a buffer or texture holds (bytes), also once its copy in memory is given up (see uploadOnce). */
+const BYTES = new WeakMap<object, number>();
+
+/**
+ * A buffer that is uploaded once and never written again: its copy in memory
+ * is given up after the upload. three keeps the array of every attribute, as
+ * it may have to upload it again — for a view of Vienna that was about 100 MB
+ * of normals, colours, AO attributes and indices held twice.
+ */
+function uploadOnce(attribute: THREE.BufferAttribute): THREE.BufferAttribute {
+  BYTES.set(attribute, (attribute.array as ArrayBufferView).byteLength);
+  return attribute.onUpload(releaseArray);
+}
+
+function releaseArray(this: THREE.BufferAttribute) {
+  (this as unknown as { array: null }).array = null;
+}
+
 /** A table as an integer texture of AO_TEXTURE_WIDTH-texel rows, read with texelFetch. */
 function aoTexture(data: Uint32Array | Uint16Array, channels: 1 | 4): THREE.DataTexture {
   const short = data instanceof Uint16Array;
@@ -295,6 +313,11 @@ function aoTexture(data: Uint32Array | Uint16Array, channels: 1 | 4): THREE.Data
   tex.magFilter = THREE.NearestFilter;
   tex.generateMipmaps = false;
   tex.needsUpdate = true;
+  // Uploaded once, like the buffers (see uploadOnce).
+  BYTES.set(tex, data.byteLength);
+  tex.onUpdate = () => {
+    (tex.image as { data: unknown }).data = null;
+  };
   return tex;
 }
 
@@ -956,8 +979,8 @@ export class Fill3DManager implements TileConsumer {
   private addSkirt(entry: TileEntry, skirt: SkirtResult) {
     const sg = new THREE.BufferGeometry();
     sg.setAttribute('position', new THREE.BufferAttribute(skirt.position, 3));
-    sg.setAttribute('coord', new THREE.BufferAttribute(skirt.coord, 2, true));
-    sg.setIndex(new THREE.BufferAttribute(skirt.index, 1));
+    sg.setAttribute('coord', uploadOnce(new THREE.BufferAttribute(skirt.coord, 2, true)));
+    sg.setIndex(uploadOnce(new THREE.BufferAttribute(skirt.index, 1)));
     const skirtMesh = new THREE.Mesh(sg, this.skirtMaterial);
     skirtMesh.frustumCulled = true;
     skirtMesh.onBeforeRender = () => this.bindSkirt(entry);
@@ -1041,10 +1064,10 @@ export class Fill3DManager implements TileConsumer {
 
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(result.position, 3));
-    geometry.setAttribute('normal', new THREE.BufferAttribute(result.normal, 3, true));
+    geometry.setAttribute('normal', uploadOnce(new THREE.BufferAttribute(result.normal, 3, true)));
     entry.geometry = geometry;
     if (entry.colorEpoch === this.colorEpoch) {
-      geometry.setAttribute('color', new THREE.BufferAttribute(prepared.color, 4, true));
+      geometry.setAttribute('color', uploadOnce(new THREE.BufferAttribute(prepared.color, 4, true)));
       entry.translucent = prepared.translucent;
     } else {
       this.recolor(entry); // the global state the worker's colours were made for has changed
@@ -1053,13 +1076,13 @@ export class Fill3DManager implements TileConsumer {
     // none (the shader then reads a constant and skips the AO anyway).
     if (result.aoh.length) {
       geometry.setAttribute('aoh', new THREE.BufferAttribute(result.aoh, 1));
-      geometry.setAttribute('aoface', new THREE.BufferAttribute(result.aoFace, 1));
-      geometry.setAttribute('aouv', new THREE.BufferAttribute(result.aoUV, 2));
+      geometry.setAttribute('aoface', uploadOnce(new THREE.BufferAttribute(result.aoFace, 1)));
+      geometry.setAttribute('aouv', uploadOnce(new THREE.BufferAttribute(result.aoUV, 2)));
     }
     if (result.aoTables) entry.ao = aoTextures(result.aoTables);
     if (result.aoh.length) entry.aoFade = 1; // AO data in one go: nothing to fade in
     else entry.aoDue = entry.aoLater;
-    geometry.setIndex(new THREE.BufferAttribute(result.index, 1));
+    geometry.setIndex(uploadOnce(new THREE.BufferAttribute(result.index, 1)));
 
     const mesh = new THREE.Mesh(geometry, this.material);
     mesh.frustumCulled = true;
@@ -1111,8 +1134,8 @@ export class Fill3DManager implements TileConsumer {
     // On a map without terrain the worker has the heights above the ground already.
     const flatDone = result.aoh?.length === vertexCount && !this.map.terrain && entry.terrainEpoch === this.terrainEpoch;
     entry.geometry.setAttribute('aoh', new THREE.BufferAttribute(flatDone ? result.aoh! : new Int16Array(vertexCount), 1)); // else filled by bake
-    entry.geometry.setAttribute('aoface', new THREE.BufferAttribute(result.aoFace, 1));
-    entry.geometry.setAttribute('aouv', new THREE.BufferAttribute(result.aoUV, 2));
+    entry.geometry.setAttribute('aoface', uploadOnce(new THREE.BufferAttribute(result.aoFace, 1)));
+    entry.geometry.setAttribute('aouv', uploadOnce(new THREE.BufferAttribute(result.aoUV, 2)));
     if (result.aoTables) entry.ao = aoTextures(result.aoTables);
     // The columns now include the skirt's.
     entry.columnXZ = result.columnXZ;
@@ -1148,7 +1171,7 @@ export class Fill3DManager implements TileConsumer {
     const { color, opacity } = this.config;
     const properties = entry.properties ?? NO_PROPERTIES;
     const colors = vertexColors(entry.baseY.length, entry.table, properties, color, opacity, this.map.getZoom(), globalStateOf(this.map));
-    entry.geometry.setAttribute('color', new THREE.BufferAttribute(colors.color, 4, true));
+    entry.geometry.setAttribute('color', uploadOnce(new THREE.BufferAttribute(colors.color, 4, true)));
     entry.translucent = colors.translucent;
     entry.colorEpoch = this.colorEpoch;
   }
@@ -1670,10 +1693,10 @@ function bytesOf(entry: TileEntry): number {
   let bytes = 0;
   for (const g of [entry.geometry, entry.skirtGeometry]) {
     if (!g) continue;
-    for (const a of Object.values(g.attributes)) bytes += (a.array as ArrayBufferView).byteLength;
-    if (g.index) bytes += (g.index.array as ArrayBufferView).byteLength;
+    for (const a of Object.values(g.attributes)) bytes += BYTES.get(a) ?? (a.array as ArrayBufferView).byteLength;
+    if (g.index) bytes += BYTES.get(g.index) ?? (g.index.array as ArrayBufferView).byteLength;
   }
-  if (entry.ao) for (const t of Object.values(entry.ao)) bytes += ((t as THREE.DataTexture).image.data as ArrayBufferView).byteLength;
+  if (entry.ao) for (const t of Object.values(entry.ao)) bytes += BYTES.get(t) ?? 0;
   for (const a of [entry.baseY, entry.column, entry.columnXZ, entry.skirtColumn, entry.groundCache, entry.centreCache]) bytes += a?.byteLength ?? 0;
   return bytes;
 }

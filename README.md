@@ -175,6 +175,10 @@ may grow, else to the one with the least to do.
   heights and bounds, come ready from the worker; the main thread wraps the
   buffers and no longer walks the vertices. Arriving tiles are put on the map one
   per frame.
+- **Memory.** What goes to the GPU once and is never written again (normals,
+  colours, AO attributes and tables, indices) is not held in memory after its
+  upload; what stays are the positions and what baking onto terrain reads. A
+  Vienna view of 2.7 million vertices holds 63 MB of arrays instead of 129 MB.
 - **Tiles are kept.** A tile that leaves the view stays in memory, hidden, within
   `tileCache` megabytes (oldest given up first), and is on screen without loading
   when the view comes back — after a pan back, a turn, a zoom out and in again.
