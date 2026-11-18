@@ -313,22 +313,29 @@ function aoTexture(data: Uint32Array | Uint16Array, channels: 1 | 4): THREE.Data
   tex.magFilter = THREE.NearestFilter;
   tex.generateMipmaps = false;
   tex.needsUpdate = true;
-  // Uploaded once, like the buffers (see uploadOnce).
-  BYTES.set(tex, data.byteLength);
-  tex.onUpdate = () => {
-    (tex.image as { data: unknown }).data = null;
-  };
   return tex;
 }
 
-function aoTextures(t: AoTables): AoTextures {
+function tablesAsTextures(t: AoTables): AoTextures {
   return { faces: aoTexture(t.faces, 4), cells: aoTexture(t.cells, 1), lists: aoTexture(t.lists, 1), edges: aoTexture(t.edges, 4) };
+}
+
+/** A tile's AO tables as textures; uploaded once, like its static buffers (see uploadOnce). */
+function aoTextures(t: AoTables): AoTextures {
+  const textures = tablesAsTextures(t);
+  for (const tex of Object.values(textures) as THREE.DataTexture[]) {
+    BYTES.set(tex, (tex.image.data as ArrayBufferView).byteLength);
+    tex.onUpdate = () => {
+      (tex.image as { data: unknown }).data = null;
+    };
+  }
+  return textures;
 }
 
 /** Empty tables: integer samplers need integer textures bound, also for tiles without AO. */
 function emptyAoTextures(): AoTextures {
   const row = (channels: number) => AO_TEXTURE_WIDTH * channels;
-  return aoTextures({ faces: new Uint32Array(row(4)), cells: new Uint32Array(row(1)), lists: new Uint16Array(row(1)), edges: new Uint32Array(row(4)) });
+  return tablesAsTextures({ faces: new Uint32Array(row(4)), cells: new Uint32Array(row(1)), lists: new Uint16Array(row(1)), edges: new Uint32Array(row(4)) });
 }
 
 function createFill3DMaterial(transparent: boolean, ao: AoTextures): THREE.ShaderMaterial {
@@ -573,6 +580,7 @@ export class Fill3DManager implements TileConsumer {
   /** The look at the view that is due once a series of `moveend`s has ended. */
   private moveEndTimer?: ReturnType<typeof setTimeout>;
   private readonly onTerrain: () => void;
+  private readonly onContextRestored: () => void;
   private onSourceData?: (ev: unknown) => void;
   private readonly unwatchGlobalState: () => void;
   private recolorRafId?: number;
@@ -664,6 +672,10 @@ export class Fill3DManager implements TileConsumer {
     map.on('moveend', this.onMoveEnd);
     map.on('move', this.onMove);
     map.on('terrain', this.onTerrain);
+    // A restored WebGL context has none of the buffers, and those given up after
+    // their upload (see uploadOnce) cannot be uploaded again: the tiles are loaded anew.
+    this.onContextRestored = () => this.reload();
+    map.on('webglcontextrestored', this.onContextRestored);
 
     // `["global-state", …]`: a per-feature value is baked into the vertices, so
     // re-bake it; a feature-constant opacity is a uniform read every frame.
@@ -860,6 +872,18 @@ export class Fill3DManager implements TileConsumer {
   setCacheBytes(bytes: number) {
     this.cacheBytes = Math.max(0, bytes);
     this.trim();
+  }
+
+  /** Give up every tile, shown and kept, and load the view again. */
+  private reload() {
+    for (const entry of this.tiles.values()) this.freeTile(entry);
+    this.tiles.clear();
+    for (const entry of this.kept.values()) this.freeTile(entry);
+    this.kept.clear();
+    this.keptBytes = 0;
+    this.pins.clear();
+    this.rebakeQueue.clear();
+    this.update();
   }
 
   /** A tile enters the view: from the kept ones, known to be empty, or to be loaded. */
@@ -1599,6 +1623,7 @@ export class Fill3DManager implements TileConsumer {
     this.map.off('moveend', this.onMoveEnd);
     this.map.off('move', this.onMove);
     this.map.off('terrain', this.onTerrain);
+    this.map.off('webglcontextrestored', this.onContextRestored);
     if (this.onSourceData) this.map.off('sourcedata', this.onSourceData);
     if (this.rebakeRafId !== undefined) cancelAnimationFrame(this.rebakeRafId);
     if (this.recolorRafId !== undefined) cancelAnimationFrame(this.recolorRafId);
