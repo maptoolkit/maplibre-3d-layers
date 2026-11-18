@@ -1,10 +1,5 @@
 import { LngLat } from 'maplibre-gl';
-import type { Map, LngLatLike } from 'maplibre-gl';
-
-interface Entry {
-  lngLat: LngLat;
-  elevation: number;
-}
+import type { Map } from 'maplibre-gl';
 
 /** Terrain elevation (m) at a point. */
 export type ElevationSampler = (lng: number, lat: number) => number;
@@ -77,18 +72,36 @@ export function createMercatorElevationSampler(map: Map): (mx: number, my: numbe
     if (s === undefined) memo.set(k, (s = direct(wrap, z, tx, ty)));
     return s;
   };
+  // The points of a pass lie close together (a tile's ground columns, the trees
+  // of a view): per zoom level, the tile of the point before is tried first —
+  // the lookups above were a third of a pass over a tile's columns.
+  const zooms = index?.zooms ?? [];
+  const lastWrap = new Int32Array(zooms.length).fill(-99);
+  const lastTx = new Int32Array(zooms.length);
+  const lastTy = new Int32Array(zooms.length);
+  const lastSample: TileSample[] = new Array(zooms.length).fill(false);
 
   return (mx, my) => {
     if (index) {
       if (my >= 0 && my < 1) {
         const wrap = Math.floor(mx);
-        for (const z of index.zooms) {
+        for (let i = 0; i < zooms.length; i++) {
+          const z = zooms[i];
           const scale = 1 << z;
           const sx = (mx - wrap) * scale;
           const sy = my * scale;
           const tx = Math.floor(sx);
           const ty = Math.floor(sy);
-          const sample = lookup(wrap, z, tx, ty);
+          let sample: TileSample;
+          if (tx === lastTx[i] && ty === lastTy[i] && wrap === lastWrap[i]) {
+            sample = lastSample[i];
+          } else {
+            sample = lookup(wrap, z, tx, ty);
+            lastWrap[i] = wrap;
+            lastTx[i] = tx;
+            lastTy[i] = ty;
+            lastSample[i] = sample;
+          }
           if (sample === false) continue;
           if (sample) {
             return sample(
@@ -114,103 +127,6 @@ export function createMercatorElevationSampler(map: Map): (mx: number, my: numbe
     }
     return byZoom(toLngLat(mx, my), fallbackZoom);
   };
-}
-
-/**
- * Caches `map.queryTerrainElevation` results per sample point so the render loop
- * doesn't re-query every frame.
- *
- * Terrain DEM tiles stream in asynchronously (and can be replaced when zooming),
- * so a cached elevation goes stale the moment a fresh tile covering that point
- * arrives. We listen for the source's per-tile `data` events and invalidate only
- * the cached samples that fall inside the newly (re)loaded tile's geographic
- * bounds — everything else stays cached.
- */
-export class ElevationCache {
-  private readonly map: Map;
-  private readonly sourceId: string;
-  private readonly entries = new globalThis.Map<string, Entry>();
-  private readonly onData: (e: unknown) => void;
-
-  constructor(map: Map, sourceId: string) {
-    this.map = map;
-    this.sourceId = sourceId;
-
-    this.onData = (e) => {
-      // Only per-tile source data for our terrain source carries a tileID.
-      const ev = e as {
-        sourceId?: string;
-        tile?: { tileID?: { canonical?: { x: number; y: number; z: number } } };
-      };
-      if (ev.sourceId !== this.sourceId) return;
-      const c = ev.tile?.tileID?.canonical;
-      if (!c) return;
-      this.invalidateTile(c.x, c.y, c.z);
-    };
-    map.on('data', this.onData);
-  }
-
-  /** Drop every cached sample, e.g. after the map's terrain changed. */
-  clear() {
-    this.entries.clear();
-  }
-
-  /** Detach the terrain-data listener and clear the cache. */
-  dispose() {
-    this.map.off('data', this.onData);
-    this.entries.clear();
-  }
-
-  /** Ground elevation (m) at a point; queries + caches on a miss. */
-  get(point: LngLatLike): number {
-    const lngLat = LngLat.convert(point);
-    const key = ElevationCache.key(lngLat.lng, lngLat.lat);
-    const hit = this.entries.get(key);
-    if (hit) return hit.elevation;
-
-    const elevation = this.map.queryTerrainElevation(lngLat) ?? 0;
-    this.entries.set(key, { lngLat, elevation });
-    return elevation;
-  }
-
-  /**
-   * Like {@link get}, for many points in one synchronous pass: misses share one
-   * {@link createElevationSampler}. Drop the returned function after the pass.
-   */
-  batch(): (lngLat: LngLat) => number {
-    let sample: ElevationSampler | undefined;
-    return (lngLat) => {
-      const key = ElevationCache.key(lngLat.lng, lngLat.lat);
-      const hit = this.entries.get(key);
-      if (hit) return hit.elevation;
-
-      sample ??= createElevationSampler(this.map);
-      const elevation = sample(lngLat.lng, lngLat.lat);
-      this.entries.set(key, { lngLat, elevation });
-      return elevation;
-    };
-  }
-
-  /** Drop cached samples inside the given tile's bounds so they re-query. */
-  private invalidateTile(x: number, y: number, z: number) {
-    const b = tileBounds(x, y, z);
-    let changed = false;
-    for (const [key, entry] of this.entries) {
-      const { lng, lat } = entry.lngLat;
-      if (lng >= b.west && lng <= b.east && lat >= b.south && lat <= b.north) {
-        this.entries.delete(key);
-        changed = true;
-      }
-    }
-    // Fresh elevations available → let the custom layer re-render with them.
-    if (changed) this.map.triggerRepaint();
-  }
-
-  private static key(lng: number, lat: number): string {
-    // ~0.1 m grid — enough to dedupe identical sample points without
-    // collapsing distinct feature centroids.
-    return `${lng.toFixed(6)},${lat.toFixed(6)}`;
-  }
 }
 
 export interface GeoBounds {

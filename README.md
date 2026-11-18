@@ -182,10 +182,11 @@ may grow, else to the one with the least to do.
   to hold nothing for the layer are remembered and not loaded again.
 - **On terrain, tile by tile.** The heights are put onto the terrain on the main
   thread (baked). When terrain data arrives under a tile, the tile is baked anew
-  only if that changes the ground it stands on — checked at about 256 of its
-  ground columns, to two centimetres; most of what arrives while a map moves is
-  coarser than what the tile stands on already. Tiles are baked one per frame,
-  the nearest to the map centre first, also after the terrain was switched.
+  only if that changes the ground it stands on — every height the last bake took
+  from the terrain is sampled again and compared; most of what arrives while a
+  map moves is coarser than what the tile stands on already. Tiles are baked one
+  per frame, the nearest to the map centre first, also after the terrain was
+  switched.
 - **Loading ahead.** `layer.preload({ center, zoom, pitch, bearing, padding })`
   loads the tiles that camera would show, without showing them; when the map
   gets there (a jump, the end of a flight) they are on screen at once. The next

@@ -1,7 +1,6 @@
 import { LngLat } from 'maplibre-gl';
 import type { Map, CustomLayerInterface, CustomRenderMethodInput } from 'maplibre-gl';
 import * as THREE from 'three';
-import { ElevationCache } from './ElevationCache';
 import { Fill3DManager } from './Fill3DManager';
 import { compileColor, compileOpacity } from './paint';
 import type { PaintValue } from './paint';
@@ -140,7 +139,6 @@ export class Fill3DLayer implements CustomLayerInterface {
   private camera!: THREE.Camera;
   private scene!: THREE.Scene;
   private renderer!: THREE.WebGLRenderer;
-  private elevation?: ElevationCache;
   private manager?: Fill3DManager;
 
   // Reused every frame to avoid per-frame allocations.
@@ -206,12 +204,10 @@ export class Fill3DLayer implements CustomLayerInterface {
     });
     this.renderer.autoClear = false;
 
-    this.elevation = new ElevationCache(map, terrainSourceId);
     this.manager = new Fill3DManager(
       map,
       this.scene,
       LngLat.convert(map.getCenter()), // initial anchor; re-anchors itself on pan
-      this.elevation,
       terrainSourceId,
       {
         color: this.colorEval,
@@ -289,7 +285,6 @@ export class Fill3DLayer implements CustomLayerInterface {
 
   onRemove() {
     this.manager?.dispose();
-    this.elevation?.dispose();
     this.renderer?.dispose();
   }
 }

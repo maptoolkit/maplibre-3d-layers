@@ -1,8 +1,7 @@
 import { MercatorCoordinate, LngLat } from 'maplibre-gl';
 import type { CoveringTilesOptions, Map } from 'maplibre-gl';
 import * as THREE from 'three';
-import type { ElevationCache } from './ElevationCache';
-import { createMercatorElevationSampler, tileBounds } from './ElevationCache';
+import { createElevationSampler, createMercatorElevationSampler, tileBounds } from './ElevationCache';
 import type { GeoBounds } from './ElevationCache';
 import type { ExtrusionRequest, TileResult, TileSpec, AoResult, SkirtResult, FeatureTable, AoTables, TerrainAnchors } from './mvt3dGeometry';
 import {
@@ -36,10 +35,8 @@ interface Transform {
 
 /** Wait this long (ms) at most for the source's layer list before loading tiles of every zoom level. */
 const LAYER_ZOOMS_WAIT_MS = 1500;
-/** A tile's terrain is remembered at about this many of its ground columns (see TileEntry.probes). */
-const TERRAIN_PROBES = 256;
-/** Terrain that differs from those by less than this (metres) at every one of them is the same terrain. */
-const TERRAIN_SAME_M = 0.02;
+/** Tiles are looked at for changed terrain (see terrainMoved) for at most this much of a frame (ms). */
+const TERRAIN_CHECK_MS = 4;
 
 /** Remember this many tiles that turned out to hold nothing for the layer. */
 const EMPTY_KEYS_MAX = 4096;
@@ -448,23 +445,23 @@ interface TileEntry {
   /** The terrain and paint states (see terrainEpoch, colorEpoch) its heights and colours were made for. */
   terrainEpoch?: number;
   colorEpoch?: number;
-  /**
-   * What the tile was last baked onto: the ground height at every n-th of its
-   * columns (0 on a map without terrain, `probeFlat`). New terrain data under
-   * the tile only means a new bake if it changes these — most of what arrives
-   * while a map moves is coarser than what the tile stands on already.
-   */
-  probes?: Float32Array;
-  probeFlat?: boolean;
+  /** Whether it was last baked onto the flat map (no terrain). */
+  bakedFlat?: boolean;
   /** Per vertex: the worker's y, the height above the feature base (no terrain
    *  yet). x and z never change, so only y is kept for re-baking. */
   baseY?: Float32Array;
-  /** Per vertex / skirt vertex its ground column, per column x, z — and the
-   *  ground height per column during a bake (NaN = not sampled yet). */
+  /**
+   * Per vertex / skirt vertex its ground column, per column x, z — and what the
+   * tile was last baked onto: the ground height per column and the terrain
+   * height at the centre per feature, each where the bake used it (else NaN).
+   * New terrain data under the tile only means a new bake if it changes one of
+   * these (see terrainMoved).
+   */
   column?: Uint16Array | Uint32Array;
   skirtColumn?: Uint32Array;
   columnXZ?: Float32Array;
   groundCache?: Float32Array;
+  centreCache?: Float32Array;
   /** The features' vertex spans, and — only if the paint has to be evaluated again on a global-state change — their properties. */
   table?: FeatureTable;
   properties?: Record<string, unknown>[];
@@ -485,7 +482,7 @@ interface TileEntry {
  * Vertical placement: the worker emits feature-base-relative heights; this class
  * bakes terrain elevation into the vertex Y — per group of touching buildings
  * fitted to their wall feet, else per feature centre (see bake) — and re-bakes
- * whenever new DEM tiles stream in (via the shared {@link ElevationCache}) or the
+ * whenever new DEM tiles stream in or the
  * map's terrain is switched. Without terrain the meshes sit on the flat map,
  * nothing below it: the source sinks ground walls 10 m for slopes (see bake).
  *
@@ -505,7 +502,6 @@ export class Fill3DManager implements TileConsumer {
   /** Ground skirts; drawn in the colour pass only, after the buildings' depth. */
   private readonly skirtGroup: THREE.Group;
   private readonly skirtMaterial: THREE.ShaderMaterial;
-  private readonly elevation: ElevationCache;
   private readonly terrainSourceId: string;
   private hub?: TileHub;
   private consumerId = 0;
@@ -568,13 +564,11 @@ export class Fill3DManager implements TileConsumer {
     map: Map,
     scene: THREE.Scene,
     sceneOrigin: LngLat,
-    elevation: ElevationCache,
     terrainSourceId: string,
     config: Fill3DConfig,
   ) {
     this.map = map;
     this.scene = scene;
-    this.elevation = elevation;
     this.terrainSourceId = terrainSourceId;
     this.config = config;
     this.cacheBytes = config.cacheBytes;
@@ -617,10 +611,9 @@ export class Fill3DManager implements TileConsumer {
       this.maybeRebase();
       this.update();
     };
-    // Terrain switched on, off or re-set: the cached elevations are stale, and
-    // without terrain the sunk wall bases must come up to the map (see bake).
+    // Terrain switched on, off or re-set: the heights are stale, and without
+    // terrain the sunk wall bases must come up to the map (see bake).
     this.onTerrain = () => {
-      this.elevation.clear();
       this.terrainEpoch++;
       this.rebakeAll();
     };
@@ -1045,6 +1038,7 @@ export class Fill3DManager implements TileConsumer {
       geometry.boundingSphere = toSphere(prepared.flat.sphere);
       if (entry.skirtGeometry && prepared.flat.skirtSphere) entry.skirtGeometry.boundingSphere = toSphere(prepared.flat.skirtSphere);
       entry.terrainEpoch = this.terrainEpoch;
+      entry.bakedFlat = true;
     } else {
       this.bake(entry);
     }
@@ -1081,8 +1075,6 @@ export class Fill3DManager implements TileConsumer {
     if (result.aoTables) entry.ao = aoTextures(result.aoTables);
     // The columns now include the skirt's.
     entry.columnXZ = result.columnXZ;
-    entry.groundCache = undefined;
-    entry.probes = undefined;
     if (result.skirt) this.addSkirt(entry, result.skirt);
     entry.aoSince = performance.now();
     entry.aoFade = 0;
@@ -1313,8 +1305,12 @@ export class Fill3DManager implements TileConsumer {
    * only vertices below the base. The terrain surface covers that reserve. The
    * flat map covers nothing, so without terrain those vertices come up to the
    * base — else every wall shows 10 m too deep on a pitched map.
+   *
+   * `sampled`: the terrain heights the tile keeps (see TileEntry.groundCache)
+   * are the terrain's as it is — terrainMoved has just sampled them — and are
+   * used as they are.
    */
-  private bake(entry: TileEntry) {
+  private bake(entry: TileEntry, sampled = false) {
     if (!entry.geometry || !entry.baseY || !entry.table) return;
     entry.terrainEpoch = this.terrainEpoch;
     const table = entry.table;
@@ -1324,19 +1320,38 @@ export class Fill3DManager implements TileConsumer {
     const aoAttr = entry.geometry.getAttribute('aoh') as THREE.BufferAttribute | undefined;
     const ao = aoAttr?.array as Int16Array | undefined;
     const flat = !this.map.terrain;
-    const elevationAt = this.elevation.batch();
+    const elevationAt = createElevationSampler(this.map);
     const groundAt = createMercatorElevationSampler(this.map);
     const scale = entry.tileScale ?? 0;
     // The terrain under a vertex, sampled once per ground column: a wall's top
     // and bottom, the roof above it and the skirt at its foot share one.
     const column = entry.column!;
     const xz = entry.columnXZ!;
-    const cache = (entry.groundCache ??= new Float32Array(xz.length / 2));
-    cache.fill(NaN);
+    // Kept as 32-bit floats and read back as such, so a bake from kept heights
+    // gives what a bake from fresh ones does.
+    let cache = entry.groundCache;
+    let centres = entry.centreCache;
+    if (!sampled || !cache || !centres || cache.length !== xz.length / 2) {
+      cache = entry.groundCache = new Float32Array(xz.length / 2).fill(NaN);
+      centres = entry.centreCache = new Float32Array(table.start.length).fill(NaN);
+    }
+    entry.bakedFlat = flat;
     const groundOf = (c: number) => {
       let g = cache[c];
-      if (g !== g) cache[c] = g = groundAt(entry.tileMx + xz[c * 2] * scale, entry.tileMy - xz[c * 2 + 1] * scale);
+      if (g !== g) {
+        cache[c] = groundAt(entry.tileMx + xz[c * 2] * scale, entry.tileMy - xz[c * 2 + 1] * scale);
+        g = cache[c];
+      }
       return g;
+    };
+    // The terrain at a feature's centre (its anchor, for a rigid model).
+    const centreOf = (i: number) => {
+      let e = centres[i];
+      if (e !== e) {
+        centres[i] = elevationAt(table.lng[i], table.lat[i]);
+        e = centres[i];
+      }
+      return e;
     };
     // Fake AO needs each vertex's height above the ground, but only where it can
     // reach: up to its radius, plus headroom for the ground falling away on a slope.
@@ -1344,6 +1359,7 @@ export class Fill3DManager implements TileConsumer {
     const fits = flat || !scale || !entry.anchors ? undefined : anchorFits(entry.anchors, groundOf);
     // The flat map's ground under the vertices of rigid models.
     const rigidGround = flat && ao ? flatGroundOfRigid(table, column, baseY, xz.length / 2) : undefined;
+    let moved = false;
 
     for (let i = 0; i < table.start.length; i++) {
       const start = table.start[i];
@@ -1354,11 +1370,14 @@ export class Fill3DManager implements TileConsumer {
         // GltfLayer model. Its feet reach below the ground on purpose (the generator's
         // skirt, lower ground than at the anchor): nothing follows the ground down,
         // and on the flat map nothing is clamped — what lies below it shows through.
-        const ele = flat ? 0 : elevationAt(new LngLat(table.lng[i], table.lat[i]));
+        const ele = flat ? 0 : centreOf(i);
         for (let v = start; v < end; v++) {
           const rel = baseY[v];
           const y = rel + ele;
-          pos[v * 3 + 1] = y;
+          if (pos[v * 3 + 1] !== Math.fround(y)) {
+            pos[v * 3 + 1] = y;
+            moved = true;
+          }
           if (!ao) continue;
           const aboveGround = rigidGround ? rel - rigidGround[column[v]] : !flat && scale && rel < aoReach ? y - groundOf(column[v]) : rel;
           ao[v] = Math.max(-32766, Math.min(32766, Math.round(aboveGround * 10)));
@@ -1366,7 +1385,7 @@ export class Fill3DManager implements TileConsumer {
         continue;
       }
       const fit = fits && table.anchor[i] >= 0 ? fits[table.anchor[i]] : NaN;
-      const ele = flat ? 0 : fit === fit ? table.base[i] + fit : elevationAt(new LngLat(table.lng[i], table.lat[i]));
+      const ele = flat ? 0 : fit === fit ? table.base[i] + fit : centreOf(i);
       for (let v = start; v < end; v++) {
         const rel = baseY[v];
         let y: number;
@@ -1382,20 +1401,19 @@ export class Fill3DManager implements TileConsumer {
           y = rel + ele;
           aboveGround = rel; // out of AO reach (or AO off): any value beyond the radius
         }
-        pos[v * 3 + 1] = y;
+        if (pos[v * 3 + 1] !== Math.fround(y)) {
+          pos[v * 3 + 1] = y;
+          moved = true;
+        }
         if (ao) ao[v] = Math.max(-32766, Math.min(32766, Math.round(aboveGround * 10)));
       }
     }
-    attr.needsUpdate = true;
+    // Heights that stayed as they were (a tile that stands already gets its AO data) are not uploaded again.
+    if (moved || !entry.geometry.boundingSphere) {
+      attr.needsUpdate = true;
+      entry.geometry.boundingSphere = toSphere(boundingSphere(pos));
+    }
     if (aoAttr) aoAttr.needsUpdate = true;
-    entry.geometry.boundingSphere = toSphere(boundingSphere(pos));
-
-    // What it stands on now (see TileEntry.probes).
-    const columns = xz.length / 2;
-    const step = probeStep(columns);
-    const probes = (entry.probes = new Float32Array(Math.ceil(columns / step)));
-    if (!flat) for (let i = 0, c = 0; c < columns; i++, c += step) probes[i] = groundOf(c);
-    entry.probeFlat = flat;
 
     // The skirt lies on the ground, lifted a little against z-fighting.
     if (entry.skirtGeometry && scale) {
@@ -1412,9 +1430,7 @@ export class Fill3DManager implements TileConsumer {
   private rebakeAll() {
     this.pendingDemRegions = [];
     for (const entry of this.tiles.values()) {
-      if (entry.state !== 'ready') continue;
-      entry.probes = undefined;
-      this.rebakeQueue.add(entry);
+      if (entry.state === 'ready') this.rebakeQueue.add(entry);
     }
     this.scheduleRebake();
   }
@@ -1429,12 +1445,12 @@ export class Fill3DManager implements TileConsumer {
    * Bring the tiles onto changed terrain: those that overlap a DEM tile that
    * has arrived (and those shown again from the kept ones) are queued, and each
    * frame one of them is baked anew, the nearest to the map centre first — but
-   * only if the terrain under it has changed at all (see onSameTerrain). Baking
+   * only if the terrain under it has changed at all (see terrainMoved). Baking
    * every overlapping tile in the frame the DEM tile arrived in blocked a map in
    * motion again and again (Vienna with terrain, 2026-11-18: 13 tiles in one
-   * frame, 45 frames a tour with over 100 ms of baking), and two thirds of
-   * those bakes moved no vertex: coarser terrain tiles keep arriving for ground
-   * the tile stands on in finer ones.
+   * frame, 45 frames a tour with over 100 ms of baking), and most of those
+   * bakes moved no vertex: coarser terrain tiles keep arriving for ground the
+   * tile stands on in finer ones.
    */
   private rebakeStep() {
     this.rebakeRafId = undefined;
@@ -1450,10 +1466,10 @@ export class Fill3DManager implements TileConsumer {
     }
     if (!this.rebakeQueue.size) return;
 
-    const groundAt = createMercatorElevationSampler(this.map);
     const centre = MercatorCoordinate.fromLngLat(this.map.getCenter(), 0);
+    const t0 = performance.now();
     let baked = false;
-    while (this.rebakeQueue.size && !baked) {
+    while (this.rebakeQueue.size && !baked && performance.now() - t0 < TERRAIN_CHECK_MS) {
       let next: TileEntry | undefined;
       let nearest = Infinity;
       for (const entry of this.rebakeQueue) {
@@ -1465,32 +1481,52 @@ export class Fill3DManager implements TileConsumer {
       }
       this.rebakeQueue.delete(next!);
       if (next!.state !== 'ready' || next!.mesh?.parent !== this.group) continue; // left the view meanwhile
-      if (this.onSameTerrain(next!, groundAt)) {
+      if (!this.terrainMoved(next!)) {
         next!.terrainEpoch = this.terrainEpoch;
         continue;
       }
-      this.bake(next!);
+      this.bake(next!, true);
       baked = true;
     }
     if (baked) this.map.triggerRepaint();
     if (this.rebakeQueue.size) this.scheduleRebake();
   }
 
-  /** Whether the terrain under a tile is what it was baked onto (see TileEntry.probes). */
-  private onSameTerrain(entry: TileEntry, groundAt: (mx: number, my: number) => number): boolean {
-    const probes = entry.probes;
-    const xz = entry.columnXZ;
+  /**
+   * Whether the terrain under a tile is another than the one it was last baked
+   * onto: every height that bake took from the terrain (see
+   * TileEntry.groundCache) is sampled again and compared, exactly. The samples
+   * are kept — the bake that follows a `true` uses them (`sampled`). Costs a
+   * quarter of a bake; a few hundred points per tile instead were not enough:
+   * finer terrain data moves the ground by metres at an embankment and by
+   * nothing a street away, and the buildings there kept standing on the old one.
+   */
+  private terrainMoved(entry: TileEntry): boolean {
     const flat = !this.map.terrain;
-    if (!probes || !xz || entry.probeFlat !== flat) return false;
-    if (flat) return true;
+    const cache = entry.groundCache;
+    const centres = entry.centreCache;
+    const xz = entry.columnXZ;
+    const table = entry.table;
+    if (entry.bakedFlat !== flat) return true;
+    if (flat) return false;
+    if (!cache || !centres || !xz || !table || cache.length !== xz.length / 2) return true;
+    const groundAt = createMercatorElevationSampler(this.map);
+    const elevationAt = createElevationSampler(this.map);
     const scale = entry.tileScale ?? 0;
-    const columns = xz.length / 2;
-    const step = probeStep(columns);
-    for (let i = 0, c = 0; c < columns; i++, c += step) {
-      // Not `>=`: a NaN on either side is a change.
-      if (!(Math.abs(groundAt(entry.tileMx + xz[c * 2] * scale, entry.tileMy - xz[c * 2 + 1] * scale) - probes[i]) < TERRAIN_SAME_M)) return false;
+    let moved = false;
+    for (let c = 0; c < cache.length; c++) {
+      const was = cache[c];
+      if (was !== was) continue; // not used
+      cache[c] = groundAt(entry.tileMx + xz[c * 2] * scale, entry.tileMy - xz[c * 2 + 1] * scale);
+      if (cache[c] !== was) moved = true;
     }
-    return true;
+    for (let i = 0; i < centres.length; i++) {
+      const was = centres[i];
+      if (was !== was) continue;
+      centres[i] = elevationAt(table.lng[i], table.lat[i]);
+      if (centres[i] !== was) moved = true;
+    }
+    return moved;
   }
 
   /** Detach listeners, stop the worker and free all tile geometry. */
@@ -1579,11 +1615,6 @@ let FIT_ORDER = new Uint32Array(256);
 /** Groups of at most this many feet are sorted by insertion. */
 const FIT_INSERTION_MAX = 32;
 
-/** Every how many-th ground column of a tile is a terrain probe (see TileEntry.probes). */
-function probeStep(columns: number): number {
-  return Math.max(1, Math.floor(columns / TERRAIN_PROBES));
-}
-
 /** A bounding sphere the worker computed (x, y, z, radius). */
 function toSphere(s: Float32Array): THREE.Sphere {
   return new THREE.Sphere(new THREE.Vector3(s[0], s[1], s[2]), s[3]);
@@ -1601,7 +1632,7 @@ function bytesOf(entry: TileEntry): number {
     if (g.index) bytes += (g.index.array as ArrayBufferView).byteLength;
   }
   if (entry.ao) for (const t of Object.values(entry.ao)) bytes += ((t as THREE.DataTexture).image.data as ArrayBufferView).byteLength;
-  for (const a of [entry.baseY, entry.column, entry.columnXZ, entry.skirtColumn]) bytes += a?.byteLength ?? 0;
+  for (const a of [entry.baseY, entry.column, entry.columnXZ, entry.skirtColumn, entry.groundCache, entry.centreCache]) bytes += a?.byteLength ?? 0;
   return bytes;
 }
 
