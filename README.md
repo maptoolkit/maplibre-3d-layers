@@ -593,7 +593,13 @@ A rebuild does not block the frame it starts in: it takes at most 3 ms of a fram
 and goes on in the next ones; the instances on screen stay until the new ones are
 complete. The features of a tiled source are read once per tile, not on every
 rebuild, and a newly loaded tile per slice (via MapLibre internals; where they
-are missing, through `map.querySourceFeatures` as before).
+are missing, through `map.querySourceFeatures` as before). For point features
+(single trees, say) a rebuild only decides which of them are on screen: where
+they stand and what `model-id`, `model-rotation`, `model-scale`,
+`model-translation`, `model-color` and a per-feature `model-opacity` give for
+them is worked out once per feature and kept while its tile is loaded —
+evaluated anew when the global state these expressions read changes, or the
+zoom if one of them reads it.
 Positions jump straight to their new location — there is no interpolation between
 updates. `paint`, `layout` and `visibility` are read once when the layer is added;
 custom layers have no `setPaintProperty`.
