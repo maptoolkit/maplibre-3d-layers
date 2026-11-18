@@ -1300,12 +1300,16 @@ function findInnerEdges(faces: Face[]): number {
     g.f.inner.push({ key: g, origin: g.origin, dir: g.dir, lo, hi, m: runOff(g), k });
     pairs++;
   };
-  /** An edge on its line, once it pairs (undefined: not computed yet, null: degenerate). */
-  const refs: (EdgeRef | null | undefined)[] = [];
+  /**
+   * An edge on its line, once it pairs (null: degenerate): `refAt` is 1 + its
+   * place in `refs`, 0 while not computed — few edges pair, and an array with
+   * a slot per edge would be a sparse one, slow to write.
+   */
+  const refs: (EdgeRef | null)[] = [];
+  const refAt = new Int32Array(count);
   const refOf = (i: number) => {
-    let ref = refs[i];
-    if (ref === undefined) ref = refs[i] = edgeRef(edgeFace[i], edgeA[i], edgeB[i]) ?? null;
-    return ref;
+    if (refAt[i] === 0) refAt[i] = refs.push(edgeRef(edgeFace[i], edgeA[i], edgeB[i]) ?? null);
+    return refs[refAt[i] - 1];
   };
 
   // Same end points (a hash may be shared by others: compare them).
