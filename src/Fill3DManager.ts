@@ -542,6 +542,8 @@ export class Fill3DManager implements TileConsumer {
   private readonly onMove: () => void;
   /** When update() last ran (ms), for the throttle while the map moves. */
   private lastUpdate = -Infinity;
+  /** The look at the view that is due once a series of `moveend`s has ended. */
+  private moveEndTimer?: ReturnType<typeof setTimeout>;
   private readonly onTerrain: () => void;
   private onSourceData?: (ev: unknown) => void;
   private readonly unwatchGlobalState: () => void;
@@ -603,6 +605,19 @@ export class Fill3DManager implements TileConsumer {
       }
     };
     this.onMoveEnd = () => {
+      // A camera that is set on every frame ends a move on every frame: such a
+      // series is looked at as often as a move in progress (see onMove), and
+      // once more when it has ended.
+      const wait = MOVE_UPDATE_MS - (performance.now() - this.lastUpdate);
+      if (wait > 0) {
+        this.moveEndTimer ??= setTimeout(() => {
+          this.moveEndTimer = undefined;
+          if (this.disposed) return;
+          this.maybeRebase();
+          this.update();
+        }, wait);
+        return;
+      }
       this.maybeRebase();
       this.update();
     };
@@ -1538,6 +1553,7 @@ export class Fill3DManager implements TileConsumer {
     if (this.onSourceData) this.map.off('sourcedata', this.onSourceData);
     if (this.rebakeRafId !== undefined) cancelAnimationFrame(this.rebakeRafId);
     if (this.recolorRafId !== undefined) cancelAnimationFrame(this.recolorRafId);
+    if (this.moveEndTimer !== undefined) clearTimeout(this.moveEndTimer);
     this.unwatchGlobalState();
     this.disposed = true;
     for (const entry of this.tiles.values()) this.freeTile(entry);
