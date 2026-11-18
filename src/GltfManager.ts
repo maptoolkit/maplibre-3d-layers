@@ -621,6 +621,18 @@ export class GltfManager {
     }, DATA_SETTLE_MS);
   }
 
+  /**
+   * Whether the instances are those of the view as it is: nothing to read or
+   * rebuild, no rebuild in progress or due, all models loaded.
+   */
+  isIdle(): boolean {
+    if (this.disposed) return true;
+    if (this.needsRead || this.needsBuild || this.building || this.rafId !== undefined || this.paintRafId !== undefined) return false;
+    if (this.settleTimer !== undefined || this.moveTimer !== undefined || this.pendingDemRegions.length > 0) return false;
+    for (const model of this.models.values()) if (model.state === 'loading') return false;
+    return !this.needsImpostors();
+  }
+
   /** Re-read the source and rebuild all instances (coalesced to one frame). */
   refresh() {
     this.schedule(true, true);

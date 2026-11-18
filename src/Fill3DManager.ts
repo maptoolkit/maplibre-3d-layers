@@ -440,6 +440,9 @@ interface TileEntry {
   aoFade?: number;
   /** The request's number at the {@link TileHub}. */
   seq?: number;
+  /** Its AO data comes in a message of its own (`aoLater`) and is not in yet (`aoDue`). */
+  aoLater?: boolean;
+  aoDue?: boolean;
   /** What the tile holds in memory (bytes), once it is ready. */
   bytes?: number;
   /** The terrain and paint states (see terrainEpoch, colorEpoch) its heights and colours were made for. */
@@ -511,6 +514,8 @@ export class Fill3DManager implements TileConsumer {
   private zooms?: [number, number];
   /** No zoom level has anything for this layer. */
   private nothing = false;
+  /** The source is not there: nothing will ever load. */
+  private failed = false;
   private disposed = false;
   /** The tiles of the view. */
   private readonly tiles = new globalThis.Map<string, TileEntry>();
@@ -676,6 +681,7 @@ export class Fill3DManager implements TileConsumer {
 
     if (!this.map.getSource(id)) {
       console.error(`Fill3DLayer: source '${id}' not found — add it before the layer`);
+      this.failed = true;
       return;
     }
     if (tryRead()) {
@@ -809,6 +815,22 @@ export class Fill3DManager implements TileConsumer {
     this.pins = pins;
     this.trim();
     return asked;
+  }
+
+  /**
+   * Whether the view is complete and at rest: every tile of it is loaded, has
+   * its AO data (faded in), stands on the terrain as it is and has the colours
+   * of the global state as it is, and no look at the view is due. Tiles loaded
+   * ahead (see preload) do not count.
+   */
+  isIdle(): boolean {
+    if (this.disposed || this.failed) return true;
+    if (!this.started || this.moveEndTimer !== undefined || this.recolorRafId !== undefined) return false;
+    if (this.rebakeRafId !== undefined || this.rebakeQueue.size > 0 || this.pendingDemRegions.length > 0) return false;
+    for (const entry of this.tiles.values()) {
+      if (entry.state === 'loading' || entry.aoDue || entry.aoSince !== undefined) return false;
+    }
+    return true;
   }
 
   /** How many bytes of tiles outside the view are kept (see `kept`); less gives up kept tiles at once. */
@@ -982,7 +1004,9 @@ export class Fill3DManager implements TileConsumer {
       .replace('{z}', String(z))
       .replace('{x}', String(x))
       .replace('{y}', String(y));
-    entry.seq = this.hub!.request(this.consumerId, key, x, y, z, url, this.spec());
+    const spec = this.spec();
+    entry.aoLater = spec.ao && spec.aoLater === true;
+    entry.seq = this.hub!.request(this.consumerId, key, x, y, z, url, spec);
   }
 
   onTileFailed(key: string, seq: number) {
@@ -1034,6 +1058,7 @@ export class Fill3DManager implements TileConsumer {
     }
     if (result.aoTables) entry.ao = aoTextures(result.aoTables);
     if (result.aoh.length) entry.aoFade = 1; // AO data in one go: nothing to fade in
+    else entry.aoDue = entry.aoLater;
     geometry.setIndex(new THREE.BufferAttribute(result.index, 1));
 
     const mesh = new THREE.Mesh(geometry, this.material);
@@ -1077,6 +1102,7 @@ export class Fill3DManager implements TileConsumer {
     const shown = this.tiles.get(result.key);
     const entry = shown ?? this.kept.get(result.key);
     if (!entry || entry.state !== 'ready' || !entry.geometry || !entry.baseY || entry.seq !== result.seq) return; // given up meanwhile
+    entry.aoDue = false;
     const vertexCount = entry.baseY.length;
     if (result.aoFace.length !== vertexCount || entry.aoFade !== undefined) {
       if (entry.aoFade === undefined) console.warn(`Fill3DLayer: AO data of tile ${result.key} does not fit its geometry — ignored`);

@@ -199,6 +199,19 @@ may grow, else to the one with the least to do.
   // a tour: while the camera circles one stop, load the next
   for (const layer of fill3dLayers) layer.preload({ center: next.center, zoom: 16.5, pitch: 60, bearing: 120 });
   ```
+- **Done loading?** `layer.isIdle()` tells whether the layer shows its view
+  completely and nothing of it is still changing: every tile loaded, its ambient
+  occlusion in and faded in, everything on the terrain as it is. `await
+  layer.whenIdle()` waits for that (it looks once per frame). Both speak for the
+  layer alone, not for the rest of the map (see the map's `idle` event), and not
+  for tiles loaded ahead.
+
+  ```js
+  // a still frame of a view: wait for the map and for the 3D layers
+  map.jumpTo(view);
+  await map.once('idle');
+  await Promise.all(layers3d.map((layer) => layer.whenIdle()));
+  ```
 
 ### Landmarks: models in the tiles
 
@@ -601,6 +614,10 @@ they stand and what `model-id`, `model-rotation`, `model-scale`,
 them is worked out once per feature and kept while its tile is loaded —
 evaluated anew when the global state these expressions read changes, or the
 zoom if one of them reads it.
+`layer.isIdle()` tells whether the instances are those of the view as it is (the
+models loaded, no rebuild due or in progress), `await layer.whenIdle()` waits for
+that. Both speak for the layer alone: source tiles the map is still loading bring
+more to place, so wait for the map's `idle` first.
 Positions jump straight to their new location — there is no interpolation between
 updates. `paint`, `layout` and `visibility` are read once when the layer is added;
 custom layers have no `setPaintProperty`.

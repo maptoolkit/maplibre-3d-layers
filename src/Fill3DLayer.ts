@@ -5,6 +5,7 @@ import { Fill3DManager } from './Fill3DManager';
 import { compileColor, compileOpacity } from './paint';
 import type { PaintValue } from './paint';
 import { compileNumber } from './expression';
+import { whenIdle } from './idle';
 import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
 import type { ExtrusionRequest } from './mvt3dGeometry';
 
@@ -275,6 +276,21 @@ export class Fill3DLayer implements CustomLayerInterface {
    */
   preload(camera: PreloadCamera): number {
     return this.visible ? (this.manager?.preload(camera) ?? 0) : 0;
+  }
+
+  /**
+   * Whether the layer shows its view completely and nothing of it is still
+   * changing: all tiles loaded, their ambient occlusion in, everything on the
+   * terrain as it is. Says nothing about the rest of the map (see the map's own
+   * `idle` event) and nothing about tiles loaded ahead (see {@link preload}).
+   */
+  isIdle(): boolean {
+    return !this.visible || (this.manager?.isIdle() ?? true);
+  }
+
+  /** Resolves once {@link isIdle} holds (looked at once per frame). */
+  whenIdle(): Promise<void> {
+    return whenIdle(() => this.isIdle());
   }
 
   /** Change `tileCache` (megabytes); less gives up kept tiles at once. */

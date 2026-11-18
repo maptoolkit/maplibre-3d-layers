@@ -6,6 +6,7 @@ import { GltfManager } from './GltfManager';
 import type { ImpostorLight } from './GltfManager';
 import { compileColor, compileNumber, compileString, compileVec3 } from './expression';
 import type { StyleValue, Vec3 } from './expression';
+import { whenIdle } from './idle';
 import type { ExpressionSpecification, FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
 
 /** How a feature turns into models. `'auto'` picks by geometry type. */
@@ -414,6 +415,21 @@ export class GltfLayer implements CustomLayerInterface {
     room.dispose();
     pmrem.dispose();
     this.renderer.resetState(); // PMREM rendered into the shared context
+  }
+
+  /**
+   * Whether the layer shows the instances of the view as it is: its models are
+   * loaded and no rebuild is due or in progress. Says nothing about the map's
+   * own loading (see its `idle` event): tiles of the source that are still to
+   * come bring more to place.
+   */
+  isIdle(): boolean {
+    return !this.visible || (this.manager?.isIdle() ?? true);
+  }
+
+  /** Resolves once {@link isIdle} holds (looked at once per frame). */
+  whenIdle(): Promise<void> {
+    return whenIdle(() => this.isIdle());
   }
 
   onRemove() {
