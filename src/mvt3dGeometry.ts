@@ -436,36 +436,26 @@ interface Face {
   yOff: number;
   /** Newell normal — points INTO the building in this frame (see the shader). */
   n: Vec3;
-  /** Stretches of the face's edges it shares as an inner edge with another face. */
-  inner: InnerStretch[];
+  /**
+   * The stretches of the face's boundary along which it meets another face in
+   * an inner (concave) edge, {@link STRETCH} numbers each: the line of the
+   * face's edge it lies on (its place in {@link ParsedTile.innerLines};
+   * stretches on one edge get merged), the interval lo, hi along that line,
+   * and the strength — 1 + cos of the opening angle between the two faces
+   * (see {@link TileResult.aok}). Numbers, not objects: a tile has a million.
+   */
+  inner: number[];
 }
 
-/** A stretch of the face's boundary along which it meets another face in an inner (concave) edge. */
-interface InnerStretch {
-  /** The face's edge it lies on: stretches on one edge get merged. */
-  edge: EdgeRef;
-  /** The interval along the edge's line. */
-  lo: number;
-  hi: number;
-  /** Strength: 1 + cos of the opening angle between the two faces (see {@link TileResult.aok}). */
-  k: number;
-}
+const STRETCH = 4;
 
-/** A face edge, positioned on its line in the face's height frame. */
-interface EdgeRef {
-  f: Face;
-  /** Its two vertices: offsets in the face's `xyz`. */
-  a: number;
-  b: number;
-  /** Unit direction of the line (canonical sign) and the parameter range the edge covers. */
-  dir: Vec3;
-  t0: number;
-  t1: number;
-  /** Point on the line at parameter 0, in the frame (y includes yOff). */
-  origin: Vec3;
-  /** Unit direction within the face, from the line towards the darkened side; set once the edge is an inner one. */
-  m: Vec3 | undefined;
-}
+/**
+ * A face's edge on its line, in the face's height frame, as it is kept for an
+ * inner edge — {@link EDGE_LINE} numbers: the line's unit direction (canonical
+ * sign), its point at parameter 0 (y includes yOff), and the unit direction
+ * within the face from the line towards the darkened side.
+ */
+const EDGE_LINE = 9;
 
 /** Fill-in timings and counts for benchmarks (not used in rendering). */
 export interface BuildStats {
@@ -577,10 +567,11 @@ class AoAttributes {
   readonly uv: Int16Array;
   readonly tables = new AoTableBuilder();
 
-  /** For `vertices` vertices, with inner edges reaching `radius` metres. */
+  /** For `vertices` vertices, with inner edges — their lines in `lines` — reaching `radius` metres. */
   constructor(
     vertices: number,
     readonly radius: number,
+    readonly lines: number[],
   ) {
     this.face = new Uint16Array(vertices).fill(AO_NO_FACE);
     this.uv = new Int16Array(vertices * 2);
@@ -695,8 +686,11 @@ export interface ParsedTile {
   buildings: Building[];
   /** meterInMercatorCoordinateUnits at the tile's latitude. */
   tileScale: number;
-  /** The inner edges are on the faces already (findInnerEdges adds to them). */
-  innerFound?: boolean;
+  /**
+   * Once the inner edges are on the faces (findInnerEdges adds to them): the
+   * lines of the edges they lie on, {@link EDGE_LINE} numbers each.
+   */
+  innerLines?: number[];
   /**
    * Left by {@link emitTile} for {@link emitAo}, which then need not walk the
    * vertices for them again: per vertex its ground column, the columns
@@ -847,14 +841,15 @@ function countVertices(buildings: Building[]): number {
   return count;
 }
 
-/** Find the tile's inner edges once (they are added to the faces). */
-function findInner(parsed: ParsedTile, stats?: BuildStats) {
-  if (parsed.innerFound) return;
+/** Find the tile's inner edges once (they are added to the faces); returns their lines. */
+function findInner(parsed: ParsedTile, stats?: BuildStats): number[] {
+  if (parsed.innerLines) return parsed.innerLines;
   const faces: Face[] = [];
   for (const b of parsed.buildings) for (const m of b.members) for (const f of m.faces) faces.push(f);
-  const pairs = findInnerEdges(faces);
-  parsed.innerFound = true;
+  const lines: number[] = [];
+  const pairs = findInnerEdges(faces, lines);
   if (stats) stats.innerPairs += pairs;
+  return (parsed.innerLines = lines);
 }
 
 /** Triangulate a parsed tile into tile-local metre geometry — with `ao` including the AO data, with `skirtRadius` the skirt. */
@@ -862,11 +857,11 @@ export function emitTile(parsed: ParsedTile, skirtRadius = 0, ao = true, stats?:
   const lap = lapOf(stats);
   const { buildings, tileScale } = parsed;
   // Without AO there is nothing to find, and no AO attributes to emit.
-  if (ao) findInner(parsed, stats);
+  const lines = ao ? findInner(parsed, stats) : undefined;
   lap('innerMs');
 
   const vertices = countVertices(buildings);
-  const out = new MeshBuilder(vertices, ao ? new AoAttributes(vertices, aoRadius) : undefined);
+  const out = new MeshBuilder(vertices, lines && new AoAttributes(vertices, aoRadius, lines));
   const anchors = terrainAnchors(buildings, out.columns);
   for (const b of buildings) emitBuilding(out, b);
   const index = out.index.subarray(0, out.indexCount);
@@ -908,13 +903,13 @@ export function emitAo(
   stats?: BuildStats,
 ): Omit<AoResult, 'key' | 'phase'> & { column: Uint16Array | Uint32Array } {
   const lap = lapOf(stats);
-  findInner(parsed, stats);
+  const lines = findInner(parsed, stats);
   lap('innerMs');
   if (!parsed.forAo) emitTile(parsed, 0, false);
   const { column, columns, ground } = parsed.forAo!;
   // The skirt changes them: they are good for one AO pass.
   parsed.forAo = undefined;
-  const ao = new AoAttributes(countVertices(parsed.buildings), aoRadius);
+  const ao = new AoAttributes(countVertices(parsed.buildings), aoRadius, lines);
   let first = 0;
   for (const b of parsed.buildings) {
     for (const m of b.members) {
@@ -1304,9 +1299,10 @@ function terrainAnchors(buildings: Building[], columns: Columns): TerrainAnchors
  *    they are).
  * Not found: an edge lying inside another face that has no edge there — a
  * lower roof of an OSM body or extrusion against a wall running on above it.
- * Stretches are recorded on both faces. Returns the number of pairs found.
+ * Stretches are recorded on both faces, the lines of their edges in `lines`
+ * (see {@link Face.inner}). Returns the number of pairs found.
  */
-function findInnerEdges(faces: Face[]): number {
+function findInnerEdges(faces: Face[], lines: number[]): number {
   // The edges in columns (six ints per edge) and chained per hash, not as an
   // object per edge in a list per hash: a tile has millions of edges. A
   // non-vertical edge has its end points in millimetres (y in the frame), the
@@ -1319,7 +1315,7 @@ function findInnerEdges(faces: Face[]): number {
   const edgeFace = new Int32Array(capacity);
   const edgeA = new Int32Array(capacity);
   const edgeB = new Int32Array(capacity);
-  /** Per vertical edge the range it covers on its line (see {@link EdgeRef}): t0, t1. */
+  /** Per edge the range it covers on its line: t0, t1. Of a vertical edge, and of one whose line is in `lines`. */
   const span = new Float64Array(capacity * 2);
   /**
    * Per hash the first edge with it, in an open-addressing table (-1: free).
@@ -1398,24 +1394,33 @@ function findInnerEdges(faces: Face[]): number {
   }
 
   let pairs = 0;
-  const record = (e: EdgeRef, lo: number, hi: number, g: EdgeRef) => {
-    const k = edgeStrength(e.f.n, g.f.n);
-    e.m ??= runOff(e.f, e.a, e.b, [0, 0, 0]);
-    g.m ??= runOff(g.f, g.a, g.b, [0, 0, 0]);
-    e.f.inner.push({ edge: e, lo, hi, k });
-    g.f.inner.push({ edge: g, lo, hi, k });
-    pairs++;
-  };
   /**
-   * An edge on its line, once it is an inner one (null: degenerate): `refAt`
-   * is 1 + its place in `refs`, 0 while not computed — few edges are, and an
-   * array with a slot per edge would be a sparse one, slow to write.
+   * Per edge where its line is in `lines`, once it is an inner one (-1: not
+   * yet, -2: degenerate) — few edges are.
    */
-  const refs: (EdgeRef | null)[] = [];
-  const refAt = new Int32Array(count);
-  const refOf = (i: number) => {
-    if (refAt[i] === 0) refAt[i] = refs.push(edgeRef(faces[edgeFace[i]], edgeA[i], edgeB[i]) ?? null);
-    return refs[refAt[i] - 1];
+  const lineOf = new Int32Array(count).fill(-1);
+  /** Whether edge i has a line (it is put into `lines` when first asked for). */
+  const hasLine = (i: number): boolean => {
+    if (lineOf[i] === -1) {
+      const f = faces[edgeFace[i]];
+      if (edgeLine(f, edgeA[i], edgeB[i])) {
+        const m = runOff(f, edgeA[i], edgeB[i], RUN_OFF);
+        lineOf[i] = lines.length;
+        lines.push(LINE[0], LINE[1], LINE[2], LINE[5], LINE[6], LINE[7], m[0], m[1], m[2]);
+        span[i * 2] = LINE[3];
+        span[i * 2 + 1] = LINE[4];
+      } else lineOf[i] = -2;
+    }
+    return lineOf[i] >= 0;
+  };
+  /** Edges i and j (both with a line) meet in an inner edge from lo to hi. */
+  const record = (i: number, j: number, lo: number, hi: number) => {
+    const f = faces[edgeFace[i]];
+    const g = faces[edgeFace[j]];
+    const k = edgeStrength(f.n, g.n);
+    f.inner.push(lineOf[i], lo, hi, k);
+    g.inner.push(lineOf[j], lo, hi, k);
+    pairs++;
   };
 
   // Same end points (a hash may be shared by others: compare them). The
@@ -1432,9 +1437,7 @@ function findInnerEdges(faces: Face[]): number {
         if (ends[q] !== ends[o] || ends[q + 1] !== ends[o + 1] || ends[q + 2] !== ends[o + 2] || ends[q + 3] !== ends[o + 3] || ends[q + 4] !== ends[o + 4] || ends[q + 5] !== ends[o + 5]) continue;
         // The line only for an inner edge: most shared edges are none.
         if (!isInnerEdge(f, edgeA[i], edgeB[i], g, edgeA[j], edgeB[j])) continue;
-        const e = refOf(i);
-        const h = refOf(j);
-        if (e && h) record(e, e.t0, e.t1, h);
+        if (hasLine(i) && hasLine(j)) record(i, j, span[i * 2], span[i * 2 + 1]);
       }
     }
   }
@@ -1460,7 +1463,7 @@ function findInnerEdges(faces: Face[]): number {
         const lo = Math.max(span[e * 2], span[g * 2]);
         const hi = Math.min(span[e * 2 + 1], span[g * 2 + 1]);
         if (hi - lo < MIN_SHARED_M || !isInnerEdge(f, edgeA[e], edgeB[e], gf, edgeA[g], edgeB[g])) continue;
-        record(refOf(e)!, lo, hi, refOf(g)!); // not degenerate: those are not listed
+        if (hasLine(e) && hasLine(g)) record(e, g, lo, hi);
       }
     }
   }
@@ -1492,7 +1495,7 @@ function mm(v: number): number {
  */
 const LINE = new Float64Array(8);
 
-/** Put an edge's line into LINE (see {@link EdgeRef}); false if the edge is degenerate. */
+/** Put an edge's line into LINE; false if the edge is degenerate. */
 function edgeLine(f: Face, a: number, b: number): boolean {
   // Work in the face's height frame, from the lexicographically smaller end, so
   // that two faces computing the same edge get bit-identical lines.
@@ -1525,12 +1528,6 @@ function edgeLine(f: Face, a: number, b: number): boolean {
   LINE[6] = y0 - t0 * dy;
   LINE[7] = z0 - t0 * dz;
   return true;
-}
-
-/** An edge on its line, or undefined if degenerate. */
-function edgeRef(f: Face, a: number, b: number): EdgeRef | undefined {
-  if (!edgeLine(f, a, b)) return undefined;
-  return { f, a, b, dir: [LINE[0], LINE[1], LINE[2]], t0: LINE[3], t1: LINE[4], origin: [LINE[5], LINE[6], LINE[7]], m: undefined };
 }
 
 /**
@@ -1574,7 +1571,7 @@ function isInnerEdge(f: Face, fa: number, fb: number, g: Face, ga: number, gb: n
   return gFront > CONCAVE_EPSILON && fFront > CONCAVE_EPSILON;
 }
 
-/** Scratch of isInnerEdge: it asks for every pair of faces sharing an edge. */
+/** Scratch for runOff: it is asked for every pair of faces sharing an edge. */
 const RUN_OFF: Vec3 = [0, 0, 0];
 
 /** Unit direction, within the face's plane, in which face f runs off from its edge a → b (vertex offsets); written to `m`. */
@@ -1593,53 +1590,77 @@ function runOff(f: Face, a: number, b: number, m: Vec3): Vec3 {
   return m;
 }
 
+/** Scratch of mergeStretches: its result, as in {@link Face.inner}. */
+let MERGED = new Float64Array(STRETCH * 64);
+
 /**
- * The face's inner stretches, merged per edge where they touch, longest
- * first — e.g. a wall split into storeys meets its neighbour as one stretch.
+ * A face's inner stretches, merged per edge where they touch, longest first —
+ * e.g. a wall split into storeys meets its neighbour as one stretch. They are
+ * put into MERGED; returns how many they are. Sorted by insertion: a face has
+ * few, mostly each on an edge of its own.
  */
-function mergedStretches(face: Face): InnerStretch[] {
-  const inner = face.inner;
-  if (inner.length < 2) return inner; // the common case: nothing to merge
-  // The next most common: a few stretches, each on an edge of its own.
-  let apart = inner.length <= 8;
-  for (let i = 1; apart && i < inner.length; i++) {
-    for (let j = 0; apart && j < i; j++) apart = inner[j].edge !== inner[i].edge;
-  }
-  if (apart) return inner.slice().sort(longestFirst);
-  const byEdge = new globalThis.Map<EdgeRef, InnerStretch[]>();
-  for (const s of inner) {
-    const list = byEdge.get(s.edge);
-    if (list) list.push(s);
-    else byEdge.set(s.edge, [s]);
-  }
-  const merged: InnerStretch[] = [];
-  for (const list of byEdge.values()) {
-    list.sort((p, q) => p.lo - q.lo);
-    let cur = { ...list[0] };
-    for (let i = 1; i < list.length; i++) {
-      if (list[i].lo <= cur.hi + MERGE_GAP_M) {
-        cur.hi = Math.max(cur.hi, list[i].hi);
-        cur.k = Math.max(cur.k, list[i].k); // met by faces at different angles: the stronger
-      } else {
-        merged.push(cur);
-        cur = { ...list[i] };
-      }
+function mergeStretches(inner: number[]): number {
+  if (MERGED.length < inner.length) MERGED = new Float64Array(inner.length * 2);
+  const out = MERGED;
+  // Offsets into `inner` (i, j) and `out` (the others): a stretch is STRETCH numbers.
+  let end = 0;
+  // Edge by edge, in the order the edges first occur…
+  for (let i = 0; i < inner.length; i += STRETCH) {
+    const line = inner[i];
+    let seen = false;
+    for (let j = 0; j < i && !seen; j += STRETCH) seen = inner[j] === line;
+    if (seen) continue;
+    // …an edge's stretches by where they start (those starting at one place in the order they came)…
+    const first = end;
+    for (let j = i; j < inner.length; j += STRETCH) {
+      if (inner[j] !== line) continue;
+      let at = end;
+      for (; at > first && out[at - STRETCH + 1] > inner[j + 1]; at -= STRETCH) moveStretch(out, at - STRETCH, at);
+      out[at] = line;
+      out[at + 1] = inner[j + 1];
+      out[at + 2] = inner[j + 2];
+      out[at + 3] = inner[j + 3];
+      end += STRETCH;
     }
-    merged.push(cur);
+    // …and merged where they touch.
+    let cur = first;
+    for (let at = first + STRETCH; at < end; at += STRETCH) {
+      if (out[at + 1] <= out[cur + 2] + MERGE_GAP_M) {
+        out[cur + 2] = Math.max(out[cur + 2], out[at + 2]);
+        out[cur + 3] = Math.max(out[cur + 3], out[at + 3]); // met by faces at different angles: the stronger
+      } else moveStretch(out, at, (cur += STRETCH));
+    }
+    end = cur + STRETCH;
   }
-  return merged.sort(longestFirst);
+  // Longest first, those of one length in the order they are in.
+  for (let i = STRETCH; i < end; i += STRETCH) {
+    const line = out[i];
+    const lo = out[i + 1];
+    const hi = out[i + 2];
+    const k = out[i + 3];
+    let at = i;
+    for (; at > 0 && hi - lo - (out[at - STRETCH + 2] - out[at - STRETCH + 1]) > 0; at -= STRETCH) moveStretch(out, at - STRETCH, at);
+    out[at] = line;
+    out[at + 1] = lo;
+    out[at + 2] = hi;
+    out[at + 3] = k;
+  }
+  return end / STRETCH;
 }
 
-function longestFirst(p: InnerStretch, q: InnerStretch): number {
-  return q.hi - q.lo - (p.hi - p.lo);
+function moveStretch(stretches: Float64Array, from: number, to: number) {
+  stretches[to] = stretches[from];
+  stretches[to + 1] = stretches[from + 1];
+  stretches[to + 2] = stretches[from + 2];
+  stretches[to + 3] = stretches[from + 3];
 }
 
 /**
- * Register a face's inner stretches in the AO table, in an orthonormal basis of
- * its plane around the centre of its box. Returns its table index and how to
- * map a vertex into that plane (metres).
+ * Register a face's inner stretches — the first `count` in MERGED — in the AO
+ * table, in an orthonormal basis of its plane around the centre of its box.
+ * Returns its table index and how to map a vertex into that plane (metres).
  */
-function registerAoFace(ao: AoAttributes, face: Face, stretches: InnerStretch[]): number {
+function registerAoFace(ao: AoAttributes, face: Face, count: number): number {
   const { n, xyz, at } = face;
   const p0x = xyz[at];
   const p0y = xyz[at + 1];
@@ -1684,35 +1705,38 @@ function registerAoFace(ao: AoAttributes, face: Face, stretches: InnerStretch[])
   }
   const ca = (a0 + a1) / 2;
   const cb = (b0 + b1) / 2;
-  if (PLANE_EDGES.length < stretches.length * PLANE_EDGE) PLANE_EDGES = new Float64Array(stretches.length * PLANE_EDGE * 2);
+  if (PLANE_EDGES.length < count * PLANE_EDGE) PLANE_EDGES = new Float64Array(count * PLANE_EDGE * 2);
   const edges = PLANE_EDGES;
-  for (let i = 0; i < stretches.length; i++) {
-    const st = stretches[i];
+  const lines = ao.lines;
+  for (let i = 0; i < count; i++) {
+    // The stretch's line: direction, origin, the side m of the face (see EDGE_LINE).
+    const line = MERGED[i * STRETCH];
+    const lo = MERGED[i * STRETCH + 1];
+    const dir0 = lines[line];
+    const dir1 = lines[line + 1];
+    const dir2 = lines[line + 2];
     // The stretch start in the face's base-relative coordinates (the line lives in its height frame).
-    const { origin, dir } = st.edge;
-    const m = st.edge.m!;
-    const t = st.lo;
-    const d0 = origin[0] + dir[0] * t - p0x;
-    const d1 = origin[1] + dir[1] * t - face.yOff - p0y;
-    const d2 = origin[2] + dir[2] * t - p0z;
+    const d0 = lines[line + 3] + dir0 * lo - p0x;
+    const d1 = lines[line + 4] + dir1 * lo - face.yOff - p0y;
+    const d2 = lines[line + 5] + dir2 * lo - p0z;
     const a = d0 * e1x + d1 * e1y + d2 * e1z;
     const b = d0 * e2x + d1 * e2y + d2 * e2z;
-    let ua = dir[0] * e1x + dir[1] * e1y + dir[2] * e1z;
-    let ub = dir[0] * e2x + dir[1] * e2y + dir[2] * e2z;
+    let ua = dir0 * e1x + dir1 * e1y + dir2 * e1z;
+    let ub = dir0 * e2x + dir1 * e2y + dir2 * e2z;
     const l = Math.hypot(ua, ub) || 1;
     ua /= l;
     ub /= l;
     // Which side of the edge's direction the face lies on (where m points).
-    const ma = m[0] * e1x + m[1] * e1y + m[2] * e1z;
-    const mb = m[0] * e2x + m[1] * e2y + m[2] * e2z;
+    const ma = lines[line + 6] * e1x + lines[line + 7] * e1y + lines[line + 8] * e1z;
+    const mb = lines[line + 6] * e2x + lines[line + 7] * e2y + lines[line + 8] * e2z;
     const o = i * PLANE_EDGE;
     edges[o] = a - ca;
     edges[o + 1] = b - cb;
     edges[o + 2] = ua;
     edges[o + 3] = ub;
-    edges[o + 4] = st.hi - st.lo;
+    edges[o + 4] = MERGED[i * STRETCH + 2] - lo;
     edges[o + 5] = -ub * ma + ua * mb >= 0 ? 1 : -1;
-    edges[o + 6] = st.k;
+    edges[o + 6] = MERGED[i * STRETCH + 3];
   }
   // How emitFaceAo maps a vertex into the plane (see PLANE).
   PLANE[0] = p0x;
@@ -1726,7 +1750,7 @@ function registerAoFace(ao: AoAttributes, face: Face, stretches: InnerStretch[])
   PLANE[8] = e2z;
   PLANE[9] = ca;
   PLANE[10] = cb;
-  return ao.tables.add(edges, stretches.length, a0 - ca, b0 - cb, a1 - ca, b1 - cb, ao.radius);
+  return ao.tables.add(edges, count, a0 - ca, b0 - cb, a1 - ca, b1 - cb, ao.radius);
 }
 
 /** Scratch of registerAoFace: the face's inner edges in its plane (see {@link PLANE_EDGE}). */
@@ -1755,11 +1779,20 @@ function uvUnits(v: number): number {
  * edges leaves them as they are.
  */
 function emitFaceAo(ao: AoAttributes, face: Face, first: number) {
-  const stretches = mergedStretches(face);
-  if (!stretches.length) return;
-  const aoIndex = registerAoFace(ao, face, stretches);
+  if (!face.inner.length) return;
+  const aoIndex = registerAoFace(ao, face, mergeStretches(face.inner));
   if (aoIndex === AO_NO_FACE) return;
-  const [px, py, pz, e1x, e1y, e1z, e2x, e2y, e2z, ca, cb] = PLANE;
+  const px = PLANE[0];
+  const py = PLANE[1];
+  const pz = PLANE[2];
+  const e1x = PLANE[3];
+  const e1y = PLANE[4];
+  const e1z = PLANE[5];
+  const e2x = PLANE[6];
+  const e2y = PLANE[7];
+  const e2z = PLANE[8];
+  const ca = PLANE[9];
+  const cb = PLANE[10];
   const xyz = face.xyz;
   for (let o = face.at, end = o + 3 * face.count, v = first; o < end; o += 3, v++) {
     const d0 = xyz[o] - px;
