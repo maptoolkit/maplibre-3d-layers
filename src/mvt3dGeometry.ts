@@ -562,22 +562,24 @@ function mercatorScaleAtLat(latDeg: number): number {
   return 1 / (EARTH_CIRCUMFERENCE * Math.cos((latDeg * Math.PI) / 180));
 }
 
-/** Accumulates the tile's mesh, vertex by vertex. */
+/**
+ * Accumulates the tile's mesh, vertex by vertex — straight into the arrays the
+ * result is made of: the number of vertices is known beforehand.
+ */
 class MeshBuilder {
-  positions: number[] = [];
-  normals: number[] = [];
-  aoh: number[] = [];
-  aoFace: number[] = [];
-  aoUV: number[] = [];
+  /** Vertices emitted so far. */
+  vertexCount = 0;
+  readonly position: Float32Array;
+  readonly normal: Int8Array;
+  readonly aoh: Int16Array;
+  readonly aoFace: Uint16Array;
+  readonly aoUV: Int16Array;
   readonly aoTables = new AoTableBuilder();
-  /** Emit the fake-AO attributes at all, and how far inner edges reach. */
-  withAo = true;
-  aoRadius = 3;
-  /** The second pass — AO attributes, tables and columns only, no triangles. */
-  aoOnly = false;
-  indices: number[] = [];
+  /** The triangles' vertices, `indexCount` of them so far. */
+  index: Uint32Array;
+  indexCount = 0;
   /** Per vertex its ground column, and per column its x, z. */
-  column: number[] = [];
+  readonly column: Uint32Array;
   columnXZ: number[] = [];
   // The columns by position in whole millimetres, in an open-addressing table
   // (x, z, column per slot; -1: free): a tile asks millions of times, and a Map
@@ -588,8 +590,36 @@ class MeshBuilder {
   features: FeatureSpan[] = [];
   ground: GroundEdge[] = [];
 
-  get vertexCount() {
-    return this.column.length; // one column entry per vertex, also in the AO-only pass
+  /**
+   * For `vertices` vertices. `withAo`: emit the fake-AO attributes at all, with
+   * inner edges reaching `aoRadius`. `aoOnly`: the second pass — AO attributes,
+   * tables and columns only, no triangles.
+   */
+  constructor(
+    vertices: number,
+    readonly withAo: boolean,
+    readonly aoRadius: number,
+    readonly aoOnly = false,
+  ) {
+    const drawn = aoOnly ? 0 : vertices;
+    this.position = new Float32Array(drawn * 3);
+    this.normal = new Int8Array(drawn * 3);
+    this.aoh = new Int16Array(withAo ? drawn : 0);
+    this.aoFace = new Uint16Array(withAo ? vertices : 0).fill(AO_NO_FACE);
+    this.aoUV = new Int16Array(withAo ? vertices * 2 : 0);
+    // A face of n vertices has n - 2 triangles, with holes two more for each.
+    this.index = new Uint32Array(drawn * 3);
+    this.column = new Uint32Array(vertices);
+  }
+
+  /** Append a face's triangles (indices into the face's vertices, the first of which is `base`). */
+  addTriangles(tri: number[], base: number) {
+    if (this.indexCount + tri.length > this.index.length) {
+      const grown = new Uint32Array(Math.max(this.index.length * 2, this.indexCount + tri.length));
+      grown.set(this.index);
+      this.index = grown;
+    }
+    for (let t = 0; t < tri.length; t++) this.index[this.indexCount++] = tri[t] + base;
   }
 
   /** The ground column at (x, z), positions within a millimetre sharing one. */
@@ -782,6 +812,13 @@ export function parseTile(
   return { buildings, tileScale };
 }
 
+/** The number of vertices the buildings' faces have. */
+function countVertices(buildings: Building[]): number {
+  let count = 0;
+  for (const b of buildings) for (const m of b.members) for (const f of m.faces) count += f.count;
+  return count;
+}
+
 /** Find the tile's inner edges once (they are added to the faces). */
 function findInner(parsed: ParsedTile, stats?: BuildStats) {
   if (parsed.innerFound) return;
@@ -794,28 +831,24 @@ function findInner(parsed: ParsedTile, stats?: BuildStats) {
 export function emitTile(parsed: ParsedTile, skirtRadius = 0, ao = true, stats?: BuildStats, aoRadius = 3): Omit<TileResult, 'key'> {
   const lap = lapOf(stats);
   const { buildings, tileScale } = parsed;
-  const out = new MeshBuilder();
   // Without AO there is nothing to find, and no AO attributes to emit.
   if (ao) findInner(parsed, stats);
-  out.withAo = ao;
-  out.aoRadius = aoRadius;
   lap('innerMs');
 
+  const out = new MeshBuilder(countVertices(buildings), ao, aoRadius);
   const anchors = terrainAnchors(buildings, out);
   for (const b of buildings) emitBuilding(out, b);
-  const vertexCount = out.vertexCount;
-  const normal = new Int8Array(out.normals.length);
-  for (let i = 0; i < out.normals.length; i++) normal[i] = Math.round(out.normals[i] * 127);
+  const index = out.index.subarray(0, out.indexCount);
   const result = {
-    position: new Float32Array(out.positions),
-    normal,
-    aoh: new Int16Array(out.aoh),
-    aoFace: new Uint16Array(out.aoFace),
-    aoUV: new Int16Array(out.aoUV),
+    position: out.position,
+    normal: out.normal,
+    aoh: out.aoh,
+    aoFace: out.aoFace,
+    aoUV: out.aoUV,
     aoTables: ao ? out.aoTables.pack() : undefined,
-    index: vertexCount <= 65536 ? new Uint16Array(out.indices) : new Uint32Array(out.indices),
+    index: out.vertexCount <= 65536 ? new Uint16Array(index) : index.slice(),
     // 16 bit while the tile has at most 65536 columns (half the bytes), like the index.
-    column: out.columnXZ.length / 2 <= 65536 ? new Uint16Array(out.column) : new Uint32Array(out.column),
+    column: out.columnXZ.length / 2 <= 65536 ? new Uint16Array(out.column) : out.column,
     features: out.features,
     anchors,
     tileScale,
@@ -839,17 +872,14 @@ export function emitAo(
   skirtRadius: number,
   aoRadius: number,
   stats?: BuildStats,
-): Omit<AoResult, 'key' | 'phase'> & { column: number[] } {
+): Omit<AoResult, 'key' | 'phase'> & { column: Uint32Array } {
   const lap = lapOf(stats);
   findInner(parsed, stats);
   lap('innerMs');
-  const out = new MeshBuilder();
-  out.withAo = true;
-  out.aoOnly = true;
-  out.aoRadius = aoRadius;
+  const out = new MeshBuilder(countVertices(parsed.buildings), true, aoRadius, true);
   terrainAnchors(parsed.buildings, out); // the columns of the wall feet first, as in emitTile
   for (const b of parsed.buildings) emitBuilding(out, b);
-  const result = { aoFace: new Uint16Array(out.aoFace), aoUV: new Int16Array(out.aoUV), aoTables: out.aoTables.pack() };
+  const result = { aoFace: out.aoFace, aoUV: out.aoUV, aoTables: out.aoTables.pack() };
   lap('emitMs');
   const skirt = skirtRadius > 0 && out.ground.length ? buildSkirt(out.ground, skirtRadius, out) : undefined;
   lap('skirtMs');
@@ -1582,21 +1612,26 @@ function emitFace(out: MeshBuilder, face: Face) {
     const stretches = mergedStretches(face);
     if (stretches.length) aoIndex = registerAoFace(out, face, stretches);
   }
+  // Without inner edges the face's AO attributes stay as the builder made them: no face, (0, 0).
   const inPlane = aoIndex !== AO_NO_FACE;
   const [px, py, pz, e1x, e1y, e1z, e2x, e2y, e2z, ca, cb] = PLANE;
+  const { position, normal, column, aoFace, aoUV } = out;
+  const first = out.vertexCount;
+  out.vertexCount += face.count;
 
   if (out.aoOnly) {
     // The second pass of a tile whose geometry is out: per vertex, in the same
     // order, the column (for the skirt's) and the AO attributes.
-    for (let o = face.at; o < end; o += 3) {
-      out.column.push(out.columnAt(xyz[o], xyz[o + 2]));
-      out.aoFace.push(aoIndex);
+    for (let o = face.at, v = first; o < end; o += 3, v++) {
+      column[v] = out.columnAt(xyz[o], xyz[o + 2]);
       if (inPlane) {
         const d0 = xyz[o] - px;
         const d1 = xyz[o + 1] - py;
         const d2 = xyz[o + 2] - pz;
-        out.aoUV.push(uvUnits(d0 * e1x + d1 * e1y + d2 * e1z - ca), uvUnits(d0 * e2x + d1 * e2y + d2 * e2z - cb));
-      } else out.aoUV.push(0, 0);
+        aoFace[v] = aoIndex;
+        aoUV[2 * v] = uvUnits(d0 * e1x + d1 * e1y + d2 * e1z - ca);
+        aoUV[2 * v + 1] = uvUnits(d0 * e2x + d1 * e2y + d2 * e2z - cb);
+      }
     }
     return;
   }
@@ -1618,30 +1653,37 @@ function emitFace(out: MeshBuilder, face: Face) {
   const y1 = n[2] * x0 - n[0] * x2;
   const y2 = n[0] * x1 - n[1] * x0;
 
-  const polyVertexBase = out.vertexCount;
+  // The normal as the result has it: scaled to ±127.
+  const n0 = Math.round(n[0] * 127);
+  const n1 = Math.round(n[1] * 127);
+  const n2 = Math.round(n[2] * 127);
   const flat2D = FLAT_2D;
   flat2D.length = 0;
-  for (let o = face.at; o < end; o += 3) {
+  for (let o = face.at, v = first; o < end; o += 3, v++) {
     const x = xyz[o];
     const y = xyz[o + 1];
     const z = xyz[o + 2];
-    out.positions.push(x, y, z);
-    out.normals.push(n[0], n[1], n[2]);
-    out.column.push(out.columnAt(x, z));
+    position[3 * v] = x;
+    position[3 * v + 1] = y;
+    position[3 * v + 2] = z;
+    normal[3 * v] = n0;
+    normal[3 * v + 1] = n1;
+    normal[3 * v + 2] = n2;
+    column[v] = out.columnAt(x, z);
     if (out.withAo) {
-      out.aoh.push(dm(y));
-      out.aoFace.push(aoIndex);
+      out.aoh[v] = dm(y);
       if (inPlane) {
         const d0 = x - px;
         const d1 = y - py;
         const d2 = z - pz;
-        out.aoUV.push(uvUnits(d0 * e1x + d1 * e1y + d2 * e1z - ca), uvUnits(d0 * e2x + d1 * e2y + d2 * e2z - cb));
-      } else out.aoUV.push(0, 0);
+        aoFace[v] = aoIndex;
+        aoUV[2 * v] = uvUnits(d0 * e1x + d1 * e1y + d2 * e1z - ca);
+        aoUV[2 * v + 1] = uvUnits(d0 * e2x + d1 * e2y + d2 * e2z - cb);
+      }
     }
     flat2D.push(x * x0 + y * x1 + z * x2, x * y0 + y * y1 + z * y2);
   }
-  const tri = face.count === 3 ? ONE_TRIANGLE : earcut(flat2D, face.holes, 2);
-  for (let t = 0; t < tri.length; t++) out.indices.push(tri[t] + polyVertexBase);
+  out.addTriangles(face.count === 3 ? ONE_TRIANGLE : earcut(flat2D, face.holes, 2), first);
 }
 
 /** Metres → decimetres, clamped into Int16. */
