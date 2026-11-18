@@ -2298,9 +2298,16 @@ function wholePart(group: SourceFeature[]): Part {
 }
 
 function connectedParts(group: SourceFeature[], tolerance: number): Part[] {
-  const faces: { feature: SourceFeature; polygon: number; box: [number, number, number, number] }[] = [];
-  for (const feature of group) {
-    const { xyz, ringEnd, polygonEnd } = feature.geometry;
+  // The faces in columns — which feature of the group, which of its polygons,
+  // the box of its outline — not as an object each: a tile has hundreds of thousands.
+  let capacity = 0;
+  for (const feature of group) capacity += feature.geometry.polygonEnd.length - 1;
+  const faceFeature = new Int32Array(capacity);
+  const facePolygon = new Int32Array(capacity);
+  const box = new Float64Array(capacity * 4);
+  let count = 0;
+  for (let f = 0; f < group.length; f++) {
+    const { xyz, ringEnd, polygonEnd } = group[f].geometry;
     for (let polygon = 1; polygon < polygonEnd.length; polygon++) {
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
       const outer = polygonEnd[polygon - 1];
@@ -2313,29 +2320,37 @@ function connectedParts(group: SourceFeature[], tolerance: number): Part[] {
         if (y > maxY) maxY = y;
       }
       if (minX > maxX) continue; // empty ring
-      faces.push({ feature, polygon, box: [minX, minY, maxX, maxY] });
+      faceFeature[count] = f;
+      facePolygon[count] = polygon;
+      box[count * 4] = minX;
+      box[count * 4 + 1] = minY;
+      box[count * 4 + 2] = maxX;
+      box[count * 4 + 3] = maxY;
+      count++;
     }
   }
 
-  const parent = faces.map((_, i) => i);
+  const parent = new Int32Array(count);
+  const order = new Int32Array(count);
+  for (let i = 0; i < count; i++) parent[i] = order[i] = i;
   const find = (i: number): number => {
     while (parent[i] !== i) i = parent[i] = parent[parent[i]];
     return i;
   };
-  const order = faces.map((_, i) => i).sort((a, b) => faces[a].box[0] - faces[b].box[0]);
-  for (let oi = 0; oi < order.length; oi++) {
-    const a = faces[order[oi]].box;
-    for (let oj = oi + 1; oj < order.length && faces[order[oj]].box[0] <= a[2] + tolerance; oj++) {
-      const b = faces[order[oj]].box;
-      if (b[1] <= a[3] + tolerance && a[1] <= b[3] + tolerance) {
+  order.sort((a, b) => box[a * 4] - box[b * 4]);
+  for (let oi = 0; oi < count; oi++) {
+    const a = order[oi] * 4;
+    for (let oj = oi + 1; oj < count && box[order[oj] * 4] <= box[a + 2] + tolerance; oj++) {
+      const b = order[oj] * 4;
+      if (box[b + 1] <= box[a + 3] + tolerance && box[a + 1] <= box[b + 3] + tolerance) {
         parent[find(order[oi])] = find(order[oj]);
       }
     }
   }
 
   const parts = new globalThis.Map<number, Part>();
-  for (let i = 0; i < faces.length; i++) {
-    const { feature, polygon, box } = faces[i];
+  for (let i = 0; i < count; i++) {
+    const feature = group[faceFeature[i]];
     const root = find(i);
     let part = parts.get(root);
     if (!part) {
@@ -2344,11 +2359,11 @@ function connectedParts(group: SourceFeature[], tolerance: number): Part[] {
     }
     let member = part.members.find((m) => m.feature === feature);
     if (!member) part.members.push((member = { feature, polygons: [] }));
-    member.polygons.push(polygon);
-    part.minX = Math.min(part.minX, box[0]);
-    part.minY = Math.min(part.minY, box[1]);
-    part.maxX = Math.max(part.maxX, box[2]);
-    part.maxY = Math.max(part.maxY, box[3]);
+    member.polygons.push(facePolygon[i]);
+    part.minX = Math.min(part.minX, box[i * 4]);
+    part.minY = Math.min(part.minY, box[i * 4 + 1]);
+    part.maxX = Math.max(part.maxX, box[i * 4 + 2]);
+    part.maxY = Math.max(part.maxY, box[i * 4 + 3]);
   }
   return [...parts.values()];
 }
