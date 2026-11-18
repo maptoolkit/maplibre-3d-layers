@@ -432,15 +432,11 @@ interface Face {
 
 /** A stretch of the face's boundary along which it meets another face in an inner (concave) edge. */
 interface InnerStretch {
-  /** Stretches under one key lie on one line and get merged. */
-  key: object;
-  /** The line (frame coordinates, see {@link EdgeRef}) and the interval along it. */
-  origin: Vec3;
-  dir: Vec3;
+  /** The face's edge it lies on: stretches on one edge get merged. */
+  edge: EdgeRef;
+  /** The interval along the edge's line. */
   lo: number;
   hi: number;
-  /** Unit direction within the face, from the line towards the darkened side. */
-  m: Vec3;
   /** Strength: 1 + cos of the opening angle between the two faces (see {@link TileResult.aok}). */
   k: number;
 }
@@ -457,6 +453,8 @@ interface EdgeRef {
   t1: number;
   /** Point on the line at parameter 0, in the frame (y includes yOff). */
   origin: Vec3;
+  /** Unit direction within the face, from the line towards the darkened side; set once the edge is an inner one. */
+  m: Vec3 | undefined;
 }
 
 /** Fill-in timings and counts for benchmarks (not used in rendering). */
@@ -842,7 +840,9 @@ function countVertices(buildings: Building[]): number {
 /** Find the tile's inner edges once (they are added to the faces). */
 function findInner(parsed: ParsedTile, stats?: BuildStats) {
   if (parsed.innerFound) return;
-  const pairs = findInnerEdges(parsed.buildings.flatMap((b) => b.members.flatMap((m) => m.faces)));
+  const faces: Face[] = [];
+  for (const b of parsed.buildings) for (const m of b.members) for (const f of m.faces) faces.push(f);
+  const pairs = findInnerEdges(faces);
   parsed.innerFound = true;
   if (stats) stats.innerPairs += pairs;
 }
@@ -1304,32 +1304,48 @@ function findInnerEdges(faces: Face[]): number {
   let capacity = 0;
   for (const f of faces) capacity += f.count;
   const ends = new Int32Array(capacity * 6);
-  const edgeFace: Face[] = [];
-  /** Per edge its two vertices (offsets in its face's `xyz`). */
+  /** Per edge its face (its place in `faces`) and its two vertices (offsets in the face's `xyz`). */
+  const edgeFace = new Int32Array(capacity);
   const edgeA = new Int32Array(capacity);
   const edgeB = new Int32Array(capacity);
-  /** Per hash the first edge with it; `next` chains the others in the order they came, `last[first]` is where the chain ends. */
-  const first = new globalThis.Map<number, number>();
+  /**
+   * Per hash the first edge with it, in an open-addressing table (-1: free).
+   * `next` chains the others in the order they came, `last[first]` is where
+   * the chain ends; -1 for an edge that is not the first with its hash.
+   */
+  let slots = 1024;
+  while (slots < capacity * 2) slots *= 2;
+  const firstAt = new Int32Array(slots).fill(-1);
+  const hashOf = new Int32Array(capacity);
   const next = new Int32Array(capacity).fill(-1);
-  const last = new Int32Array(capacity);
+  const last = new Int32Array(capacity).fill(-1);
   let count = 0;
   const columns = new globalThis.Map<number, EdgeRef[]>();
-  for (const f of faces) {
+  for (let fi = 0; fi < faces.length; fi++) {
+    const f = faces[fi];
     if (f.n[0] === 0 && f.n[1] === 0 && f.n[2] === 0) continue; // degenerate
-    const { xyz, holes } = f;
+    const { xyz, holes, frame, yOff } = f;
     for (let r = 0, start = f.at; r <= holes.length; r++) {
       const end = f.at + 3 * (r < holes.length ? holes[r] : f.count);
+      // A vertex's millimetres are computed once: an edge starts where the one before ended.
+      const sx = mm(xyz[start]);
+      const sy = mm(xyz[start + 1] + yOff);
+      const sz = mm(xyz[start + 2]);
+      let bx = sx;
+      let by = sy;
+      let bz = sz;
       for (let a = start; a < end; a += 3) {
-        const b = a + 3 === end ? start : a + 3;
-        const ax = mm(xyz[a]);
-        const ay = mm(xyz[a + 1] + f.yOff);
-        const az = mm(xyz[a + 2]);
-        const bx = mm(xyz[b]);
-        const by = mm(xyz[b + 1] + f.yOff);
-        const bz = mm(xyz[b + 2]);
+        const closing = a + 3 === end;
+        const b = closing ? start : a + 3;
+        const ax = bx;
+        const ay = by;
+        const az = bz;
+        bx = closing ? sx : mm(xyz[b]);
+        by = closing ? sy : mm(xyz[b + 1] + yOff);
+        bz = closing ? sz : mm(xyz[b + 2]);
         if (ax === bx && az === bz) {
           const e = edgeRef(f, a, b);
-          if (e) pushTo(columns, hash4(f.frame, ax, az, 0x7c1), e);
+          if (e) pushTo(columns, hash4(frame, ax, az, 0x7c1), e);
           continue;
         }
         const swap = ax > bx || (ax === bx && (ay > by || (ay === by && az > bz)));
@@ -1340,17 +1356,23 @@ function findInnerEdges(faces: Face[]): number {
         ends[o + 3] = swap ? ax : bx;
         ends[o + 4] = swap ? ay : by;
         ends[o + 5] = swap ? az : bz;
-        edgeFace.push(f);
+        edgeFace[count] = fi;
         edgeA[count] = a;
         edgeB[count] = b;
-        const h = hash4(hash4(f.frame, ends[o], ends[o + 1], ends[o + 2]), ends[o + 3], ends[o + 4], ends[o + 5]);
-        const head = first.get(h);
-        if (head === undefined) {
-          first.set(h, count);
-          last[count] = count;
-        } else {
-          next[last[head]] = count;
-          last[head] = count;
+        const h = hash4(hash4(frame, ends[o], ends[o + 1], ends[o + 2]), ends[o + 3], ends[o + 4], ends[o + 5]);
+        hashOf[count] = h;
+        for (let slot = h & (slots - 1); ; slot = (slot + 1) & (slots - 1)) {
+          const head = firstAt[slot];
+          if (head === -1) {
+            firstAt[slot] = count;
+            last[count] = count;
+            break;
+          }
+          if (hashOf[head] === h) {
+            next[last[head]] = count;
+            last[head] = count;
+            break;
+          }
         }
         count++;
       }
@@ -1361,36 +1383,41 @@ function findInnerEdges(faces: Face[]): number {
   let pairs = 0;
   const record = (e: EdgeRef, lo: number, hi: number, g: EdgeRef) => {
     const k = edgeStrength(e.f.n, g.f.n);
-    e.f.inner.push({ key: e, origin: e.origin, dir: e.dir, lo, hi, m: runOff(e), k });
-    g.f.inner.push({ key: g, origin: g.origin, dir: g.dir, lo, hi, m: runOff(g), k });
+    e.m ??= runOff(e.f, e.a, e.b, [0, 0, 0]);
+    g.m ??= runOff(g.f, g.a, g.b, [0, 0, 0]);
+    e.f.inner.push({ edge: e, lo, hi, k });
+    g.f.inner.push({ edge: g, lo, hi, k });
     pairs++;
   };
   /**
-   * An edge on its line, once it pairs (null: degenerate): `refAt` is 1 + its
-   * place in `refs`, 0 while not computed — few edges pair, and an array with
-   * a slot per edge would be a sparse one, slow to write.
+   * An edge on its line, once it is an inner one (null: degenerate): `refAt`
+   * is 1 + its place in `refs`, 0 while not computed — few edges are, and an
+   * array with a slot per edge would be a sparse one, slow to write.
    */
   const refs: (EdgeRef | null)[] = [];
   const refAt = new Int32Array(count);
   const refOf = (i: number) => {
-    if (refAt[i] === 0) refAt[i] = refs.push(edgeRef(edgeFace[i], edgeA[i], edgeB[i]) ?? null);
+    if (refAt[i] === 0) refAt[i] = refs.push(edgeRef(faces[edgeFace[i]], edgeA[i], edgeB[i]) ?? null);
     return refs[refAt[i] - 1];
   };
 
-  // Same end points (a hash may be shared by others: compare them).
-  for (const head of first.values()) {
-    if (next[head] === -1) continue;
+  // Same end points (a hash may be shared by others: compare them). The
+  // firsts in the order they came.
+  for (let head = 0; head < count; head++) {
+    if (last[head] === -1 || next[head] === -1) continue;
     for (let i = head; i !== -1; i = next[i]) {
-      const f = edgeFace[i];
+      const f = faces[edgeFace[i]];
       const o = i * 6;
       for (let j = next[i]; j !== -1; j = next[j]) {
-        const g = edgeFace[j];
+        const g = faces[edgeFace[j]];
         if (g === f || g.frame !== f.frame) continue;
         const q = j * 6;
         if (ends[q] !== ends[o] || ends[q + 1] !== ends[o + 1] || ends[q + 2] !== ends[o + 2] || ends[q + 3] !== ends[o + 3] || ends[q + 4] !== ends[o + 4] || ends[q + 5] !== ends[o + 5]) continue;
+        // The line only for an inner edge: most shared edges are none.
+        if (!isInnerEdge(f, edgeA[i], edgeB[i], g, edgeA[j], edgeB[j])) continue;
         const e = refOf(i);
         const h = refOf(j);
-        if (!e || !h || !isInnerEdge(e, h)) continue;
+        if (!e || !h) continue;
         record(e, e.t0, e.t1, h);
       }
     }
@@ -1407,7 +1434,7 @@ function findInnerEdges(faces: Face[]): number {
         if (g.f === e.f || g.f.frame !== e.f.frame || mm(g.f.xyz[g.a]) !== mm(e.f.xyz[e.a]) || mm(g.f.xyz[g.a + 2]) !== mm(e.f.xyz[e.a + 2])) continue;
         const lo = Math.max(e.t0, g.t0);
         const hi = Math.min(e.t1, g.t1);
-        if (hi - lo < MIN_SHARED_M || !isInnerEdge(e, g)) continue;
+        if (hi - lo < MIN_SHARED_M || !isInnerEdge(e.f, e.a, e.b, g.f, g.a, g.b)) continue;
         record(e, lo, hi, g);
       }
     }
@@ -1464,7 +1491,7 @@ function edgeRef(f: Face, a: number, b: number): EdgeRef | undefined {
   const d: Vec3 = [dx, dy, dz];
   const t0 = x0 * dx + y0 * dy + z0 * dz;
   const origin: Vec3 = [x0 - t0 * dx, y0 - t0 * dy, z0 - t0 * dz];
-  return { f, a, b, dir: d, t0, t1: t0 + len, origin };
+  return { f, a, b, dir: d, t0, t1: t0 + len, origin, m: undefined };
 }
 
 /**
@@ -1495,25 +1522,36 @@ function hash4(a: number, b: number, c: number, d: number): number {
  * each face runs off to the front of the other. Exact, unlike comparing
  * centroids, which fails for large or non-convex faces.
  */
-function isInnerEdge(e: EdgeRef, g: EdgeRef): boolean {
-  const nf = e.f.n;
-  const ng = g.f.n;
+function isInnerEdge(f: Face, fa: number, fb: number, g: Face, ga: number, gb: number): boolean {
+  const nf = f.n;
+  const ng = g.n;
   if (nf[0] * ng[0] + nf[1] * ng[1] + nf[2] * ng[2] > COPLANAR_COS) return false;
-  const me = runOff(e);
-  const mg = runOff(g);
   // Outward normals are the negated Newell normals.
-  const gFront = -(mg[0] * nf[0] + mg[1] * nf[1] + mg[2] * nf[2]);
-  const eFront = -(me[0] * ng[0] + me[1] * ng[1] + me[2] * ng[2]);
-  return gFront > CONCAVE_EPSILON && eFront > CONCAVE_EPSILON;
+  const m = RUN_OFF;
+  runOff(g, ga, gb, m);
+  const gFront = -(m[0] * nf[0] + m[1] * nf[1] + m[2] * nf[2]);
+  runOff(f, fa, fb, m);
+  const fFront = -(m[0] * ng[0] + m[1] * ng[1] + m[2] * ng[2]);
+  return gFront > CONCAVE_EPSILON && fFront > CONCAVE_EPSILON;
 }
 
-/** Unit direction, within the face's plane, in which the face runs off from edge e. */
-function runOff(e: EdgeRef): Vec3 {
-  const { n, xyz } = e.f;
-  const d: Vec3 = [xyz[e.b] - xyz[e.a], xyz[e.b + 1] - xyz[e.a + 1], xyz[e.b + 2] - xyz[e.a + 2]];
-  const m = cross(n, d);
-  const l = Math.hypot(m[0], m[1], m[2]) || 1;
-  return [m[0] / l, m[1] / l, m[2] / l];
+/** Scratch of isInnerEdge: it asks for every pair of faces sharing an edge. */
+const RUN_OFF: Vec3 = [0, 0, 0];
+
+/** Unit direction, within the face's plane, in which face f runs off from its edge a → b (vertex offsets); written to `m`. */
+function runOff(f: Face, a: number, b: number, m: Vec3): Vec3 {
+  const { n, xyz } = f;
+  const d0 = xyz[b] - xyz[a];
+  const d1 = xyz[b + 1] - xyz[a + 1];
+  const d2 = xyz[b + 2] - xyz[a + 2];
+  const m0 = n[1] * d2 - n[2] * d1;
+  const m1 = n[2] * d0 - n[0] * d2;
+  const m2 = n[0] * d1 - n[1] * d0;
+  const l = Math.hypot(m0, m1, m2) || 1;
+  m[0] = m0 / l;
+  m[1] = m1 / l;
+  m[2] = m2 / l;
+  return m;
 }
 
 /**
@@ -1522,11 +1560,11 @@ function runOff(e: EdgeRef): Vec3 {
  */
 function mergedStretches(face: Face): InnerStretch[] {
   if (face.inner.length < 2) return face.inner; // the common case: nothing to merge
-  const byEdge = new globalThis.Map<object, InnerStretch[]>();
+  const byEdge = new globalThis.Map<EdgeRef, InnerStretch[]>();
   for (const s of face.inner) {
-    const list = byEdge.get(s.key);
+    const list = byEdge.get(s.edge);
     if (list) list.push(s);
-    else byEdge.set(s.key, [s]);
+    else byEdge.set(s.edge, [s]);
   }
   const merged: InnerStretch[] = [];
   for (const list of byEdge.values()) {
@@ -1590,20 +1628,22 @@ function registerAoFace(ao: AoAttributes, face: Face, stretches: InnerStretch[])
   const cb = (b0 + b1) / 2;
   const edges: PlaneEdge[] = stretches.map((st) => {
     // The stretch start in the face's base-relative coordinates (the line lives in its height frame).
+    const { origin, dir } = st.edge;
+    const m = st.edge.m!;
     const t = st.lo;
-    const d0 = st.origin[0] + st.dir[0] * t - p0x;
-    const d1 = st.origin[1] + st.dir[1] * t - face.yOff - p0y;
-    const d2 = st.origin[2] + st.dir[2] * t - p0z;
+    const d0 = origin[0] + dir[0] * t - p0x;
+    const d1 = origin[1] + dir[1] * t - face.yOff - p0y;
+    const d2 = origin[2] + dir[2] * t - p0z;
     const a = d0 * e1x + d1 * e1y + d2 * e1z;
     const b = d0 * e2x + d1 * e2y + d2 * e2z;
-    let ua = st.dir[0] * e1[0] + st.dir[1] * e1[1] + st.dir[2] * e1[2];
-    let ub = st.dir[0] * e2[0] + st.dir[1] * e2[1] + st.dir[2] * e2[2];
+    let ua = dir[0] * e1[0] + dir[1] * e1[1] + dir[2] * e1[2];
+    let ub = dir[0] * e2[0] + dir[1] * e2[1] + dir[2] * e2[2];
     const l = Math.hypot(ua, ub) || 1;
     ua /= l;
     ub /= l;
     // Which side of the edge's direction the face lies on (where m points).
-    const ma = st.m[0] * e1[0] + st.m[1] * e1[1] + st.m[2] * e1[2];
-    const mb = st.m[0] * e2[0] + st.m[1] * e2[1] + st.m[2] * e2[2];
+    const ma = m[0] * e1[0] + m[1] * e1[1] + m[2] * e1[2];
+    const mb = m[0] * e2[0] + m[1] * e2[1] + m[2] * e2[2];
     return { a: a - ca, b: b - cb, ua, ub, len: st.hi - st.lo, side: -ub * ma + ua * mb >= 0 ? 1 : -1, k: st.k };
   });
   // How emitFaceAo maps a vertex into the plane (see PLANE).
