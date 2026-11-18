@@ -180,6 +180,12 @@ may grow, else to the one with the least to do.
   when the view comes back — after a pan back, a turn, a zoom out and in again.
   `layer.setTileCache(megabytes)` changes the size later. Tiles that turned out
   to hold nothing for the layer are remembered and not loaded again.
+- **On terrain, tile by tile.** The heights are put onto the terrain on the main
+  thread (baked). When terrain data arrives under a tile, the tile is baked anew
+  only if that changes the ground it stands on — checked at about 256 of its
+  ground columns, to two centimetres; most of what arrives while a map moves is
+  coarser than what the tile stands on already. Tiles are baked one per frame,
+  the nearest to the map centre first, also after the terrain was switched.
 - **Loading ahead.** `layer.preload({ center, zoom, pitch, bearing, padding })`
   loads the tiles that camera would show, without showing them; when the map
   gets there (a jump, the end of a flight) they are on screen at once. The next
@@ -586,8 +592,8 @@ the pitch by 2°), and once more when they stop.
 A rebuild does not block the frame it starts in: it takes at most 3 ms of a frame
 and goes on in the next ones; the instances on screen stay until the new ones are
 complete. The features of a tiled source are read once per tile, not on every
-rebuild (via MapLibre internals; where they are missing, through
-`map.querySourceFeatures` as before).
+rebuild, and a newly loaded tile per slice (via MapLibre internals; where they
+are missing, through `map.querySourceFeatures` as before).
 Positions jump straight to their new location — there is no interpolation between
 updates. `paint`, `layout` and `visibility` are read once when the layer is added;
 custom layers have no `setPaintProperty`.

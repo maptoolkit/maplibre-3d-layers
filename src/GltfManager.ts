@@ -405,6 +405,8 @@ export class GltfManager {
   private buildRaf?: number;
   /** A rebuild was asked for while one was in progress. */
   private buildAgain = false;
+  /** The rebuild to come reads the tiled source first (see workSteps). */
+  private readPending = false;
   /**
    * A tiled source's features per tile, as read once (see readLoadedTiles):
    * `stamp` is the tile's data, `zoom` the zoom its filter was evaluated at.
@@ -607,7 +609,7 @@ export class GltfManager {
     if (this.needsRead) {
       this.needsRead = false;
       if (this.wholeDataset) await this.readGeoJson();
-      else this.features = this.readTiles();
+      else this.readPending = true; // tile by tile, in the slices of the rebuild
       if (this.disposed) return;
       this.needsBuild = true;
     }
@@ -636,13 +638,23 @@ export class GltfManager {
 
   // ---------------------------------------------------------------- features
 
-  /** Vector (and other tiled) sources: whatever is loaded for the viewport. */
-  private readTiles(): RawFeature[] {
-    const perTile = this.readLoadedTiles();
+  /**
+   * Vector (and other tiled) sources: whatever is loaded for the viewport, read
+   * tile by tile with a step after each tile that had to be read (after a jump
+   * all tiles are new: in one piece that blocked for up to 75 ms).
+   */
+  private *readTilesSteps(): Generator<void, void, void> {
+    const perTile = yield* this.readLoadedTiles();
     if (perTile) {
       if (perTile.length === 0) this.warnIfUnconsumed();
-      return perTile;
+      this.features = perTile;
+    } else {
+      this.features = this.readTilesFromMap();
     }
+  }
+
+  /** The same through `map.querySourceFeatures`, where MapLibre's internals are not as readLoadedTiles expects. */
+  private readTilesFromMap(): RawFeature[] {
     // NB: tile pieces of one line/polygon all carry the same feature id, so
     // de-duplication cannot happen here — it happens per generated position.
     const out: RawFeature[] = [];
@@ -681,9 +693,10 @@ export class GltfManager {
    * while a camera in motion changes a tile or two at a time. Goes through
    * MapLibre's internals as its own querySourceFeatures does (the source's
    * renderable tiles, one per data tile, `tile.querySourceFeatures`); undefined
-   * where they are not as expected — the caller then asks the map.
+   * where they are not as expected — the caller then asks the map. Yields after
+   * each tile it had to read.
    */
-  private readLoadedTiles(): RawFeature[] | undefined {
+  private *readLoadedTiles(): Generator<void, RawFeature[] | undefined, void> {
     if (!this.filterIsStatic.state) return undefined;
     interface LoadedTile {
       tileID: { canonical: { key: unknown }; overscaledZ: number };
@@ -703,7 +716,8 @@ export class GltfManager {
       const out: RawFeature[] = [];
       for (const id of manager.getRenderableIds()) {
         const tile = manager.getTileByID(id);
-        if (!tile || typeof tile.querySourceFeatures !== 'function') return undefined;
+        if (!tile) continue; // gone since the list was made (the read goes over several frames)
+        if (typeof tile.querySourceFeatures !== 'function') return undefined;
         const key = tile.tileID.canonical.key;
         if (next.has(key)) continue; // several tiles (overzoomed, wrapped) of the same data
         let entry = this.tileFeatures.get(key);
@@ -717,6 +731,7 @@ export class GltfManager {
             if (!bbox) continue; // unsupported geometry
             entry.features.push({ geometry: f.geometry, bbox, props: f.properties ?? {}, id: f.id });
           }
+          yield;
         }
         next.set(key, entry);
         for (const f of entry.features) out.push(f);
@@ -761,11 +776,11 @@ export class GltfManager {
   // ------------------------------------------------------------------- build
 
   /**
-   * Rebuild the instances (see buildSteps) in slices of BUILD_SLICE_MS per
+   * Rebuild the instances (see workSteps) in slices of BUILD_SLICE_MS per
    * frame, the first right away.
    */
   private runBuild() {
-    const steps = this.buildSteps();
+    const steps = this.workSteps();
     this.building = steps;
     const slice = () => {
       this.buildRaf = undefined;
@@ -783,6 +798,15 @@ export class GltfManager {
       if (this.needsRead || this.needsBuild || this.pendingDemRegions.length || this.hidden()) this.schedule();
     };
     slice();
+  }
+
+  /** A rebuild's steps: reading the tiled source where that is due, then building the instances. */
+  private *workSteps(): Generator<void, void, void> {
+    if (this.readPending) {
+      this.readPending = false;
+      yield* this.readTilesSteps();
+    }
+    yield* this.buildSteps();
   }
 
   /**

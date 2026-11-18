@@ -206,7 +206,7 @@ export interface TileResult {
    * and bottom, the roof above it and the skirt at its foot share columns, so
    * baking samples the terrain once per column instead of once per vertex.
    */
-  column: Uint32Array;
+  column: Uint16Array | Uint32Array;
   /** x, z (tile-local metres) per column. */
   columnXZ: Float32Array;
   /** Uint16 while the tile has at most 65536 vertices (half the bytes), else Uint32. */
@@ -289,9 +289,11 @@ function snorm2x16(a: number, b: number): number {
 }
 
 /** Float32 → IEEE half (bits), rounded to nearest. */
+const HALF_F32 = new Float32Array(1);
+const HALF_U32 = new Uint32Array(HALF_F32.buffer);
 function toHalf(v: number): number {
-  const f = new Float32Array([v]);
-  const x = new Uint32Array(f.buffer)[0];
+  HALF_F32[0] = v;
+  const x = HALF_U32[0];
   const sign = (x >>> 16) & 0x8000;
   const exp = ((x >>> 23) & 0xff) - 127 + 15;
   const mant = x & 0x7fffff;
@@ -452,21 +454,6 @@ interface EdgeRef {
   origin: Vec3;
 }
 
-/** A non-vertical face edge by its end points in millimetres (y in the frame), smaller end first. */
-interface ExactEdge {
-  f: Face;
-  a: P;
-  b: P;
-  x0: number;
-  y0: number;
-  z0: number;
-  x1: number;
-  y1: number;
-  z1: number;
-  /** The edge on its line, once it pairs (undefined: not computed yet, null: degenerate). */
-  ref?: EdgeRef | null;
-}
-
 /** Fill-in timings and counts for benchmarks (not used in rendering). */
 export interface BuildStats {
   parseMs: number;
@@ -587,7 +574,12 @@ class MeshBuilder {
   /** Per vertex its ground column, and per column its x, z. */
   column: number[] = [];
   columnXZ: number[] = [];
-  private readonly columns = new globalThis.Map<number, number>();
+  // The columns by position in whole millimetres, in an open-addressing table
+  // (x, z, column per slot; -1: free): a tile asks millions of times, and a Map
+  // keyed by a number beyond 2^31 costs an allocation per question.
+  private slotX = new Int32Array(4096);
+  private slotZ = new Int32Array(4096);
+  private slotColumn = new Int32Array(4096).fill(-1);
   features: FeatureSpan[] = [];
   ground: GroundEdge[] = [];
 
@@ -597,15 +589,43 @@ class MeshBuilder {
 
   /** The ground column at (x, z), positions within a millimetre sharing one. */
   columnAt(x: number, z: number): number {
-    // Tile-local metres within ±4 km: 23 bits of millimetres each, exact in a double.
-    const key = (Math.round(x * 1000) + 4194304) * 8388608 + (Math.round(z * 1000) + 4194304);
-    let c = this.columns.get(key);
-    if (c === undefined) {
-      c = this.columnXZ.length / 2;
-      this.columns.set(key, c);
-      this.columnXZ.push(x, z);
+    const xi = Math.round(x * 1000) | 0;
+    const zi = Math.round(z * 1000) | 0;
+    let mask = this.slotColumn.length - 1;
+    let h = (Math.imul(xi, 0x9e3779b1) ^ Math.imul(zi, 0x85ebca6b)) >>> 0;
+    h = (h ^ (h >>> 15)) & mask;
+    for (;;) {
+      const c = this.slotColumn[h];
+      if (c === -1) break;
+      if (this.slotX[h] === xi && this.slotZ[h] === zi) return c;
+      h = (h + 1) & mask;
     }
+    const c = this.columnXZ.length / 2;
+    this.columnXZ.push(x, z);
+    this.slotX[h] = xi;
+    this.slotZ[h] = zi;
+    this.slotColumn[h] = c;
+    if ((c + 1) * 2 > this.slotColumn.length) this.growSlots();
     return c;
+  }
+
+  /** Double the table and put the columns into it again. */
+  private growSlots() {
+    const { slotX, slotZ, slotColumn } = this;
+    const size = slotColumn.length * 2;
+    const mask = size - 1;
+    this.slotX = new Int32Array(size);
+    this.slotZ = new Int32Array(size);
+    this.slotColumn = new Int32Array(size).fill(-1);
+    for (let i = 0; i < slotColumn.length; i++) {
+      if (slotColumn[i] === -1) continue;
+      let h = (Math.imul(slotX[i], 0x9e3779b1) ^ Math.imul(slotZ[i], 0x85ebca6b)) >>> 0;
+      h = (h ^ (h >>> 15)) & mask;
+      while (this.slotColumn[h] !== -1) h = (h + 1) & mask;
+      this.slotX[h] = slotX[i];
+      this.slotZ[h] = slotZ[i];
+      this.slotColumn[h] = slotColumn[i];
+    }
   }
 }
 
@@ -791,7 +811,8 @@ export function emitTile(parsed: ParsedTile, skirtRadius = 0, ao = true, stats?:
     aoUV: new Int16Array(out.aoUV),
     aoTables: ao ? out.aoTables.pack() : undefined,
     index: vertexCount <= 65536 ? new Uint16Array(out.indices) : new Uint32Array(out.indices),
-    column: new Uint32Array(out.column),
+    // 16 bit while the tile has at most 65536 columns (half the bytes), like the index.
+    column: out.columnXZ.length / 2 <= 65536 ? new Uint16Array(out.column) : new Uint32Array(out.column),
     features: out.features,
     anchors,
     tileScale,
@@ -1185,7 +1206,21 @@ function terrainAnchors(buildings: Building[], mesh: MeshBuilder): TerrainAnchor
  * Stretches are recorded on both faces. Returns the number of pairs found.
  */
 function findInnerEdges(faces: Face[]): number {
-  const exact = new globalThis.Map<number, ExactEdge[]>();
+  // The non-vertical edges, by their end points in millimetres (y in the frame),
+  // the lexicographically smaller end first, so that both faces of an edge get
+  // one key. In columns (six ints per edge) and chained per hash, not as an
+  // object per edge in a list per hash: a tile has millions of edges.
+  let capacity = 0;
+  for (const f of faces) for (const ring of f.rings) capacity += ring.length;
+  const ends = new Int32Array(capacity * 6);
+  const edgeFace: Face[] = [];
+  const edgeA: P[] = [];
+  const edgeB: P[] = [];
+  /** Per hash the first edge with it; `next` chains the others in the order they came, `last[first]` is where the chain ends. */
+  const first = new globalThis.Map<number, number>();
+  const next = new Int32Array(capacity).fill(-1);
+  const last = new Int32Array(capacity);
+  let count = 0;
   const columns = new globalThis.Map<number, EdgeRef[]>();
   for (const f of faces) {
     if (f.n[0] === 0 && f.n[1] === 0 && f.n[2] === 0) continue; // degenerate
@@ -1204,12 +1239,27 @@ function findInnerEdges(faces: Face[]): number {
           if (e) pushTo(columns, hash4(f.frame, ax, az, 0x7c1), e);
           continue;
         }
-        // From the lexicographically smaller end, so that both faces get one key.
         const swap = ax > bx || (ax === bx && (ay > by || (ay === by && az > bz)));
-        const k: ExactEdge = swap
-          ? { f, a, b, x0: bx, y0: by, z0: bz, x1: ax, y1: ay, z1: az }
-          : { f, a, b, x0: ax, y0: ay, z0: az, x1: bx, y1: by, z1: bz };
-        pushTo(exact, hash4(hash4(f.frame, k.x0, k.y0, k.z0), k.x1, k.y1, k.z1), k);
+        const o = count * 6;
+        ends[o] = swap ? bx : ax;
+        ends[o + 1] = swap ? by : ay;
+        ends[o + 2] = swap ? bz : az;
+        ends[o + 3] = swap ? ax : bx;
+        ends[o + 4] = swap ? ay : by;
+        ends[o + 5] = swap ? az : bz;
+        edgeFace.push(f);
+        edgeA.push(a);
+        edgeB.push(b);
+        const h = hash4(hash4(f.frame, ends[o], ends[o + 1], ends[o + 2]), ends[o + 3], ends[o + 4], ends[o + 5]);
+        const head = first.get(h);
+        if (head === undefined) {
+          first.set(h, count);
+          last[count] = count;
+        } else {
+          next[last[head]] = count;
+          last[head] = count;
+        }
+        count++;
       }
     }
   }
@@ -1221,21 +1271,29 @@ function findInnerEdges(faces: Face[]): number {
     g.f.inner.push({ key: g, origin: g.origin, dir: g.dir, lo, hi, m: runOff(g), k });
     pairs++;
   };
-  const refOf = (k: ExactEdge) => (k.ref === undefined ? (k.ref = edgeRef(k.f, k.a, k.b) ?? null) : k.ref);
+  /** An edge on its line, once it pairs (undefined: not computed yet, null: degenerate). */
+  const refs: (EdgeRef | null | undefined)[] = [];
+  const refOf = (i: number) => {
+    let ref = refs[i];
+    if (ref === undefined) ref = refs[i] = edgeRef(edgeFace[i], edgeA[i], edgeB[i]) ?? null;
+    return ref;
+  };
 
-  // Same end points (a hash bucket may hold others: compare them).
-  for (const list of exact.values()) {
-    if (list.length < 2) continue;
-    for (let i = 0; i < list.length; i++) {
-      const p = list[i];
-      for (let j = i + 1; j < list.length; j++) {
-        const q = list[j];
-        if (q.f === p.f || q.f.frame !== p.f.frame) continue;
-        if (q.x0 !== p.x0 || q.y0 !== p.y0 || q.z0 !== p.z0 || q.x1 !== p.x1 || q.y1 !== p.y1 || q.z1 !== p.z1) continue;
-        const e = refOf(p);
-        const g = refOf(q);
-        if (!e || !g || !isInnerEdge(e, g)) continue;
-        record(e, e.t0, e.t1, g);
+  // Same end points (a hash may be shared by others: compare them).
+  for (const head of first.values()) {
+    if (next[head] === -1) continue;
+    for (let i = head; i !== -1; i = next[i]) {
+      const f = edgeFace[i];
+      const o = i * 6;
+      for (let j = next[i]; j !== -1; j = next[j]) {
+        const g = edgeFace[j];
+        if (g === f || g.frame !== f.frame) continue;
+        const q = j * 6;
+        if (ends[q] !== ends[o] || ends[q + 1] !== ends[o + 1] || ends[q + 2] !== ends[o + 2] || ends[q + 3] !== ends[o + 3] || ends[q + 4] !== ends[o + 4] || ends[q + 5] !== ends[o + 5]) continue;
+        const e = refOf(i);
+        const h = refOf(j);
+        if (!e || !h || !isInnerEdge(e, h)) continue;
+        record(e, e.t0, e.t1, h);
       }
     }
   }
@@ -1390,7 +1448,7 @@ function mergedStretches(face: Face): InnerStretch[] {
  * its plane around the centre of its box. Returns its table index and how to
  * map a vertex into that plane (metres).
  */
-function registerAoFace(out: MeshBuilder, face: Face, stretches: InnerStretch[]): { index: number; toPlane: (p: P) => [number, number] } {
+function registerAoFace(out: MeshBuilder, face: Face, stretches: InnerStretch[]): number {
   const n = face.n;
   const ring = face.rings[0];
   const p0 = ring[0];
@@ -1407,19 +1465,19 @@ function registerAoFace(out: MeshBuilder, face: Face, stretches: InnerStretch[])
     }
   }
   const e2 = cross(n, e1);
-  const raw = (x: number, y: number, z: number): [number, number] => {
-    const d0 = x - p0.x;
-    const d1 = y - p0.y;
-    const d2 = z - p0.z;
-    return [d0 * e1[0] + d1 * e1[1] + d2 * e1[2], d0 * e2[0] + d1 * e2[1] + d2 * e2[2]];
-  };
+  const [e1x, e1y, e1z] = e1;
+  const [e2x, e2y, e2z] = e2;
   let a0 = Infinity;
   let b0 = Infinity;
   let a1 = -Infinity;
   let b1 = -Infinity;
   for (const r of face.rings) {
     for (const p of r) {
-      const [a, b] = raw(p.x, p.y, p.z);
+      const d0 = p.x - p0.x;
+      const d1 = p.y - p0.y;
+      const d2 = p.z - p0.z;
+      const a = d0 * e1x + d1 * e1y + d2 * e1z;
+      const b = d0 * e2x + d1 * e2y + d2 * e2z;
       if (a < a0) a0 = a;
       if (a > a1) a1 = a;
       if (b < b0) b0 = b;
@@ -1428,14 +1486,14 @@ function registerAoFace(out: MeshBuilder, face: Face, stretches: InnerStretch[])
   }
   const ca = (a0 + a1) / 2;
   const cb = (b0 + b1) / 2;
-  const toPlane = (p: P): [number, number] => {
-    const [a, b] = raw(p.x, p.y, p.z);
-    return [a - ca, b - cb];
-  };
   const edges: PlaneEdge[] = stretches.map((st) => {
     // The stretch start in the face's base-relative coordinates (the line lives in its height frame).
     const t = st.lo;
-    const [a, b] = raw(st.origin[0] + st.dir[0] * t, st.origin[1] + st.dir[1] * t - face.yOff, st.origin[2] + st.dir[2] * t);
+    const d0 = st.origin[0] + st.dir[0] * t - p0.x;
+    const d1 = st.origin[1] + st.dir[1] * t - face.yOff - p0.y;
+    const d2 = st.origin[2] + st.dir[2] * t - p0.z;
+    const a = d0 * e1x + d1 * e1y + d2 * e1z;
+    const b = d0 * e2x + d1 * e2y + d2 * e2z;
     let ua = st.dir[0] * e1[0] + st.dir[1] * e1[1] + st.dir[2] * e1[2];
     let ub = st.dir[0] * e2[0] + st.dir[1] * e2[1] + st.dir[2] * e2[2];
     const l = Math.hypot(ua, ub) || 1;
@@ -1446,9 +1504,33 @@ function registerAoFace(out: MeshBuilder, face: Face, stretches: InnerStretch[])
     const mb = st.m[0] * e2[0] + st.m[1] * e2[1] + st.m[2] * e2[2];
     return { a: a - ca, b: b - cb, ua, ub, len: st.hi - st.lo, side: -ub * ma + ua * mb >= 0 ? 1 : -1, k: st.k };
   });
-  const index = out.aoTables.add(edges, [a0 - ca, b0 - cb, a1 - ca, b1 - cb], out.aoRadius);
-  return { index, toPlane };
+  // How emitFace maps a vertex into the plane (see PLANE).
+  PLANE[0] = p0.x;
+  PLANE[1] = p0.y;
+  PLANE[2] = p0.z;
+  PLANE[3] = e1x;
+  PLANE[4] = e1y;
+  PLANE[5] = e1z;
+  PLANE[6] = e2x;
+  PLANE[7] = e2y;
+  PLANE[8] = e2z;
+  PLANE[9] = ca;
+  PLANE[10] = cb;
+  return out.aoTables.add(edges, [a0 - ca, b0 - cb, a1 - ca, b1 - cb], out.aoRadius);
 }
+
+/**
+ * The plane of the face registerAoFace was called for last: a point of it, its
+ * two axes, the centre of the face's box in it. A vertex p lies at
+ * ((p - point) · axis1 - centre1, (p - point) · axis2 - centre2). Kept here
+ * instead of handed back, because that would be an object per face.
+ */
+const PLANE = new Float64Array(11);
+
+/** Scratch of emitFace: a face's outline in 2D for earcut and where its holes start. */
+const FLAT_2D: number[] = [];
+const HOLES: number[] = [];
+const ONE_TRIANGLE = [0, 1, 2];
 
 /** A plane coordinate (m) as an aoUV integer. */
 function uvUnits(v: number): number {
@@ -1459,15 +1541,12 @@ function uvUnits(v: number): number {
 function emitFace(out: MeshBuilder, face: Face) {
   const n = face.n;
   let aoIndex = AO_NO_FACE;
-  let toPlane: ((p: P) => [number, number]) | undefined;
   if (out.withAo) {
     const stretches = mergedStretches(face);
-    if (stretches.length) {
-      const r = registerAoFace(out, face, stretches);
-      aoIndex = r.index;
-      if (aoIndex !== AO_NO_FACE) toPlane = r.toPlane;
-    }
+    if (stretches.length) aoIndex = registerAoFace(out, face, stretches);
   }
+  const inPlane = aoIndex !== AO_NO_FACE;
+  const [px, py, pz, e1x, e1y, e1z, e2x, e2y, e2z, ca, cb] = PLANE;
 
   if (out.aoOnly) {
     // The second pass of a tile whose geometry is out: per vertex, in the same
@@ -1476,18 +1555,39 @@ function emitFace(out: MeshBuilder, face: Face) {
       for (const p of ring) {
         out.column.push(out.columnAt(p.x, p.z));
         out.aoFace.push(aoIndex);
-        if (toPlane) {
-          const [a, b] = toPlane(p);
-          out.aoUV.push(uvUnits(a), uvUnits(b));
+        if (inPlane) {
+          const d0 = p.x - px;
+          const d1 = p.y - py;
+          const d2 = p.z - pz;
+          out.aoUV.push(uvUnits(d0 * e1x + d1 * e1y + d2 * e1z - ca), uvUnits(d0 * e2x + d1 * e2y + d2 * e2z - cb));
         } else out.aoUV.push(0, 0);
       }
     }
     return;
   }
 
+  // The plane ⟂ the normal, for earcut: an axis in it (from an arbitrary
+  // direction, made orthogonal to the normal) and the one across.
+  let x0 = 1.1;
+  let x1 = 1.1;
+  let x2 = 1.1;
+  const d = x0 * n[0] + x1 * n[1] + x2 * n[2];
+  x0 -= n[0] * d;
+  x1 -= n[1] * d;
+  x2 -= n[2] * d;
+  const xl = Math.hypot(x0, x1, x2) || 1;
+  x0 /= xl;
+  x1 /= xl;
+  x2 /= xl;
+  const y0 = n[1] * x2 - n[2] * x1;
+  const y1 = n[2] * x0 - n[0] * x2;
+  const y2 = n[0] * x1 - n[1] * x0;
+
   const polyVertexBase = out.vertexCount;
-  const flat2D: number[] = [];
-  const holes: number[] = [];
+  const flat2D = FLAT_2D;
+  const holes = HOLES;
+  flat2D.length = 0;
+  holes.length = 0;
   for (let r = 0; r < face.rings.length; r++) {
     if (r) holes.push(flat2D.length / 2);
     for (const p of face.rings[r]) {
@@ -1497,16 +1597,17 @@ function emitFace(out: MeshBuilder, face: Face) {
       if (out.withAo) {
         out.aoh.push(dm(p.y));
         out.aoFace.push(aoIndex);
-        if (toPlane) {
-          const [a, b] = toPlane(p);
-          out.aoUV.push(uvUnits(a), uvUnits(b));
+        if (inPlane) {
+          const d0 = p.x - px;
+          const d1 = p.y - py;
+          const d2 = p.z - pz;
+          out.aoUV.push(uvUnits(d0 * e1x + d1 * e1y + d2 * e1z - ca), uvUnits(d0 * e2x + d1 * e2y + d2 * e2z - cb));
         } else out.aoUV.push(0, 0);
       }
-      const q = to2D(p, n);
-      flat2D.push(q[0], q[1]);
+      flat2D.push(p.x * x0 + p.y * x1 + p.z * x2, p.x * y0 + p.y * y1 + p.z * y2);
     }
   }
-  const tri = flat2D.length === 6 ? [0, 1, 2] : earcut(flat2D, holes, 2);
+  const tri = flat2D.length === 6 ? ONE_TRIANGLE : earcut(flat2D, holes, 2);
   for (let t = 0; t < tri.length; t++) out.indices.push(tri[t] + polyVertexBase);
 }
 
@@ -1942,19 +2043,22 @@ function ringCentroid2D(ring: { x: number; y: number }[]): { x: number; y: numbe
  */
 /** All faces of a building id's features as one part. */
 function wholePart(group: SourceFeature[]): Part {
-  const part: Part = { members: [], minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+  const members: Part['members'] = [];
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const feature of group) {
-    part.members.push({ feature, polygons: feature.polygons });
+    members.push({ feature, polygons: feature.polygons });
     for (const polygon of feature.polygons) {
-      for (const v of polygon[0]) {
-        if (v.x < part.minX) part.minX = v.x;
-        if (v.y < part.minY) part.minY = v.y;
-        if (v.x > part.maxX) part.maxX = v.x;
-        if (v.y > part.maxY) part.maxY = v.y;
+      const ring = polygon[0];
+      for (let i = 0; i < ring.length; i++) {
+        const v = ring[i];
+        if (v.x < minX) minX = v.x;
+        if (v.y < minY) minY = v.y;
+        if (v.x > maxX) maxX = v.x;
+        if (v.y > maxY) maxY = v.y;
       }
     }
   }
-  return part;
+  return { members, minX, minY, maxX, maxY };
 }
 
 function connectedParts(group: SourceFeature[], tolerance: number): Part[] {
@@ -2010,6 +2114,7 @@ function connectedParts(group: SourceFeature[], tolerance: number): Part[] {
 }
 
 /** Tile-local vertex → true metres (east, up-above-base, north) from the tile NW corner. */
+/** A vertex in tile units becomes tile-local metres — in place: a tile has millions, and each was an object already. */
 function toTileLocal(
   v: { x: number; y: number; z: number },
   baseZ: number,
@@ -2019,11 +2124,10 @@ function toTileLocal(
 ): P {
   const mx = (v.x / extent) / pow; // mercator offset east of the tile corner
   const my = (v.y / extent) / pow; // mercator offset south of the tile corner
-  return {
-    x: mx / tileScale, // east metres
-    y: (v.z - baseZ) / 10, // decimeters → metres, base at 0 (terrain added later)
-    z: -my / tileScale, // north metres (mercator y grows southward)
-  };
+  v.x = mx / tileScale; // east metres
+  v.y = (v.z - baseZ) / 10; // decimeters → metres, base at 0 (terrain added later)
+  v.z = -my / tileScale; // north metres (mercator y grows southward)
+  return v;
 }
 
 /** Newell's method — face normal robust to non-planar rings. */
@@ -2047,29 +2151,6 @@ function newellNormal(pts: P[]): Vec3 {
 
 function cross(a: Vec3, b: Vec3): Vec3 {
   return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
-}
-
-/** Project a 3D point onto the plane ⟂ normal, giving 2D coords for earcut. */
-function to2D(p: P, n: Vec3): [number, number] {
-  const px = [p.x, p.y, p.z];
-  const x = [1.1, 1.1, 1.1];
-  const d = x[0] * n[0] + x[1] * n[1] + x[2] * n[2];
-  x[0] -= n[0] * d;
-  x[1] -= n[1] * d;
-  x[2] -= n[2] * d;
-  const xl = Math.hypot(x[0], x[1], x[2]) || 1;
-  x[0] /= xl;
-  x[1] /= xl;
-  x[2] /= xl;
-  const y = [
-    n[1] * x[2] - n[2] * x[1],
-    n[2] * x[0] - n[0] * x[2],
-    n[0] * x[1] - n[1] * x[0],
-  ];
-  return [
-    px[0] * x[0] + px[1] * x[1] + px[2] * x[2],
-    px[0] * y[0] + px[1] * y[1] + px[2] * y[2],
-  ];
 }
 
 /** Inverse web-mercator (normalized 0..1) → [lng, lat] degrees. */

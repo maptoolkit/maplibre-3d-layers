@@ -12,6 +12,7 @@ import {
   AO_TEXTURE_WIDTH,
   AO_UV_UNIT_M,
   SKIRT_LIFT_M,
+  boundingSphere,
   flatGroundOfRigid,
   vertexColors,
 } from './mvt3dGeometry';
@@ -35,6 +36,11 @@ interface Transform {
 
 /** Wait this long (ms) at most for the source's layer list before loading tiles of every zoom level. */
 const LAYER_ZOOMS_WAIT_MS = 1500;
+/** A tile's terrain is remembered at about this many of its ground columns (see TileEntry.probes). */
+const TERRAIN_PROBES = 256;
+/** Terrain that differs from those by less than this (metres) at every one of them is the same terrain. */
+const TERRAIN_SAME_M = 0.02;
+
 /** Remember this many tiles that turned out to hold nothing for the layer. */
 const EMPTY_KEYS_MAX = 4096;
 
@@ -442,12 +448,20 @@ interface TileEntry {
   /** The terrain and paint states (see terrainEpoch, colorEpoch) its heights and colours were made for. */
   terrainEpoch?: number;
   colorEpoch?: number;
+  /**
+   * What the tile was last baked onto: the ground height at every n-th of its
+   * columns (0 on a map without terrain, `probeFlat`). New terrain data under
+   * the tile only means a new bake if it changes these — most of what arrives
+   * while a map moves is coarser than what the tile stands on already.
+   */
+  probes?: Float32Array;
+  probeFlat?: boolean;
   /** Per vertex: the worker's y, the height above the feature base (no terrain
    *  yet). x and z never change, so only y is kept for re-baking. */
   baseY?: Float32Array;
   /** Per vertex / skirt vertex its ground column, per column x, z — and the
    *  ground height per column during a bake (NaN = not sampled yet). */
-  column?: Uint32Array;
+  column?: Uint16Array | Uint32Array;
   skirtColumn?: Uint32Array;
   columnXZ?: Float32Array;
   groundCache?: Float32Array;
@@ -542,6 +556,8 @@ export class Fill3DManager implements TileConsumer {
   // rebake on the next animation frame, touching only overlapping building tiles.
   private pendingDemRegions: GeoBounds[] = [];
   private rebakeRafId?: number;
+  /** Tiles whose terrain may have changed: checked, and baked anew if it has, one tile per frame. */
+  private readonly rebakeQueue = new Set<TileEntry>();
 
   // Read from the MapLibre vector source once its TileJSON has loaded.
   private tileTemplate?: string;
@@ -807,7 +823,7 @@ export class Fill3DManager implements TileConsumer {
         // the map still holds the terrain tiles of the view it comes from (coarser
         // ones for this place, as a rule), and tiles it takes from its cache
         // arrive without a `data` event.
-        this.pendingDemRegions.push(kept.bounds);
+        this.rebakeQueue.add(kept);
         this.scheduleRebake();
       } else if (kept.terrainEpoch !== this.terrainEpoch) {
         this.bake(kept);
@@ -1066,6 +1082,7 @@ export class Fill3DManager implements TileConsumer {
     // The columns now include the skirt's.
     entry.columnXZ = result.columnXZ;
     entry.groundCache = undefined;
+    entry.probes = undefined;
     if (result.skirt) this.addSkirt(entry, result.skirt);
     entry.aoSince = performance.now();
     entry.aoFade = 0;
@@ -1371,7 +1388,14 @@ export class Fill3DManager implements TileConsumer {
     }
     attr.needsUpdate = true;
     if (aoAttr) aoAttr.needsUpdate = true;
-    entry.geometry.computeBoundingSphere();
+    entry.geometry.boundingSphere = toSphere(boundingSphere(pos));
+
+    // What it stands on now (see TileEntry.probes).
+    const columns = xz.length / 2;
+    const step = probeStep(columns);
+    const probes = (entry.probes = new Float32Array(Math.ceil(columns / step)));
+    if (!flat) for (let i = 0, c = 0; c < columns; i++, c += step) probes[i] = groundOf(c);
+    entry.probeFlat = flat;
 
     // The skirt lies on the ground, lifted a little against z-fighting.
     if (entry.skirtGeometry && scale) {
@@ -1380,49 +1404,93 @@ export class Fill3DManager implements TileConsumer {
       const sc = entry.skirtColumn!;
       for (let i = 0; i < sc.length; i++) sp[i * 3 + 1] = (flat ? 0 : groundOf(sc[i])) + SKIRT_LIFT_M;
       sAttr.needsUpdate = true;
-      entry.skirtGeometry.computeBoundingSphere();
+      entry.skirtGeometry.boundingSphere = toSphere(boundingSphere(sp));
     }
   }
 
-  /** Rebake every ready tile against the map's current terrain (or none). */
+  /** The terrain was switched on, off or re-set: every tile of the view is baked anew (see rebakeStep). */
   private rebakeAll() {
     this.pendingDemRegions = [];
-    let changed = 0;
     for (const entry of this.tiles.values()) {
       if (entry.state !== 'ready') continue;
-      this.bake(entry);
-      changed++;
+      entry.probes = undefined;
+      this.rebakeQueue.add(entry);
     }
-    if (changed) this.map.triggerRepaint();
+    this.scheduleRebake();
   }
 
-  /** Coalesce a burst of DEM `data` events into one rebake on the next frame. */
+  /** Coalesce a burst of DEM `data` events into one look at the tiles on the next frame. */
   private scheduleRebake() {
     if (this.rebakeRafId !== undefined) return;
-    this.rebakeRafId = requestAnimationFrame(() => {
-      this.rebakeRafId = undefined;
-      this.flushRebake();
-    });
+    this.rebakeRafId = requestAnimationFrame(() => this.rebakeStep());
   }
 
-  /** Rebake only the ready tiles that overlap a DEM tile changed this frame. */
-  private flushRebake() {
+  /**
+   * Bring the tiles onto changed terrain: those that overlap a DEM tile that
+   * has arrived (and those shown again from the kept ones) are queued, and each
+   * frame one of them is baked anew, the nearest to the map centre first — but
+   * only if the terrain under it has changed at all (see onSameTerrain). Baking
+   * every overlapping tile in the frame the DEM tile arrived in blocked a map in
+   * motion again and again (Vienna with terrain, 2026-11-18: 13 tiles in one
+   * frame, 45 frames a tour with over 100 ms of baking), and two thirds of
+   * those bakes moved no vertex: coarser terrain tiles keep arriving for ground
+   * the tile stands on in finer ones.
+   */
+  private rebakeStep() {
+    this.rebakeRafId = undefined;
     const regions = this.pendingDemRegions;
     this.pendingDemRegions = [];
-    if (regions.length === 0) return;
-    this.terrainEpoch++; // kept tiles are baked again when they are shown
+    if (regions.length) {
+      this.terrainEpoch++; // kept tiles are checked when they are shown again
+      for (const entry of this.tiles.values()) {
+        if (entry.state !== 'ready') continue;
+        if (regions.some((r) => overlaps(r, entry.bounds))) this.rebakeQueue.add(entry);
+        else if (!this.rebakeQueue.has(entry)) entry.terrainEpoch = this.terrainEpoch; // the changed terrain is not under this tile
+      }
+    }
+    if (!this.rebakeQueue.size) return;
 
-    let changed = 0;
-    for (const entry of this.tiles.values()) {
-      if (entry.state !== 'ready') continue;
-      if (!regions.some((r) => overlaps(r, entry.bounds))) {
-        entry.terrainEpoch = this.terrainEpoch; // the changed terrain is not under this tile
+    const groundAt = createMercatorElevationSampler(this.map);
+    const centre = MercatorCoordinate.fromLngLat(this.map.getCenter(), 0);
+    let baked = false;
+    while (this.rebakeQueue.size && !baked) {
+      let next: TileEntry | undefined;
+      let nearest = Infinity;
+      for (const entry of this.rebakeQueue) {
+        const d = Math.hypot(entry.tileMx - centre.x, entry.tileMy - centre.y);
+        if (d < nearest) {
+          nearest = d;
+          next = entry;
+        }
+      }
+      this.rebakeQueue.delete(next!);
+      if (next!.state !== 'ready' || next!.mesh?.parent !== this.group) continue; // left the view meanwhile
+      if (this.onSameTerrain(next!, groundAt)) {
+        next!.terrainEpoch = this.terrainEpoch;
         continue;
       }
-      this.bake(entry);
-      changed++;
+      this.bake(next!);
+      baked = true;
     }
-    if (changed) this.map.triggerRepaint();
+    if (baked) this.map.triggerRepaint();
+    if (this.rebakeQueue.size) this.scheduleRebake();
+  }
+
+  /** Whether the terrain under a tile is what it was baked onto (see TileEntry.probes). */
+  private onSameTerrain(entry: TileEntry, groundAt: (mx: number, my: number) => number): boolean {
+    const probes = entry.probes;
+    const xz = entry.columnXZ;
+    const flat = !this.map.terrain;
+    if (!probes || !xz || entry.probeFlat !== flat) return false;
+    if (flat) return true;
+    const scale = entry.tileScale ?? 0;
+    const columns = xz.length / 2;
+    const step = probeStep(columns);
+    for (let i = 0, c = 0; c < columns; i++, c += step) {
+      // Not `>=`: a NaN on either side is a change.
+      if (!(Math.abs(groundAt(entry.tileMx + xz[c * 2] * scale, entry.tileMy - xz[c * 2 + 1] * scale) - probes[i]) < TERRAIN_SAME_M)) return false;
+    }
+    return true;
   }
 
   /** Detach listeners, stop the worker and free all tile geometry. */
@@ -1440,6 +1508,7 @@ export class Fill3DManager implements TileConsumer {
     this.tiles.clear();
     for (const entry of this.kept.values()) this.freeTile(entry);
     this.kept.clear();
+    this.rebakeQueue.clear();
     this.hub?.detach(this.consumerId);
     this.scene.remove(this.group);
     this.scene.remove(this.skirtGroup);
@@ -1463,18 +1532,37 @@ function anchorFits(anchors: TerrainAnchors, groundOf: (column: number) => numbe
   const fits = new Float32Array(groups);
   const diff = new Float32Array(anchors.column.length);
   for (let i = 0; i < diff.length; i++) diff[i] = groundOf(anchors.column[i]) - anchors.height[i];
-  const order: number[] = [];
+  let order = FIT_ORDER;
   for (let g = 0; g < groups; g++) {
-    order.length = 0;
+    const start = anchors.start[g];
+    const n = anchors.start[g + 1] - start;
+    if (n > order.length) order = FIT_ORDER = new Uint32Array(n * 2);
+    // The group's feet by their difference, ascending. Most groups have a
+    // handful of feet: sorted by insertion (stable, like Array.sort); a long
+    // row of houses goes through Array.sort.
     let total = 0;
-    for (let i = anchors.start[g]; i < anchors.start[g + 1]; i++) {
-      order.push(i);
-      total += anchors.weight[i];
+    for (let k = 0; k < n; k++) total += anchors.weight[start + k];
+    if (n <= FIT_INSERTION_MAX) {
+      for (let k = 0; k < n; k++) {
+        const i = start + k;
+        const d = diff[i];
+        let at = k;
+        while (at > 0 && diff[order[at - 1]] > d) {
+          order[at] = order[at - 1];
+          at--;
+        }
+        order[at] = i;
+      }
+    } else {
+      const sorted: number[] = [];
+      for (let k = 0; k < n; k++) sorted.push(start + k);
+      sorted.sort((a, b) => diff[a] - diff[b]);
+      order.set(sorted);
     }
-    order.sort((a, b) => diff[a] - diff[b]);
     let fit = NaN; // a group without feet: its buildings go to their centres
     let sum = 0;
-    for (const i of order) {
+    for (let k = 0; k < n; k++) {
+      const i = order[k];
       sum += anchors.weight[i];
       if (sum >= total / 2) {
         fit = diff[i];
@@ -1484,6 +1572,16 @@ function anchorFits(anchors: TerrainAnchors, groundOf: (column: number) => numbe
     fits[g] = fit;
   }
   return fits;
+}
+
+/** Scratch of anchorFits: a group's feet in order. */
+let FIT_ORDER = new Uint32Array(256);
+/** Groups of at most this many feet are sorted by insertion. */
+const FIT_INSERTION_MAX = 32;
+
+/** Every how many-th ground column of a tile is a terrain probe (see TileEntry.probes). */
+function probeStep(columns: number): number {
+  return Math.max(1, Math.floor(columns / TERRAIN_PROBES));
 }
 
 /** A bounding sphere the worker computed (x, y, z, radius). */
