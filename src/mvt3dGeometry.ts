@@ -303,16 +303,12 @@ function toHalf(v: number): number {
   return h;
 }
 
-/** A face's inner edge in its plane: start, unit direction, length, side (±1), strength. */
-interface PlaneEdge {
-  a: number;
-  b: number;
-  ua: number;
-  ub: number;
-  len: number;
-  side: number;
-  k: number;
-}
+/**
+ * A face's inner edges in its plane come as {@link PLANE_EDGE} numbers each:
+ * start a, b; unit direction ua, ub; length; side (±1); strength. In one
+ * array, not as an object per edge — a tile has hundreds of thousands.
+ */
+const PLANE_EDGE = 7;
 
 /** Collects the AO tables of a tile, face by face. */
 class AoTableBuilder {
@@ -323,38 +319,52 @@ class AoTableBuilder {
   private readonly f32 = new Float32Array(1);
   private readonly u32 = new Uint32Array(this.f32.buffer);
 
-  /** Add a face's edges with its plane box [a0, b0, a1, b1]; returns its index (AO_NO_FACE when full). */
-  add(edges: PlaneEdge[], box: [number, number, number, number], radius: number): number {
+  /**
+   * Add a face's `count` edges (see {@link PLANE_EDGE}) with its plane box
+   * [boxA0, boxB0] to [boxA1, boxB1]; returns its index (AO_NO_FACE when full).
+   */
+  add(edges: Float64Array, count: number, boxA0: number, boxB0: number, boxA1: number, boxB1: number, radius: number): number {
     const index = this.faces.length / 4;
     if (index >= AO_NO_FACE) return AO_NO_FACE;
     const firstEdge = this.edges.length / 4;
-    for (const e of edges) this.edges.push(this.bits(e.a), this.bits(e.b), snorm2x16(e.ua, e.ub), (toHalf(e.len * e.side) | (toHalf(e.k) << 16)) >>> 0);
-    if (edges.length <= AO_DIRECT_EDGES) {
+    for (let o = 0; o < count * PLANE_EDGE; o += PLANE_EDGE) {
+      this.edges.push(
+        this.bits(edges[o]),
+        this.bits(edges[o + 1]),
+        snorm2x16(edges[o + 2], edges[o + 3]),
+        (toHalf(edges[o + 4] * edges[o + 5]) | (toHalf(edges[o + 6]) << 16)) >>> 0,
+      );
+    }
+    if (count <= AO_DIRECT_EDGES) {
       // No grid: the fragment checks them all, straight from the edge table.
-      this.faces.push(0, 65536 * edges.length, 0, firstEdge);
+      this.faces.push(0, 65536 * count, 0, firstEdge);
       return index;
     }
     const firstCell = this.cells.length;
     // The grid origin in whole decimetres (two Int16 in the face entry).
-    const a0 = Math.floor(box[0] * 10) / 10;
-    const b0 = Math.floor(box[1] * 10) / 10;
-    const nx = Math.max(1, Math.ceil((box[2] - a0) / AO_CELL_M));
-    const ny = Math.max(1, Math.ceil((box[3] - b0) / AO_CELL_M));
+    const a0 = Math.floor(boxA0 * 10) / 10;
+    const b0 = Math.floor(boxB0 * 10) / 10;
+    const nx = Math.max(1, Math.ceil((boxA1 - a0) / AO_CELL_M));
+    const ny = Math.max(1, Math.ceil((boxB1 - b0) / AO_CELL_M));
     const lists: number[][] = [];
     for (let c = 0; c < nx * ny; c++) lists.push([]);
     const h = AO_CELL_M / 2;
-    edges.forEach((e, i) => {
+    for (let i = 0; i < count; i++) {
+      const o = i * PLANE_EDGE;
+      const ua = edges[o + 2];
+      const ub = edges[o + 3];
+      const len = edges[o + 4];
       // Its zone (where it can darken): along [-radius, len + radius], up to
       // radius into the face; a little more, so that a fragment on a cell
       // border still finds it.
-      const na = -e.ub * e.side;
-      const nb = e.ua * e.side;
-      const hu = e.len / 2 + radius + AO_CELL_MARGIN_M;
+      const na = -ub * edges[o + 5];
+      const nb = ua * edges[o + 5];
+      const hu = len / 2 + radius + AO_CELL_MARGIN_M;
       const hn = radius / 2 + AO_CELL_MARGIN_M;
-      const ca = e.a + e.ua * (e.len / 2) + na * (radius / 2);
-      const cb = e.b + e.ub * (e.len / 2) + nb * (radius / 2);
-      const ra = hu * Math.abs(e.ua) + hn * Math.abs(na);
-      const rb = hu * Math.abs(e.ub) + hn * Math.abs(nb);
+      const ca = edges[o] + ua * (len / 2) + na * (radius / 2);
+      const cb = edges[o + 1] + ub * (len / 2) + nb * (radius / 2);
+      const ra = hu * Math.abs(ua) + hn * Math.abs(na);
+      const rb = hu * Math.abs(ub) + hn * Math.abs(nb);
       const x0 = Math.max(0, Math.floor((ca - ra - a0) / AO_CELL_M));
       const x1 = Math.min(nx - 1, Math.floor((ca + ra - a0) / AO_CELL_M));
       const y0 = Math.max(0, Math.floor((cb - rb - b0) / AO_CELL_M));
@@ -365,12 +375,12 @@ class AoTableBuilder {
           const da = a0 + (x + 0.5) * AO_CELL_M - ca;
           const db = b0 + (y + 0.5) * AO_CELL_M - cb;
           if (Math.abs(da) > h + ra || Math.abs(db) > h + rb) continue;
-          if (Math.abs(da * e.ua + db * e.ub) > hu + h * (Math.abs(e.ua) + Math.abs(e.ub))) continue;
+          if (Math.abs(da * ua + db * ub) > hu + h * (Math.abs(ua) + Math.abs(ub))) continue;
           if (Math.abs(da * na + db * nb) > hn + h * (Math.abs(na) + Math.abs(nb))) continue;
           lists[y * nx + x].push(i);
         }
       }
-    });
+    }
     for (const list of lists) {
       const n = Math.min(list.length, AO_MAX_PER_CELL);
       this.cells.push(this.lists.length * 256 + n);
@@ -1559,9 +1569,16 @@ function runOff(f: Face, a: number, b: number, m: Vec3): Vec3 {
  * first — e.g. a wall split into storeys meets its neighbour as one stretch.
  */
 function mergedStretches(face: Face): InnerStretch[] {
-  if (face.inner.length < 2) return face.inner; // the common case: nothing to merge
+  const inner = face.inner;
+  if (inner.length < 2) return inner; // the common case: nothing to merge
+  // The next most common: a few stretches, each on an edge of its own.
+  let apart = inner.length <= 8;
+  for (let i = 1; apart && i < inner.length; i++) {
+    for (let j = 0; apart && j < i; j++) apart = inner[j].edge !== inner[i].edge;
+  }
+  if (apart) return inner.slice().sort(longestFirst);
   const byEdge = new globalThis.Map<EdgeRef, InnerStretch[]>();
-  for (const s of face.inner) {
+  for (const s of inner) {
     const list = byEdge.get(s.edge);
     if (list) list.push(s);
     else byEdge.set(s.edge, [s]);
@@ -1581,7 +1598,11 @@ function mergedStretches(face: Face): InnerStretch[] {
     }
     merged.push(cur);
   }
-  return merged.sort((p, q) => q.hi - q.lo - (p.hi - p.lo));
+  return merged.sort(longestFirst);
+}
+
+function longestFirst(p: InnerStretch, q: InnerStretch): number {
+  return q.hi - q.lo - (p.hi - p.lo);
 }
 
 /**
@@ -1595,20 +1616,28 @@ function registerAoFace(ao: AoAttributes, face: Face, stretches: InnerStretch[])
   const p0y = xyz[at + 1];
   const p0z = xyz[at + 2];
   // e1: the outer ring's first edge, made orthogonal to n; e2 = n × e1.
-  let e1: Vec3 = [1, 0, 0];
+  let e1x = 1;
+  let e1y = 0;
+  let e1z = 0;
   for (let o = at + 3, end = at + 3 * outerCount(face); o < end; o += 3) {
-    const d: Vec3 = [xyz[o] - p0x, xyz[o + 1] - p0y, xyz[o + 2] - p0z];
-    const k = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
-    const t: Vec3 = [d[0] - k * n[0], d[1] - k * n[1], d[2] - k * n[2]];
-    const l = Math.hypot(t[0], t[1], t[2]);
+    const d0 = xyz[o] - p0x;
+    const d1 = xyz[o + 1] - p0y;
+    const d2 = xyz[o + 2] - p0z;
+    const k = d0 * n[0] + d1 * n[1] + d2 * n[2];
+    const t0 = d0 - k * n[0];
+    const t1 = d1 - k * n[1];
+    const t2 = d2 - k * n[2];
+    const l = Math.hypot(t0, t1, t2);
     if (l > 1e-6) {
-      e1 = [t[0] / l, t[1] / l, t[2] / l];
+      e1x = t0 / l;
+      e1y = t1 / l;
+      e1z = t2 / l;
       break;
     }
   }
-  const e2 = cross(n, e1);
-  const [e1x, e1y, e1z] = e1;
-  const [e2x, e2y, e2z] = e2;
+  const e2x = n[1] * e1z - n[2] * e1y;
+  const e2y = n[2] * e1x - n[0] * e1z;
+  const e2z = n[0] * e1y - n[1] * e1x;
   let a0 = Infinity;
   let b0 = Infinity;
   let a1 = -Infinity;
@@ -1626,7 +1655,10 @@ function registerAoFace(ao: AoAttributes, face: Face, stretches: InnerStretch[])
   }
   const ca = (a0 + a1) / 2;
   const cb = (b0 + b1) / 2;
-  const edges: PlaneEdge[] = stretches.map((st) => {
+  if (PLANE_EDGES.length < stretches.length * PLANE_EDGE) PLANE_EDGES = new Float64Array(stretches.length * PLANE_EDGE * 2);
+  const edges = PLANE_EDGES;
+  for (let i = 0; i < stretches.length; i++) {
+    const st = stretches[i];
     // The stretch start in the face's base-relative coordinates (the line lives in its height frame).
     const { origin, dir } = st.edge;
     const m = st.edge.m!;
@@ -1636,16 +1668,23 @@ function registerAoFace(ao: AoAttributes, face: Face, stretches: InnerStretch[])
     const d2 = origin[2] + dir[2] * t - p0z;
     const a = d0 * e1x + d1 * e1y + d2 * e1z;
     const b = d0 * e2x + d1 * e2y + d2 * e2z;
-    let ua = dir[0] * e1[0] + dir[1] * e1[1] + dir[2] * e1[2];
-    let ub = dir[0] * e2[0] + dir[1] * e2[1] + dir[2] * e2[2];
+    let ua = dir[0] * e1x + dir[1] * e1y + dir[2] * e1z;
+    let ub = dir[0] * e2x + dir[1] * e2y + dir[2] * e2z;
     const l = Math.hypot(ua, ub) || 1;
     ua /= l;
     ub /= l;
     // Which side of the edge's direction the face lies on (where m points).
-    const ma = m[0] * e1[0] + m[1] * e1[1] + m[2] * e1[2];
-    const mb = m[0] * e2[0] + m[1] * e2[1] + m[2] * e2[2];
-    return { a: a - ca, b: b - cb, ua, ub, len: st.hi - st.lo, side: -ub * ma + ua * mb >= 0 ? 1 : -1, k: st.k };
-  });
+    const ma = m[0] * e1x + m[1] * e1y + m[2] * e1z;
+    const mb = m[0] * e2x + m[1] * e2y + m[2] * e2z;
+    const o = i * PLANE_EDGE;
+    edges[o] = a - ca;
+    edges[o + 1] = b - cb;
+    edges[o + 2] = ua;
+    edges[o + 3] = ub;
+    edges[o + 4] = st.hi - st.lo;
+    edges[o + 5] = -ub * ma + ua * mb >= 0 ? 1 : -1;
+    edges[o + 6] = st.k;
+  }
   // How emitFaceAo maps a vertex into the plane (see PLANE).
   PLANE[0] = p0x;
   PLANE[1] = p0y;
@@ -1658,8 +1697,11 @@ function registerAoFace(ao: AoAttributes, face: Face, stretches: InnerStretch[])
   PLANE[8] = e2z;
   PLANE[9] = ca;
   PLANE[10] = cb;
-  return ao.tables.add(edges, [a0 - ca, b0 - cb, a1 - ca, b1 - cb], ao.radius);
+  return ao.tables.add(edges, stretches.length, a0 - ca, b0 - cb, a1 - ca, b1 - cb, ao.radius);
 }
+
+/** Scratch of registerAoFace: the face's inner edges in its plane (see {@link PLANE_EDGE}). */
+let PLANE_EDGES = new Float64Array(PLANE_EDGE * 64);
 
 /**
  * The plane of the face registerAoFace was called for last: a point of it, its
@@ -2330,10 +2372,6 @@ function newellNormal(xyz: Float64Array, at: number, count: number): Vec3 {
   n[1] /= l;
   n[2] /= l;
   return n;
-}
-
-function cross(a: Vec3, b: Vec3): Vec3 {
-  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 }
 
 /** Inverse web-mercator (normalized 0..1) → [lng, lat] degrees. */
