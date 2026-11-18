@@ -1860,12 +1860,18 @@ function buildSkirt(ground: GroundEdge[], radius: number, columns: Columns): Ski
       [g.az, g.bz] = [g.bz, g.az];
     }
   }
-  // …so a foot's end meets its successor's start at a corner.
-  const key = (x: number, z: number) => `${Math.round(x * 100)},${Math.round(z * 100)}`;
+  // …so a foot's end meets its successor's start at a corner: the same
+  // centimetres. As one number where that is exact — it is for any tile's
+  // metres, and a tile asks tens of thousands of times — else as text.
+  const key = (x: number, z: number) => {
+    const xi = Math.round(x * 100);
+    const zi = Math.round(z * 100);
+    return Math.abs(xi) < 2 ** 25 && Math.abs(zi) < 2 ** 25 ? xi * 2 ** 26 + zi : `${xi},${zi}`;
+  };
   const feet = dropPartyWalls(ground);
 
-  const starts = new globalThis.Map<string, GroundEdge[]>();
-  const ends = new globalThis.Map<string, GroundEdge[]>();
+  const starts = new globalThis.Map<number | string, GroundEdge[]>();
+  const ends = new globalThis.Map<number | string, GroundEdge[]>();
   for (const g of feet) {
     const ks = key(g.ax, g.az);
     const ke = key(g.bx, g.bz);
