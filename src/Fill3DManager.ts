@@ -828,9 +828,11 @@ export class Fill3DManager implements TileConsumer {
         | { tiles?: string[]; minzoom?: number; maxzoom?: number }
         | undefined;
       if (!src) return false;
+      // Known once the source's TileJSON has been read. Not `map.isSourceLoaded`:
+      // that also waits for every tile MapLibre itself loads from the source
+      // for the view, one to two seconds on a view full of buildings.
       const template = src.tiles?.[0];
       if (!template || src.minzoom == null || src.maxzoom == null) return false;
-      if (!this.map.isSourceLoaded(id)) return false;
       this.tileTemplate = template;
       this.minzoom = src.minzoom;
       this.maxzoom = src.maxzoom;

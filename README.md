@@ -163,6 +163,9 @@ Tiles are parsed and triangulated in web workers, several side by side (see
 `workers`): each tile goes to an idle worker, or to a new one while the pool
 may grow, else to the one with the least to do.
 
+- **From the start.** A layer asks for the tiles of the view as soon as the
+  source's TileJSON has been read; it does not wait for the tiles MapLibre itself
+  loads from that source.
 - **One load per tile.** All `Fill3DLayer`s on a source (the buildings and the
   landmarks, say) share a tile's fetch and its pass through a worker, which reads
   the tile once and builds each layer's geometry from it.
