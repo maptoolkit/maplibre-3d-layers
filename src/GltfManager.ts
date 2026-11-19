@@ -271,12 +271,15 @@ interface OwnPoint extends PlacedPoint {
 }
 
 /**
- * What the placement expressions give for a point feature: its instances carry
- * its id and properties, so the values hold until what the expressions read
- * besides those changes (`epoch`, see GltfManager.evalEpoch).
+ * What the placement expressions give for an instance. A point feature's
+ * instances carry its id and properties, a generated one its own id and its
+ * feature's properties (see generatedFor): either way the values hold until
+ * what the expressions read besides those changes (`epoch`, see GltfManager.evalEpoch).
  */
 interface Placed {
   epoch: number;
+  /** The properties it was evaluated with: a generated instance is looked up by its id alone. */
+  props: Record<string, unknown>;
   modelId: string;
   rot: Vec3;
   scl: Vec3;
@@ -448,6 +451,8 @@ export class GltfManager {
   private readonly evalStateRefs: string[];
   private evalKey = '';
   private evalEpoch = 0;
+  /** What the placement expressions gave for the generated instances the last rebuild placed, by instance id (see generatedFor). */
+  private generated = new globalThis.Map<number, Placed>();
   private paintRafId?: number;
   private needsRead = false;
   private needsBuild = false;
@@ -970,6 +975,8 @@ export class GltfManager {
     const candidates: { f: RawFeature; point: PlacedPoint; x: number; y: number; need: number; own: boolean }[] = [];
 
     const groups = new globalThis.Map<string, { recs: Rec[]; colors?: Rgba[]; alphas?: number[] }>();
+    // The generated instances this rebuild places, for the next one (see generatedFor).
+    const generated = new globalThis.Map<number, Placed>();
     const add = (f: RawFeature, point: PlacedPoint): boolean =>
       consider(f, point, point.x !== undefined ? unitX(point.x) : mercX(point.lng), point.y !== undefined ? unitY(point.y) : mercY(point.lat), false);
     const consider = (f: RawFeature, point: PlacedPoint, x: number, y: number, own: boolean): boolean => {
@@ -1000,8 +1007,8 @@ export class GltfManager {
     };
     const place = (f: RawFeature, point: PlacedPoint, x: number, y: number, own: boolean): boolean => {
       const id = point.id;
-      const placed = own ? this.placedFor(f, zoom, state) : undefined;
-      const modelId = placed ? placed.modelId : this.config.modelId(zoom, f.props, id, state);
+      const placed = own ? this.placedFor(f, zoom, state) : this.generatedFor(f, id, zoom, state);
+      const modelId = placed.modelId;
       const model = this.models.get(modelId);
       if (!model) {
         this.warnOnce(
@@ -1035,14 +1042,15 @@ export class GltfManager {
         lat: point.lat,
         east: (x - origin.x) / origin.s,
         north: (origin.y - y) / origin.s,
-        rot: placed ? placed.rot : ([...this.config.rotation(zoom, f.props, id, state)] as Vec3),
-        scl: placed ? placed.scl : ([...this.config.scale(zoom, f.props, id, state)] as Vec3),
-        tr: placed ? placed.tr : ([...this.config.translation(zoom, f.props, id, state)] as Vec3),
+        rot: placed.rot,
+        scl: placed.scl,
+        tr: placed.tr,
         props: f.props,
         id,
       });
-      g.colors?.push(placed ? placed.color! : this.config.color!(zoom, f.props, id, state));
-      g.alphas?.push(placed ? placed.alpha! : this.config.opacity!(zoom, f.props, id, state));
+      g.colors?.push(placed.color!);
+      g.alphas?.push(placed.alpha!);
+      if (!own) generated.set(id, placed);
       return ++count < limit;
     };
 
@@ -1112,6 +1120,7 @@ export class GltfManager {
     // The swap, in one step: the new origin with the instances that stand on it.
     yield;
     this.origin = origin;
+    this.generated = generated;
     for (const [modelId, batch] of this.batches) {
       if (!groups.has(modelId)) this.disposeBatch(modelId, batch);
     }
@@ -1160,12 +1169,30 @@ export class GltfManager {
    * trees while the camera moves.
    */
   private placedFor(f: RawFeature, zoom: number, state: GlobalState): Placed {
-    let p = f.placed;
+    const p = f.placed;
     if (p && p.epoch === this.evalEpoch) return p;
+    return (f.placed = this.evaluate(f, f.id as number, zoom, state));
+  }
+
+  /**
+   * The same for an instance generated along a line or inside a polygon: its id
+   * is a hash of its position, so the values hold for that id and the feature's
+   * properties. Kept from one rebuild to the next (a camera in motion places
+   * mostly the trees it placed before) and only for the instances the last
+   * rebuild placed, at most maxInstances x HARD_STOP_FACTOR: evaluated per
+   * instance and rebuild they were a sixth to a third of a rebuild of woods.
+   */
+  private generatedFor(f: RawFeature, id: number, zoom: number, state: GlobalState): Placed {
+    const p = this.generated.get(id);
+    return p && p.epoch === this.evalEpoch && p.props === f.props ? p : this.evaluate(f, id, zoom, state);
+  }
+
+  /** What the placement expressions give for an instance of `f` with the id `id`, as of now. */
+  private evaluate(f: RawFeature, id: number, zoom: number, state: GlobalState): Placed {
     const c = this.config;
-    const id = f.id as number;
-    p = f.placed = {
+    return {
       epoch: this.evalEpoch,
+      props: f.props,
       modelId: c.modelId(zoom, f.props, id, state),
       rot: [...c.rotation(zoom, f.props, id, state)] as Vec3,
       scl: [...c.scale(zoom, f.props, id, state)] as Vec3,
@@ -1173,7 +1200,6 @@ export class GltfManager {
       color: c.color?.(zoom, f.props, id, state),
       alpha: this.instanceOpacity ? c.opacity!(zoom, f.props, id, state) : undefined,
     };
-    return p;
   }
 
   /**
