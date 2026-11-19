@@ -134,7 +134,8 @@ source also sinks the walls standing on a building's base 10 m below it as a
 reserve for slopes (buildings3d `MTK_BUILDINGS3D_GROUND_DEPTH`); the terrain
 surface hides that reserve. Without terrain the meshes sit on the flat map,
 which hides nothing below it, so the reserve is cut off at the base. Switching
-the terrain on or off re-bakes the loaded tiles. Landmarks are placed in their
+the terrain on or off puts the loaded tiles onto the new ground (see
+[Loading](#loading)); nothing is loaded again. Landmarks are placed in their
 own way, see [Landmarks](#landmarks-models-in-the-tiles).
 
 ### Options
@@ -171,27 +172,29 @@ may grow, else to the one with the least to do.
   not list its `source-layer`, and where its `filter` cannot pass (comparisons of
   `["zoom"]` with a number, also inside `["all", …]`); likewise for `extrusion`.
   With `buildings3d` at zoom 15 only, that is about half of the tiles.
-- **Prepared in the worker.** Colours, and on a map without terrain the final
-  heights and bounds, come ready from the worker; the main thread wraps the
-  buffers and no longer walks the vertices. Arriving tiles are put on the map one
+- **Prepared in the worker.** Colours and bounds come ready from the worker; the
+  main thread wraps the buffers and never walks the vertices. Arriving tiles are put on the map one
   per frame — more where frames take longer than a sixtieth of a second, so a
   slow device does not wait a frame per tile.
-- **Memory.** What goes to the GPU once and is never written again (normals,
-  colours, AO attributes and tables, indices) is not held in memory after its
-  upload; what stays are the positions and what baking onto terrain reads. A
-  Vienna view of 2.7 million vertices holds 63 MB of arrays instead of 129 MB.
+- **Memory.** Every vertex buffer goes to the GPU once and is not held in memory
+  after its upload (positions, normals, colours, AO attributes and tables,
+  indices). What stays are small tables per tile: its ground points, its wall
+  feet, its features. A Vienna view of 2.7 million vertices holds 10 MB of
+  arrays instead of 129 MB.
 - **Tiles are kept.** A tile that leaves the view stays in memory, hidden, within
   `tileCache` megabytes (oldest given up first), and is on screen without loading
   when the view comes back — after a pan back, a turn, a zoom out and in again.
   `layer.setTileCache(megabytes)` changes the size later. Tiles that turned out
   to hold nothing for the layer are remembered and not loaded again.
-- **On terrain, tile by tile.** The heights are put onto the terrain on the main
-  thread (baked). When terrain data arrives under a tile, the tile is baked anew
-  only if that changes the ground it stands on — every height the last bake took
-  from the terrain is sampled again and compared; most of what arrives while a
-  map moves is coarser than what the tile stands on already. Tiles are baked one
-  per frame, the nearest to the map centre first, also after the terrain was
-  switched.
+- **On terrain, tile by tile.** Where a vertex stands is worked out in the vertex
+  shader: from its height as the tile gives it (above its building's base) and
+  two small tables per tile — the terrain height at each of the tile's ground
+  points, and the height each building's base goes to. Putting a tile onto the
+  terrain means sampling the terrain and writing those tables; no vertex is
+  walked or uploaded again. When terrain data arrives under a tile, the terrain
+  is sampled again and compared, exactly; only a change rewrites the tables.
+  Tiles are looked at one per frame, the nearest to the map centre first, also
+  after the terrain was switched on or off.
 - **Loading ahead.** `layer.preload({ center, zoom, pitch, bearing, padding })`
   loads the tiles that camera would show, without showing them; when the map
   gets there (a jump, the end of a flight) they are on screen at once. The next

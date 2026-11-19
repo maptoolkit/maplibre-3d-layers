@@ -11,8 +11,6 @@ import {
   AO_TEXTURE_WIDTH,
   AO_UV_UNIT_M,
   SKIRT_LIFT_M,
-  boundingSphere,
-  flatGroundOfRigid,
   vertexColors,
 } from './mvt3dGeometry';
 import type { ColorEval, OpacityEval, PaintValue } from './paint';
@@ -73,11 +71,47 @@ const AO_FADE_MS = 500;
 // sRGB and outputs directly (no colour-management conversion), like MapLibre.
 // `normal`/`color` are our per-vertex attributes in the (east, up, north) frame;
 // u_lightpos is the style light mapped into that same frame (see syncLight()).
+//
+// Where a vertex stands is worked out here, not on the main thread: `position.y`
+// is its height as the tile gives it, relative to its feature's base, and two
+// small tables per tile say where that goes (see Fill3DManager.bake) — the
+// terrain height per ground column, and per feature the height its base goes to.
+// So new terrain data means sampling the terrain and writing those tables, not
+// walking and uploading every vertex of the tile again.
+const HEIGHT_VERTEX = /* glsl */ `
+  attribute float column;  // the vertex's ground column
+  attribute float feature;
+  uniform highp sampler2D u_ground;   // per column: the terrain height (m); on the flat map the ground under rigid models
+  uniform highp sampler2D u_features; // per feature: (the height its base goes to, 1 for a rigid model)
+  uniform float u_flat;               // 1: this tile stands on a map without terrain
+  uniform float u_ao_reach;           // metres above its base up to which a vertex needs its height above the ground
+  ivec2 heightTexel(float i) {
+    int k = int(i + 0.5);
+    return ivec2(k & ${AO_TEXTURE_WIDTH - 1}, k >> ${AO_TEXTURE_SHIFT});
+  }
+  // x: the vertex's height on the map, y: its height above the ground (m).
+  vec2 heights() {
+    highp float rel = position.y;
+    highp float ground = texelFetch(u_ground, heightTexel(column), 0).r;
+    highp vec2 f = texelFetch(u_features, heightTexel(feature), 0).rg;
+    bool rigid = f.y > 0.5;
+    if (u_flat > 0.5) {
+      // No terrain covers the wall feet sunk below the base: they come up to the map. A rigid model stays as built.
+      highp float y = rigid ? rel : max(rel, 0.0);
+      return vec2(y, rigid ? rel - ground : y);
+    }
+    // A vertex at the base follows the ground down where it drops below the base's height.
+    bool foot = !rigid && rel <= ${BASE_EPSILON_M.toFixed(2)};
+    highp float y = foot ? min(f.x, ground) + rel : rel + f.x;
+    return vec2(y, foot || rel < u_ao_reach ? y - ground : rel);
+  }
+`;
+
 const FILL3D_VERTEX = /* glsl */ `
+  ${HEIGHT_VERTEX}
   attribute vec4 color;
-  // Fake AO: the height above ground (dm); the face's entry in the AO tables and
+  // Fake AO: the face's entry in the AO tables and
   // the position in its plane (units of AO_UV_UNIT_M), see innerEdges().
-  attribute float aoh;
   attribute float aoface;
   attribute vec2 aouv;
   uniform vec3 u_lightpos;
@@ -98,7 +132,9 @@ const FILL3D_VERTEX = /* glsl */ `
   varying highp float v_aoface;
   varying highp vec2 v_aouv;
   void main() {
-    v_aoh = aoh * 0.1;
+    vec2 h = heights();
+    // In whole decimetres, as when this came per vertex from the main thread.
+    v_aoh = clamp(floor(h.y * 10.0 + 0.5), -32766.0, 32766.0) * 0.1;
     v_aoface = aoface;
     v_aouv = aouv * ${AO_UV_UNIT_M};
     float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
@@ -118,7 +154,7 @@ const FILL3D_VERTEX = /* glsl */ `
       vec3(1.0)
     );
     v_color = vec4(lit, color.a * u_opacity);
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position.x, h.x, position.z, 1.0);
   }
 `;
 
@@ -219,10 +255,16 @@ const FILL3D_FRAGMENT = /* glsl */ `
 // only the strongest darkening counts (see SkirtMode).
 const SKIRT_VERTEX = /* glsl */ `
   attribute vec2 coord; // in skirt radii: beyond a free end of the strip, out from the wall foot
+  attribute float column; // the vertex's ground column, as in HEIGHT_VERTEX
+  uniform highp sampler2D u_ground;
+  uniform float u_flat;
   varying vec2 v_coord;
   void main() {
     v_coord = coord;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    int k = int(column + 0.5);
+    // On the ground, lifted a little against z-fighting.
+    float ground = u_flat > 0.5 ? 0.0 : texelFetch(u_ground, ivec2(k & ${AO_TEXTURE_WIDTH - 1}, k >> ${AO_TEXTURE_SHIFT}), 0).r;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position.x, ground + ${SKIRT_LIFT_M.toFixed(2)}, position.z, 1.0);
   }
 `;
 
@@ -305,6 +347,16 @@ function releaseArray(this: THREE.BufferAttribute) {
   (this as unknown as { array: null }).array = null;
 }
 
+/**
+ * An index per vertex (its ground column, its feature) as an attribute the
+ * vertex shader reads as a float. 32-bit integers would be bound as an integer
+ * attribute, which a float input does not accept: they go as floats, exact up
+ * to 2^24.
+ */
+function indexAttribute(index: Uint16Array | Uint32Array): THREE.BufferAttribute {
+  return uploadOnce(new THREE.BufferAttribute(index instanceof Uint32Array ? new Float32Array(index) : index, 1));
+}
+
 /** A table as an integer texture of AO_TEXTURE_WIDTH-texel rows, read with texelFetch. */
 function aoTexture(data: Uint32Array | Uint16Array, channels: 1 | 4): THREE.DataTexture {
   const short = data instanceof Uint16Array;
@@ -345,9 +397,48 @@ function emptyAoTextures(): AoTextures {
   return tablesAsTextures({ faces: new Uint32Array(row(4)), cells: new Uint32Array(row(1)), lists: new Uint16Array(row(1)), edges: new Uint32Array(row(4)) });
 }
 
-function createFill3DMaterial(transparent: boolean, ao: AoTextures): THREE.ShaderMaterial {
+/** Where a tile's vertices stand: the tables its vertex shader reads (see HEIGHT_VERTEX), written by Fill3DManager.bake. */
+interface Heights {
+  /** Per ground column: the terrain height; on the flat map the ground under rigid models, 0 elsewhere. */
+  ground: THREE.DataTexture;
+  /** Per feature: the height its base goes to, and 1 for a rigid model. */
+  features: THREE.DataTexture;
+  /** Written for a map without terrain. */
+  flat: boolean;
+  /** How many ground columns `ground` is written for. */
+  columns: number;
+}
+
+/** Texels for `n` entries of a table that is read with heightTexel(): whole rows. */
+function texels(n: number): number {
+  return Math.max(1, Math.ceil(n / AO_TEXTURE_WIDTH)) * AO_TEXTURE_WIDTH;
+}
+
+/** A table of floats (1 or 2 per entry) as a texture of AO_TEXTURE_WIDTH-texel rows, read with texelFetch. */
+function heightTexture(data: Float32Array, channels: 1 | 2): THREE.DataTexture {
+  const tex = new THREE.DataTexture(data, AO_TEXTURE_WIDTH, data.length / channels / AO_TEXTURE_WIDTH, channels === 1 ? THREE.RedFormat : THREE.RGFormat, THREE.FloatType);
+  tex.internalFormat = channels === 1 ? 'R32F' : 'RG32F';
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/** What the height samplers are bound to while no tile is: one row of zeros each. */
+function emptyHeights(): Heights {
+  return { ground: heightTexture(new Float32Array(texels(1)), 1), features: heightTexture(new Float32Array(texels(1) * 2), 2), flat: true, columns: 0 };
+}
+
+/** The uniforms of HEIGHT_VERTEX; the tables and `u_flat` are swapped per tile (bindTile). */
+function heightUniforms(none: Heights, aoReach: number) {
+  return { u_ground: { value: none.ground }, u_features: { value: none.features }, u_flat: { value: 1 }, u_ao_reach: { value: aoReach } };
+}
+
+function createFill3DMaterial(transparent: boolean, ao: AoTextures, heights: ReturnType<typeof heightUniforms>): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     uniforms: {
+      ...heights,
       u_lightpos: { value: new THREE.Vector3(0.288, 0.996, 0.498) },
       u_lightintensity: { value: 0.5 },
       u_lightcolor: { value: new THREE.Vector3(1, 1, 1) },
@@ -376,18 +467,21 @@ function createFill3DMaterial(transparent: boolean, ao: AoTextures): THREE.Shade
 }
 
 /** The depth pre-pass of a transparent layer: a program that only places the vertices. */
-function createDepthMaterial(): THREE.ShaderMaterial {
+function createDepthMaterial(heights: ReturnType<typeof heightUniforms>): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
-    vertexShader: 'void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    uniforms: heights,
+    vertexShader: `${HEIGHT_VERTEX} void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position.x, heights().x, position.z, 1.0); }`,
     fragmentShader: 'void main() {}',
     side: THREE.BackSide, // as the colour material
     colorWrite: false,
   });
 }
 
-function createSkirtMaterial(): THREE.ShaderMaterial {
+function createSkirtMaterial(none: Heights): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     uniforms: {
+      u_ground: { value: none.ground }, // per tile, like u_flat and u_ao_tile (see bindSkirt)
+      u_flat: { value: 1 },
       u_ao_intensity: { value: 0 },
       u_ao_tile: { value: 0 }, // per tile, see bindSkirt
       u_opacity: { value: 1 },
@@ -485,22 +579,24 @@ interface TileEntry {
   /** The terrain and paint states (see terrainEpoch, colorEpoch) its heights and colours were made for. */
   terrainEpoch?: number;
   colorEpoch?: number;
-  /** Whether it was last baked onto the flat map (no terrain). */
-  bakedFlat?: boolean;
-  /** Per vertex: the worker's y, the height above the feature base (no terrain
-   *  yet). x and z never change, so only y is kept for re-baking. */
-  baseY?: Float32Array;
+  /** How many vertices it has. */
+  vertices?: number;
+  /** Where its vertices stand (see bake). */
+  heights?: Heights;
   /**
-   * Per vertex / skirt vertex its ground column, per column x, z — and what the
-   * tile was last baked onto: the ground height per column and the terrain
-   * height at the centre per feature, each where the bake used it (else NaN).
-   * New terrain data under the tile only means a new bake if it changes one of
-   * these (see terrainMoved).
+   * What the heights are worked out from: x, z per ground column; the bounding
+   * spheres of the geometry and the skirt as the tile gives them (heights
+   * relative to the feature bases); the flat map's ground under rigid models
+   * per column; the terrain height at the centre per feature, where the last
+   * bake used it (else NaN). New terrain data under the tile only means new
+   * heights if it changes what `heights` holds (see terrainMoved).
    */
-  column?: Uint16Array | Uint32Array;
-  skirtColumn?: Uint32Array;
   columnXZ?: Float32Array;
-  groundCache?: Float32Array;
+  /** Per ground column of the geometry: 1 where a vertex needs the terrain height there (the skirt's columns all do). */
+  needed?: Uint8Array;
+  sphere?: Float32Array;
+  skirtSphere?: Float32Array;
+  rigidGround?: Float32Array;
   centreCache?: Float32Array;
   /** The features' vertex spans, and — only if the paint has to be evaluated again on a global-state change — their properties. */
   table?: FeatureTable;
@@ -519,12 +615,15 @@ interface TileEntry {
  * re-anchored and every mesh repositioned — no re-parsing. This keeps float32
  * precision high anywhere on earth (e.g. flying Vienna → Berlin).
  *
- * Vertical placement: the worker emits feature-base-relative heights; this class
- * bakes terrain elevation into the vertex Y — per group of touching buildings
- * fitted to their wall feet, else per feature centre (see bake) — and re-bakes
- * whenever new DEM tiles stream in or the
- * map's terrain is switched. Without terrain the meshes sit on the flat map,
- * nothing below it: the source sinks ground walls 10 m for slopes (see bake).
+ * Vertical placement: the worker emits feature-base-relative heights, and they
+ * stay that way in the buffers; the vertex shader puts them onto the map from
+ * two tables per tile that this class writes (see bake) — the terrain height
+ * per ground column and where each feature's base goes: per group of touching
+ * buildings fitted to their wall feet, else to the terrain at the feature's
+ * centre. The tables are written anew when new DEM tiles under a tile change
+ * its ground, or the map's terrain is switched. Without terrain the meshes sit
+ * on the flat map, nothing below it: the source sinks ground walls 10 m for
+ * slopes (see bake).
  *
  * Loading: tiles come through the source's {@link TileHub} (one fetch and one
  * worker pass per tile for all layers of the source), only from the zoom levels
@@ -578,6 +677,13 @@ export class Fill3DManager implements TileConsumer {
   private readonly depthMaterial: THREE.ShaderMaterial;
   /** Empty AO tables, bound for tiles without inner edges. */
   private readonly aoEmpty: AoTextures;
+  /** Bound while no tile's height tables are (see Heights). */
+  private readonly noHeights: Heights;
+  /**
+   * Fake AO needs a vertex's height above the ground only where it can reach:
+   * up to its radius above the base, plus headroom for the ground falling away on a slope.
+   */
+  private readonly aoReach: number;
   private readonly config: Fill3DConfig;
   private readonly onData: (ev: unknown) => void;
   private readonly onMoveEnd: () => void;
@@ -629,11 +735,13 @@ export class Fill3DManager implements TileConsumer {
     // Shades like MapLibre's fill-extrusion (flat directional ramp). Per-vertex
     // sRGB colour (fill-3d-color) + alpha (fill-3d-opacity) via the `color` attr.
     this.aoEmpty = emptyAoTextures();
-    this.material = createFill3DMaterial(config.transparent, this.aoEmpty);
+    this.noHeights = emptyHeights();
+    const aoReach = (this.aoReach = this.aoEnabled ? config.ao.radius + 10 : -1e9);
+    this.material = createFill3DMaterial(config.transparent, this.aoEmpty, heightUniforms(this.noHeights, aoReach));
     this.blends = config.transparent;
-    this.depthMaterial = createDepthMaterial();
+    this.depthMaterial = createDepthMaterial(heightUniforms(this.noHeights, aoReach));
     this.material.uniforms.u_ao_radius.value = config.ao.radius;
-    this.skirtMaterial = createSkirtMaterial();
+    this.skirtMaterial = createSkirtMaterial(this.noHeights);
 
 
     // DEM tiles stream in → re-bake feature heights against the new terrain.
@@ -983,43 +1091,55 @@ export class Fill3DManager implements TileConsumer {
     entry.geometry?.dispose();
     entry.skirtGeometry?.dispose();
     if (entry.ao) for (const t of Object.values(entry.ao)) t.dispose();
+    entry.heights?.ground.dispose();
+    entry.heights?.features.dispose();
   }
 
-  /** Bind a tile's AO tables to the shared material before its mesh draws. */
-  private bindAo(entry: TileEntry) {
-    const t = entry.ao ?? this.aoEmpty;
-    const fade = entry.aoFade ?? 0;
-    const u = this.material.uniforms;
-    if (u.u_ao_faces.value === t.faces && u.u_ao_tile.value === fade) return;
-    u.u_ao_tile.value = fade;
-    u.u_ao_faces.value = t.faces;
-    u.u_ao_cells.value = t.cells;
-    u.u_ao_lists.value = t.lists;
-    u.u_ao_edges.value = t.edges;
-    this.material.uniformsNeedUpdate = true;
+  /**
+   * Bind what is a tile's own to the material that is about to draw its mesh
+   * (the colour material, or the depth pre-pass's): its height tables, and for
+   * the colour pass its AO tables.
+   */
+  private bindTile(entry: TileEntry, material: THREE.Material) {
+    const shader = material as THREE.ShaderMaterial;
+    const u = shader.uniforms;
+    const h = entry.heights ?? this.noHeights;
+    u.u_ground.value = h.ground;
+    u.u_features.value = h.features;
+    u.u_flat.value = h.flat ? 1 : 0;
+    if (material === this.material) {
+      const t = entry.ao ?? this.aoEmpty;
+      u.u_ao_tile.value = entry.aoFade ?? 0;
+      u.u_ao_faces.value = t.faces;
+      u.u_ao_cells.value = t.cells;
+      u.u_ao_lists.value = t.lists;
+      u.u_ao_edges.value = t.edges;
+    }
+    shader.uniformsNeedUpdate = true;
   }
 
-  /** The tile's AO fade for its skirt, before the skirt draws. */
+  /** The tile's ground heights and AO fade for its skirt, before the skirt draws. */
   private bindSkirt(entry: TileEntry) {
-    const fade = entry.aoFade ?? 0;
     const u = this.skirtMaterial.uniforms;
-    if (u.u_ao_tile.value === fade) return;
-    u.u_ao_tile.value = fade;
+    const h = entry.heights ?? this.noHeights;
+    u.u_ground.value = h.ground;
+    u.u_flat.value = h.flat ? 1 : 0;
+    u.u_ao_tile.value = entry.aoFade ?? 0;
     this.skirtMaterial.uniformsNeedUpdate = true;
   }
 
   /** A tile's ground skirt (not in the scene yet, see show). */
   private addSkirt(entry: TileEntry, skirt: SkirtResult) {
     const sg = new THREE.BufferGeometry();
-    sg.setAttribute('position', new THREE.BufferAttribute(skirt.position, 3));
+    sg.setAttribute('position', uploadOnce(new THREE.BufferAttribute(skirt.position, 3)));
     sg.setAttribute('coord', uploadOnce(new THREE.BufferAttribute(skirt.coord, 2, true)));
+    sg.setAttribute('column', indexAttribute(skirt.column));
     sg.setIndex(uploadOnce(new THREE.BufferAttribute(skirt.index, 1)));
     const skirtMesh = new THREE.Mesh(sg, this.skirtMaterial);
     skirtMesh.frustumCulled = true;
     skirtMesh.onBeforeRender = () => this.bindSkirt(entry);
     entry.skirtMesh = skirtMesh;
     entry.skirtGeometry = sg;
-    entry.skirtColumn = skirt.column;
   }
 
   /** What a tile is to be made of, as its worker needs to know it. */
@@ -1039,8 +1159,8 @@ export class Fill3DManager implements TileConsumer {
         opacity: c.opacitySpec,
         zoom: this.map.getZoom(),
         globalState: { ...globalStateOf(this.map) },
-        flat: !this.map.terrain,
         properties: this.repaints,
+        aoReach: this.aoReach,
       },
     };
   }
@@ -1078,8 +1198,7 @@ export class Fill3DManager implements TileConsumer {
     const entry = shown ?? this.kept.get(result.key);
     if (!entry || entry.state !== 'loading' || entry.seq !== result.seq) return; // given up mid-flight
 
-    // The worker has done the per-vertex work (colours, on a map without terrain
-    // the heights and the bounds): nothing of that here.
+    // The worker has done the per-vertex work (the colours, the bounds): nothing of that here.
     const prepared = result.prepared;
     if (result.index.length === 0 || !prepared) {
       entry.state = 'empty';
@@ -1092,12 +1211,19 @@ export class Fill3DManager implements TileConsumer {
 
     entry.table = prepared.table;
     entry.properties = prepared.properties;
-    // The base-relative Y, kept for re-baking (bake() overwrites it in `position`).
-    entry.baseY = prepared.baseY;
+    entry.vertices = result.position.length / 3;
+    entry.sphere = prepared.sphere;
+    entry.skirtSphere = prepared.skirtSphere;
+    entry.rigidGround = prepared.rigidGround;
+    entry.needed = prepared.needed;
 
+    // The heights in `position` stay relative to the features' bases: where they
+    // go is the vertex shader's part (see bake), so nothing here is written again.
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(result.position, 3));
+    geometry.setAttribute('position', uploadOnce(new THREE.BufferAttribute(result.position, 3)));
     geometry.setAttribute('normal', uploadOnce(new THREE.BufferAttribute(result.normal, 3, true)));
+    geometry.setAttribute('column', indexAttribute(result.column));
+    geometry.setAttribute('feature', indexAttribute(prepared.feature));
     entry.geometry = geometry;
     if (entry.colorEpoch === this.colorEpoch) {
       geometry.setAttribute('color', uploadOnce(new THREE.BufferAttribute(prepared.color, 4, true)));
@@ -1105,39 +1231,30 @@ export class Fill3DManager implements TileConsumer {
     } else {
       this.recolor(entry); // the global state the worker's colours were made for has changed
     }
-    // Integers, read as floats (not normalized). Without AO the worker sends
-    // none (the shader then reads a constant and skips the AO anyway).
-    if (result.aoh.length) {
-      geometry.setAttribute('aoh', new THREE.BufferAttribute(result.aoh, 1));
+    // Without AO the worker sends none (the shader then reads a constant and skips the AO anyway).
+    if (result.aoFace.length) {
       geometry.setAttribute('aoface', uploadOnce(new THREE.BufferAttribute(result.aoFace, 1)));
       geometry.setAttribute('aouv', uploadOnce(new THREE.BufferAttribute(result.aoUV, 2)));
+      entry.aoFade = 1; // AO data in one go: nothing to fade in
+    } else {
+      entry.aoDue = entry.aoLater;
     }
     if (result.aoTables) entry.ao = aoTextures(result.aoTables);
-    if (result.aoh.length) entry.aoFade = 1; // AO data in one go: nothing to fade in
-    else entry.aoDue = entry.aoLater;
     geometry.setIndex(uploadOnce(new THREE.BufferAttribute(result.index, 1)));
 
     const mesh = new THREE.Mesh(geometry, this.material);
     mesh.frustumCulled = true;
-    mesh.onBeforeRender = () => this.bindAo(entry);
+    mesh.onBeforeRender = (_renderer, _scene, _camera, _geometry, material) => this.bindTile(entry, material);
 
     if (result.skirt) this.addSkirt(entry, result.skirt);
 
     entry.state = 'ready';
     entry.tileScale = result.tileScale;
     entry.mesh = mesh;
-    entry.column = result.column;
     entry.columnXZ = result.columnXZ;
     entry.anchors = result.anchors;
 
-    if (prepared.flat && !this.map.terrain) {
-      geometry.boundingSphere = toSphere(prepared.flat.sphere);
-      if (entry.skirtGeometry && prepared.flat.skirtSphere) entry.skirtGeometry.boundingSphere = toSphere(prepared.flat.skirtSphere);
-      entry.terrainEpoch = this.terrainEpoch;
-      entry.bakedFlat = true;
-    } else {
-      this.bake(entry);
-    }
+    this.bake(entry);
     entry.bytes = bytesOf(entry);
     if (shown) {
       this.show(entry);
@@ -1157,30 +1274,25 @@ export class Fill3DManager implements TileConsumer {
   onAoParsed(result: AoResult) {
     const shown = this.tiles.get(result.key);
     const entry = shown ?? this.kept.get(result.key);
-    if (!entry || entry.state !== 'ready' || !entry.geometry || !entry.baseY || entry.seq !== result.seq) return; // given up meanwhile
+    if (!entry || entry.state !== 'ready' || !entry.geometry || entry.vertices === undefined || entry.seq !== result.seq) return; // given up meanwhile
     entry.aoDue = false;
-    const vertexCount = entry.baseY.length;
-    if (result.aoFace.length !== vertexCount || entry.aoFade !== undefined) {
+    if (result.aoFace.length !== entry.vertices || entry.aoFade !== undefined) {
       if (entry.aoFade === undefined) console.warn(`Fill3DLayer: AO data of tile ${result.key} does not fit its geometry — ignored`);
       return;
     }
-    // On a map without terrain the worker has the heights above the ground already.
-    const flatDone = result.aoh?.length === vertexCount && !this.map.terrain && entry.terrainEpoch === this.terrainEpoch;
-    entry.geometry.setAttribute('aoh', new THREE.BufferAttribute(flatDone ? result.aoh! : new Int16Array(vertexCount), 1)); // else filled by bake
     entry.geometry.setAttribute('aoface', uploadOnce(new THREE.BufferAttribute(result.aoFace, 1)));
     entry.geometry.setAttribute('aouv', uploadOnce(new THREE.BufferAttribute(result.aoUV, 2)));
     if (result.aoTables) entry.ao = aoTextures(result.aoTables);
-    // The columns now include the skirt's.
+    // The columns now include the skirt's (after the ones there were).
     entry.columnXZ = result.columnXZ;
-    if (result.skirt) this.addSkirt(entry, result.skirt);
+    if (result.skirt) {
+      this.addSkirt(entry, result.skirt);
+      entry.skirtSphere = result.skirtSphere;
+    }
     entry.aoSince = performance.now();
     entry.aoFade = 0;
-
-    if (flatDone) {
-      if (entry.skirtGeometry && result.skirtSphere) entry.skirtGeometry.boundingSphere = toSphere(result.skirtSphere);
-    } else {
-      this.bake(entry);
-    }
+    // Only the new columns' heights are missing.
+    this.bake(entry, 'columns');
     const bytes = bytesOf(entry);
     if (shown) {
       this.show(entry);
@@ -1200,10 +1312,10 @@ export class Fill3DManager implements TileConsumer {
    * blending whatever the opacity uniform says.
    */
   private recolor(entry: TileEntry) {
-    if (!entry.geometry || !entry.baseY || !entry.table) return;
+    if (!entry.geometry || entry.vertices === undefined || !entry.table) return;
     const { color, opacity } = this.config;
     const properties = entry.properties ?? NO_PROPERTIES;
-    const colors = vertexColors(entry.baseY.length, entry.table, properties, color, opacity, this.map.getZoom(), globalStateOf(this.map));
+    const colors = vertexColors(entry.vertices, entry.table, properties, color, opacity, this.map.getZoom(), globalStateOf(this.map));
     entry.geometry.setAttribute('color', uploadOnce(new THREE.BufferAttribute(colors.color, 4, true)));
     entry.translucent = colors.translucent;
     entry.colorEpoch = this.colorEpoch;
@@ -1386,140 +1498,129 @@ export class Fill3DManager implements TileConsumer {
   }
 
   /**
-   * Add terrain elevation to each vertex Y: the height the building's base goes
-   * to everywhere, except that vertices at its base follow the ground down where
-   * it drops below that — so the downhill walls of a building on a slope reach
-   * the ground instead of floating. (fill-extrusion sinks the base 10 m
-   * instead; these meshes aren't hidden by terrain, so that would show.)
+   * Put a tile onto the map: write the two tables its vertex shader works the
+   * heights out from (see HEIGHT_VERTEX) — the terrain height per ground column
+   * and, per feature, the height its base goes to. Every vertex goes to its
+   * base's height plus its own above the base, except that vertices at the base
+   * follow the ground down where it drops below that — so the downhill walls of
+   * a building on a slope reach the ground instead of floating. (fill-extrusion
+   * sinks the base 10 m instead; these meshes aren't hidden by terrain, so that
+   * would show.)
    *
    * Where the base goes: for a building in a group of touching buildings (the
    * source gives their heights in one frame) to its base height plus the group's
    * terrain fit (see anchorFits) — neighbours stay as they stand to each other in
-   * the data; for any other building to the terrain height at its centre.
+   * the data; for any other building to the terrain height at its centre. A
+   * rigid model (a landmark built against the terrain around its anchor) goes to
+   * the terrain height at that anchor as one body, like a GltfLayer model: its
+   * feet reach below the ground on purpose, nothing follows the ground down.
    *
    * The source itself sinks the walls standing on a building's base 10 m below
    * it as a reserve for slopes (buildings3d `MTK_BUILDINGS3D_GROUND_DEPTH`): the
    * only vertices below the base. The terrain surface covers that reserve. The
    * flat map covers nothing, so without terrain those vertices come up to the
-   * base — else every wall shows 10 m too deep on a pitched map.
+   * base — else every wall shows 10 m too deep on a pitched map. There the
+   * ground table holds what the map shows under rigid models (their lowest
+   * points, for the fake AO at their feet) and nothing is sampled.
    *
-   * `sampled`: the terrain heights the tile keeps (see TileEntry.groundCache)
-   * are the terrain's as it is — terrainMoved has just sampled them — and are
-   * used as they are.
+   * `how`: 'sampled' — terrainMoved has just sampled the terrain heights the
+   * tile holds, they are used as they are; 'columns' — the tile only got more
+   * ground columns (the skirt's, with its AO data): their heights are sampled
+   * and nothing else is touched (terrain that has changed meanwhile is the
+   * pending check's business).
    */
-  private bake(entry: TileEntry, sampled = false) {
-    if (!entry.geometry || !entry.baseY || !entry.table) return;
+  private bake(entry: TileEntry, how: 'fresh' | 'sampled' | 'columns' = 'fresh') {
+    const { geometry, table, columnXZ: xz, sphere } = entry;
+    if (!geometry || !table || !xz || !sphere) return;
     entry.terrainEpoch = this.terrainEpoch;
-    const table = entry.table;
-    const attr = entry.geometry.getAttribute('position') as THREE.BufferAttribute;
-    const pos = attr.array as Float32Array;
-    const baseY = entry.baseY;
-    const aoAttr = entry.geometry.getAttribute('aoh') as THREE.BufferAttribute | undefined;
-    const ao = aoAttr?.array as Int16Array | undefined;
     const flat = !this.map.terrain;
-    const elevationAt = createElevationSampler(this.map);
-    const groundAt = createMercatorElevationSampler(this.map);
-    const scale = entry.tileScale ?? 0;
-    // The terrain under a vertex, sampled once per ground column: a wall's top
-    // and bottom, the roof above it and the skirt at its foot share one.
-    const column = entry.column!;
-    const xz = entry.columnXZ!;
-    // Kept as 32-bit floats and read back as such, so a bake from kept heights
-    // gives what a bake from fresh ones does.
-    let cache = entry.groundCache;
-    let centres = entry.centreCache;
-    if (!sampled || !cache || !centres || cache.length !== xz.length / 2) {
-      cache = entry.groundCache = new Float32Array(xz.length / 2).fill(NaN);
-      centres = entry.centreCache = new Float32Array(table.start.length).fill(NaN);
-    }
-    entry.bakedFlat = flat;
-    const groundOf = (c: number) => {
-      let g = cache[c];
-      if (g !== g) {
-        cache[c] = groundAt(entry.tileMx + xz[c * 2] * scale, entry.tileMy - xz[c * 2 + 1] * scale);
-        g = cache[c];
-      }
-      return g;
-    };
-    // The terrain at a feature's centre (its anchor, for a rigid model).
-    const centreOf = (i: number) => {
-      let e = centres[i];
-      if (e !== e) {
-        centres[i] = elevationAt(table.lng[i], table.lat[i]);
-        e = centres[i];
-      }
-      return e;
-    };
-    // Fake AO needs each vertex's height above the ground, but only where it can
-    // reach: up to its radius, plus headroom for the ground falling away on a slope.
-    const aoReach = this.aoEnabled ? this.config.ao.radius + 10 : -Infinity;
-    const fits = flat || !scale || !entry.anchors ? undefined : anchorFits(entry.anchors, groundOf);
-    // The flat map's ground under the vertices of rigid models.
-    const rigidGround = flat && ao ? flatGroundOfRigid(table, column, baseY, xz.length / 2) : undefined;
-    let moved = false;
+    const columns = xz.length / 2;
+    const count = table.start.length;
 
-    for (let i = 0; i < table.start.length; i++) {
-      const start = table.start[i];
-      const end = start + table.count[i];
-      if (table.rigid[i]) {
-        // A model built against the terrain around its anchor
-        // (b.lng, b.lat) goes to the terrain height there as one rigid body, like a
-        // GltfLayer model. Its feet reach below the ground on purpose (the generator's
-        // skirt, lower ground than at the anchor): nothing follows the ground down,
-        // and on the flat map nothing is clamped — what lies below it shows through.
-        const ele = flat ? 0 : centreOf(i);
-        for (let v = start; v < end; v++) {
-          const rel = baseY[v];
-          const y = rel + ele;
-          if (pos[v * 3 + 1] !== Math.fround(y)) {
-            pos[v * 3 + 1] = y;
-            moved = true;
-          }
-          if (!ao) continue;
-          const aboveGround = rigidGround ? rel - rigidGround[column[v]] : !flat && scale && rel < aoReach ? y - groundOf(column[v]) : rel;
-          ao[v] = Math.max(-32766, Math.min(32766, Math.round(aboveGround * 10)));
-        }
-        continue;
+    // The tables; the ground's grows with the columns.
+    let h = entry.heights;
+    const keep = how !== 'fresh' && !flat && h !== undefined && !h.flat;
+    const columnsOnly = keep && how === 'columns';
+    const known = keep ? Math.min(h!.columns, columns) : 0;
+    if (!h || (h.ground.image.data as Float32Array).length < columns) {
+      const grown = new Float32Array(texels(columns));
+      if (h) {
+        grown.set((h.ground.image.data as Float32Array).subarray(0, known));
+        h.ground.dispose();
       }
-      const fit = fits && table.anchor[i] >= 0 ? fits[table.anchor[i]] : NaN;
-      const ele = flat ? 0 : fit === fit ? table.base[i] + fit : centreOf(i);
-      for (let v = start; v < end; v++) {
-        const rel = baseY[v];
-        let y: number;
-        let aboveGround: number;
-        if (flat) {
-          y = Math.max(rel, 0);
-          aboveGround = y;
-        } else if (scale && (rel <= BASE_EPSILON_M || rel < aoReach)) {
-          const ground = groundOf(column[v]);
-          y = rel <= BASE_EPSILON_M ? Math.min(ele, ground) + rel : rel + ele;
-          aboveGround = y - ground;
+      h = entry.heights = {
+        ground: heightTexture(grown, 1),
+        features: h?.features ?? heightTexture(new Float32Array(texels(count) * 2), 2),
+        flat,
+        columns,
+      };
+    }
+    h.flat = flat;
+    h.columns = columns;
+    const ground = h.ground.image.data as Float32Array;
+    const features = h.features.image.data as Float32Array;
+
+    // How far the vertices go up from the heights they came with (for the bounds), and the ground's range.
+    let low = 0;
+    let high = 0;
+    let groundLow = 0;
+    let groundHigh = 0;
+    const needed = entry.needed;
+    if (flat) {
+      ground.fill(0);
+      if (entry.rigidGround) ground.set(entry.rigidGround);
+      for (let i = 0; i < count; i++) {
+        features[i * 2] = 0;
+        features[i * 2 + 1] = table.rigid[i];
+      }
+    } else {
+      // The terrain under a vertex, sampled once per ground column: a wall's top
+      // and bottom, the roof above it and the skirt at its foot share one.
+      // Only where a vertex needs it: the columns of roof points high above the ground are left out.
+      if (known < columns) {
+        const groundAt = createMercatorElevationSampler(this.map);
+        const scale = entry.tileScale ?? 0;
+        for (let c = known; c < columns; c++) {
+          if (needed && c < needed.length && !needed[c]) continue;
+          ground[c] = groundAt(entry.tileMx + xz[c * 2] * scale, entry.tileMy - xz[c * 2 + 1] * scale);
+        }
+      }
+      let centres = entry.centreCache;
+      if (!keep || !centres) centres = entry.centreCache = new Float32Array(count).fill(NaN);
+      const elevationAt = createElevationSampler(this.map);
+      const fits = entry.anchors && !columnsOnly ? anchorFits(entry.anchors, ground) : undefined;
+      low = groundLow = Infinity;
+      high = groundHigh = -Infinity;
+      for (let i = 0; i < count && !columnsOnly; i++) {
+        const fit = fits && !table.rigid[i] && table.anchor[i] >= 0 ? fits[table.anchor[i]] : NaN;
+        if (fit === fit) {
+          features[i * 2] = table.base[i] + fit;
         } else {
-          y = rel + ele;
-          aboveGround = rel; // out of AO reach (or AO off): any value beyond the radius
+          // The terrain at the feature's centre (its anchor, for a rigid model).
+          if (centres[i] !== centres[i]) centres[i] = elevationAt(table.lng[i], table.lat[i]);
+          features[i * 2] = centres[i];
         }
-        if (pos[v * 3 + 1] !== Math.fround(y)) {
-          pos[v * 3 + 1] = y;
-          moved = true;
-        }
-        if (ao) ao[v] = Math.max(-32766, Math.min(32766, Math.round(aboveGround * 10)));
+        features[i * 2 + 1] = table.rigid[i];
+        const to = features[i * 2];
+        if (to < low) low = to;
+        if (to > high) high = to;
       }
+      for (let c = 0; c < columns; c++) {
+        if (needed && c < needed.length && !needed[c]) continue;
+        const g = ground[c];
+        if (g < groundLow) groundLow = g;
+        if (g > groundHigh) groundHigh = g;
+      }
+      if (!(low <= high)) low = high = 0;
+      if (!(groundLow <= groundHigh)) groundLow = groundHigh = 0;
     }
-    // Heights that stayed as they were (a tile that stands already gets its AO data) are not uploaded again.
-    if (moved || !entry.geometry.boundingSphere) {
-      attr.needsUpdate = true;
-      entry.geometry.boundingSphere = toSphere(boundingSphere(pos));
-    }
-    if (aoAttr) aoAttr.needsUpdate = true;
+    h.ground.needsUpdate = true;
+    if (!columnsOnly) h.features.needsUpdate = true;
 
-    // The skirt lies on the ground, lifted a little against z-fighting.
-    if (entry.skirtGeometry && scale) {
-      const sAttr = entry.skirtGeometry.getAttribute('position') as THREE.BufferAttribute;
-      const sp = sAttr.array as Float32Array;
-      const sc = entry.skirtColumn!;
-      for (let i = 0; i < sc.length; i++) sp[i * 3 + 1] = (flat ? 0 : groundOf(sc[i])) + SKIRT_LIFT_M;
-      sAttr.needsUpdate = true;
-      entry.skirtGeometry.boundingSphere = toSphere(boundingSphere(sp));
+    // The bounds: the tile's own, raised by where its vertices go (a foot may follow the ground below its base's height).
+    if (!columnsOnly) geometry.boundingSphere = lifted(sphere, Math.min(low, groundLow), high);
+    if (entry.skirtGeometry && entry.skirtSphere) {
+      entry.skirtGeometry.boundingSphere = lifted(entry.skirtSphere, groundLow + SKIRT_LIFT_M, groundHigh + SKIRT_LIFT_M);
     }
   }
 
@@ -1586,7 +1687,7 @@ export class Fill3DManager implements TileConsumer {
         next!.terrainEpoch = this.terrainEpoch;
         continue;
       }
-      this.bake(next!, true);
+      this.bake(next!, 'sampled');
       baked = true;
       bakes--;
     }
@@ -1598,36 +1699,37 @@ export class Fill3DManager implements TileConsumer {
   }
 
   /**
-   * Whether the terrain under a tile is another than the one it was last baked
-   * onto: every height that bake took from the terrain (see
-   * TileEntry.groundCache) is sampled again and compared, exactly. The samples
-   * are kept — the bake that follows a `true` uses them (`sampled`). Costs a
-   * quarter of a bake; a few hundred points per tile instead were not enough:
-   * finer terrain data moves the ground by metres at an embankment and by
-   * nothing a street away, and the buildings there kept standing on the old one.
+   * Whether the terrain under a tile is another than the one it stands on:
+   * every height its tables took from the terrain is sampled again and
+   * compared, exactly. The samples are kept — the bake that follows a `true`
+   * uses them (`sampled`). A few hundred points per tile instead were not
+   * enough: finer terrain data moves the ground by metres at an embankment and
+   * by nothing a street away, and the buildings there kept standing on the old one.
    */
   private terrainMoved(entry: TileEntry): boolean {
     const flat = !this.map.terrain;
-    const cache = entry.groundCache;
+    const h = entry.heights;
     const centres = entry.centreCache;
     const xz = entry.columnXZ;
     const table = entry.table;
-    if (entry.bakedFlat !== flat) return true;
+    if (!h || h.flat !== flat) return true;
     if (flat) return false;
-    if (!cache || !centres || !xz || !table || cache.length !== xz.length / 2) return true;
+    if (!centres || !xz || !table || h.columns !== xz.length / 2) return true;
+    const ground = h.ground.image.data as Float32Array;
     const groundAt = createMercatorElevationSampler(this.map);
     const elevationAt = createElevationSampler(this.map);
     const scale = entry.tileScale ?? 0;
     let moved = false;
-    for (let c = 0; c < cache.length; c++) {
-      const was = cache[c];
-      if (was !== was) continue; // not used
-      cache[c] = groundAt(entry.tileMx + xz[c * 2] * scale, entry.tileMy - xz[c * 2 + 1] * scale);
-      if (cache[c] !== was) moved = true;
+    const needed = entry.needed;
+    for (let c = 0; c < h.columns; c++) {
+      if (needed && c < needed.length && !needed[c]) continue;
+      const was = ground[c];
+      ground[c] = groundAt(entry.tileMx + xz[c * 2] * scale, entry.tileMy - xz[c * 2 + 1] * scale);
+      if (ground[c] !== was) moved = true;
     }
     for (let i = 0; i < centres.length; i++) {
       const was = centres[i];
-      if (was !== was) continue;
+      if (was !== was) continue; // not used
       centres[i] = elevationAt(table.lng[i], table.lat[i]);
       if (centres[i] !== was) moved = true;
     }
@@ -1658,6 +1760,8 @@ export class Fill3DManager implements TileConsumer {
     this.material.dispose();
     this.depthMaterial.dispose();
     for (const t of Object.values(this.aoEmpty)) t.dispose();
+    this.noHeights.ground.dispose();
+    this.noHeights.features.dispose();
     this.skirtMaterial.dispose();
   }
 }
@@ -1670,22 +1774,27 @@ export class Fill3DManager implements TileConsumer {
  * height datum) and what the terrain model misses of the ground's shape; the
  * median ignores feet where it misses most.
  */
-function anchorFits(anchors: TerrainAnchors, groundOf: (column: number) => number): Float32Array {
+function anchorFits(anchors: TerrainAnchors, ground: Float32Array): Float32Array {
   const groups = anchors.start.length - 1;
   const fits = new Float32Array(groups);
   const diff = new Float32Array(anchors.column.length);
-  for (let i = 0; i < diff.length; i++) diff[i] = groundOf(anchors.column[i]) - anchors.height[i];
-  let order = FIT_ORDER;
+  for (let i = 0; i < diff.length; i++) diff[i] = ground[anchors.column[i]] - anchors.height[i];
+  const bits = new Uint32Array(diff.buffer);
   for (let g = 0; g < groups; g++) {
     const start = anchors.start[g];
     const n = anchors.start[g + 1] - start;
-    if (n > order.length) order = FIT_ORDER = new Uint32Array(n * 2);
-    // The group's feet by their difference, ascending. Most groups have a
-    // handful of feet: sorted by insertion (stable, like Array.sort); a long
-    // row of houses goes through Array.sort.
+    if (n > FIT_ORDER.length) {
+      FIT_ORDER = new Uint32Array(n * 2);
+      FIT_ORDER_2 = new Uint32Array(n * 2);
+      FIT_KEYS = new Uint32Array(n * 2);
+      FIT_KEYS_2 = new Uint32Array(n * 2);
+    }
+    let order = FIT_ORDER;
+    // The group's feet by their difference, ascending, equal ones in their own order.
     let total = 0;
     for (let k = 0; k < n; k++) total += anchors.weight[start + k];
     if (n <= FIT_INSERTION_MAX) {
+      // Most groups have a handful of feet: sorted by insertion.
       for (let k = 0; k < n; k++) {
         const i = start + k;
         const d = diff[i];
@@ -1697,10 +1806,34 @@ function anchorFits(anchors: TerrainAnchors, groundOf: (column: number) => numbe
         order[at] = i;
       }
     } else {
-      const sorted: number[] = [];
-      for (let k = 0; k < n; k++) sorted.push(start + k);
-      sorted.sort((a, b) => diff[a] - diff[b]);
-      order.set(sorted);
+      // A block of houses has hundreds: by radix, on the floats' bits made to
+      // order like the numbers (four passes of a byte; back in `order` after
+      // them). Array.sort with a comparison was most of a bake of a city tile.
+      let keys = FIT_KEYS;
+      let order2 = FIT_ORDER_2;
+      let keys2 = FIT_KEYS_2;
+      for (let k = 0; k < n; k++) {
+        const b = bits[start + k];
+        keys[k] = b & 0x80000000 ? ~b : b | 0x80000000;
+        order[k] = start + k;
+      }
+      for (let shift = 0; shift < 32; shift += 8) {
+        FIT_COUNT.fill(0);
+        for (let k = 0; k < n; k++) FIT_COUNT[(keys[k] >>> shift) & 255]++;
+        let at = 0;
+        for (let b = 0; b < 256; b++) {
+          const c = FIT_COUNT[b];
+          FIT_COUNT[b] = at;
+          at += c;
+        }
+        for (let k = 0; k < n; k++) {
+          const to = FIT_COUNT[(keys[k] >>> shift) & 255]++;
+          keys2[to] = keys[k];
+          order2[to] = order[k];
+        }
+        [keys, keys2] = [keys2, keys];
+        [order, order2] = [order2, order];
+      }
     }
     let fit = NaN; // a group without feet: its buildings go to their centres
     let sum = 0;
@@ -1717,14 +1850,21 @@ function anchorFits(anchors: TerrainAnchors, groundOf: (column: number) => numbe
   return fits;
 }
 
-/** Scratch of anchorFits: a group's feet in order. */
+/** Scratch of anchorFits: a group's feet in order, and for the radix sort their keys and the other halves. */
 let FIT_ORDER = new Uint32Array(256);
+let FIT_ORDER_2 = new Uint32Array(256);
+let FIT_KEYS = new Uint32Array(256);
+let FIT_KEYS_2 = new Uint32Array(256);
+const FIT_COUNT = new Uint32Array(256);
 /** Groups of at most this many feet are sorted by insertion. */
 const FIT_INSERTION_MAX = 32;
 
-/** A bounding sphere the worker computed (x, y, z, radius). */
-function toSphere(s: Float32Array): THREE.Sphere {
-  return new THREE.Sphere(new THREE.Vector3(s[0], s[1], s[2]), s[3]);
+/**
+ * A bounding sphere the worker computed (x, y, z, radius) for the heights as a
+ * tile gives them, around vertices that stand between `low` and `high` metres higher.
+ */
+function lifted(s: Float32Array, low: number, high: number): THREE.Sphere {
+  return new THREE.Sphere(new THREE.Vector3(s[0], s[1] + (low + high) / 2, s[2]), s[3] + (high - low) / 2);
 }
 
 const NO_PROPERTIES: Record<string, unknown>[] = new Proxy([], { get: () => EMPTY_PROPERTIES }) as never;
@@ -1739,7 +1879,8 @@ function bytesOf(entry: TileEntry): number {
     if (g.index) bytes += BYTES.get(g.index) ?? (g.index.array as ArrayBufferView).byteLength;
   }
   if (entry.ao) for (const t of Object.values(entry.ao)) bytes += BYTES.get(t) ?? 0;
-  for (const a of [entry.baseY, entry.column, entry.columnXZ, entry.skirtColumn, entry.groundCache, entry.centreCache]) bytes += a?.byteLength ?? 0;
+  if (entry.heights) for (const t of [entry.heights.ground, entry.heights.features]) bytes += (t.image.data as ArrayBufferView).byteLength;
+  for (const a of [entry.columnXZ, entry.needed, entry.centreCache, entry.rigidGround]) bytes += a?.byteLength ?? 0;
   return bytes;
 }
 

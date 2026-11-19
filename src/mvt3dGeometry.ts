@@ -28,10 +28,10 @@ export interface TilePrep {
   opacity?: StyleValue<number>;
   zoom: number;
   globalState: Record<string, unknown>;
-  /** The map has no terrain: the heights can be final (see Fill3DManager.bake). */
-  flat: boolean;
   /** Also send the features' properties: the main thread re-evaluates the paint on a global-state change. */
   properties: boolean;
+  /** Metres above its base up to which a vertex needs its height above the ground (the fake AO's reach; see {@link Prepared.needed}). */
+  aoReach: number;
 }
 
 /**
@@ -79,9 +79,6 @@ export interface TileSpec {
   prep: TilePrep;
 }
 
-/** What placing a tile on a map without terrain needs of its {@link FeatureTable}. */
-export type FlatSpans = Pick<FeatureTable, 'start' | 'count' | 'rigid'>;
-
 /** The features' vertex spans as columns ({@link FeatureSpan} without the properties): transferred, not cloned. */
 export interface FeatureTable {
   start: Uint32Array;
@@ -97,21 +94,36 @@ export interface FeatureTable {
 
 /**
  * What the worker prepared for the main thread (see {@link TilePrep}): the
- * per-vertex work of a tile's arrival. With `flat`, `position` (and `aoh`, the
- * skirt) carry the final heights for a map without terrain, and the bounding
- * spheres come along (x, y, z, radius).
+ * per-vertex work of a tile's arrival. The heights stay as emitted, relative
+ * to the features' bases — the vertex shader puts them onto the map (see
+ * Fill3DManager.bake) from what comes along here.
  */
 export interface Prepared {
-  /** Per vertex: its height as emitted, relative to the feature's base (baking overwrites `position`'s). */
-  baseY: Float32Array;
   /** Per vertex RGBA, 8 bits each: fill-3d-color, with a per-feature fill-3d-opacity in the alpha. */
   color: Uint8Array;
   /** Whether any vertex got an alpha below 1. */
   translucent: boolean;
   table: FeatureTable;
+  /** Per vertex: its feature, an index into `table`. */
+  feature: Uint16Array | Uint32Array;
   /** Per feature, with {@link TilePrep.properties}. */
   properties?: Record<string, number | string | boolean>[];
-  flat?: { sphere: Float32Array; skirtSphere?: Float32Array };
+  /**
+   * Per ground column: 1 where a vertex needs the terrain height there — a
+   * building's foot, which follows the ground, or a vertex within the fake AO's
+   * reach of its base. The terrain is not sampled at the others (roof points
+   * high up; most of a rigid model's).
+   */
+  needed: Uint8Array;
+  /** The bounding sphere of the geometry as emitted (x, y, z, radius), and of the skirt. */
+  sphere: Float32Array;
+  skirtSphere?: Float32Array;
+  /**
+   * Per ground column: the lowest point of a rigid model in it (metres below
+   * its base, 0 elsewhere) — the ground a map without terrain shows under such
+   * a model. Absent without rigid models.
+   */
+  rigidGround?: Float32Array;
 }
 
 /** One feature's vertex span, so the main thread can bake terrain + colour per feature. */
@@ -185,12 +197,6 @@ export interface TileResult {
    *  (a normalized Int8 attribute — a quarter of the bytes of float32). */
   normal: Int8Array;
   /**
-   * Fake ambient occlusion at the wall foot, 1 per vertex, decimetres: the
-   * height above the ground (here: above the base; the main thread re-bakes it
-   * against the terrain). Empty without AO.
-   */
-  aoh: Int16Array;
-  /**
    * Fake AO at inner edges: per vertex its face's AO table entry
    * ({@link AO_NO_FACE}: none) and its position in the face's plane (2 per
    * vertex, units of {@link AO_UV_UNIT_M}, around the face's centre). Linear in
@@ -229,9 +235,7 @@ export interface AoResult {
   consumer?: number;
   seq?: number;
   phase: 'ao';
-  /** With {@link TilePrep.flat}: per vertex its height above the ground (dm), final for a map without terrain. */
-  aoh?: Int16Array;
-  /** With {@link TilePrep.flat}: the skirt's bounding sphere (its heights are final too). */
+  /** The skirt's bounding sphere, as emitted (on the ground at height 0). */
   skirtSphere?: Float32Array;
   aoFace: Uint16Array;
   aoUV: Int16Array;
@@ -643,7 +647,6 @@ class MeshBuilder {
   vertexCount = 0;
   readonly position: Float32Array;
   readonly normal: Int8Array;
-  readonly aoh: Int16Array;
   /** The triangles' vertices, `indexCount` of them so far. */
   index: Uint32Array;
   indexCount = 0;
@@ -660,7 +663,6 @@ class MeshBuilder {
   ) {
     this.position = new Float32Array(vertices * 3);
     this.normal = new Int8Array(vertices * 3);
-    this.aoh = new Int16Array(ao ? vertices : 0);
     // A face of n vertices has n - 2 triangles, with holes two more for each.
     this.index = new Uint32Array(vertices * 3);
     this.column = new Uint32Array(vertices);
@@ -868,7 +870,6 @@ export function emitTile(parsed: ParsedTile, skirtRadius = 0, ao = true, stats?:
   const result = {
     position: out.position,
     normal: out.normal,
-    aoh: out.aoh,
     aoFace: out.ao ? out.ao.face : new Uint16Array(0),
     aoUV: out.ao ? out.ao.uv : new Int16Array(0),
     aoTables: out.ao?.tables.pack(),
@@ -1005,50 +1006,23 @@ export function vertexColors(
 }
 
 /**
- * The flat map's ground under the vertices of rigid models,
- * per ground column, relative to the map: the map itself, or the model's lowest
- * point in that column where it reaches below the map (a wall foot on lower
- * ground shows through the flat map, and the wall darkens towards that foot).
- * Undefined without rigid models.
+ * The ground a map without terrain shows under rigid models, per ground column:
+ * the lowest of their vertices there (a model built against sloping terrain
+ * reaches below its base where the ground was lower; nothing is cut off at the
+ * flat map, and the wall darkens towards that foot). Undefined without rigid models.
  */
-export function flatGroundOfRigid(table: FlatSpans, column: ArrayLike<number>, baseY: Float32Array, columns: number): Float32Array | undefined {
+export function flatGroundOfRigid(table: Pick<FeatureTable, 'start' | 'count' | 'rigid'>, column: ArrayLike<number>, position: Float32Array, columns: number): Float32Array | undefined {
   let ground: Float32Array | undefined;
   for (let i = 0; i < table.start.length; i++) {
     if (!table.rigid[i]) continue;
     ground ??= new Float32Array(columns); // 0: the map
     for (let v = table.start[i], end = v + table.count[i]; v < end; v++) {
       const c = column[v];
-      if (baseY[v] < ground[c]) ground[c] = baseY[v];
+      const y = position[v * 3 + 1];
+      if (y < ground[c]) ground[c] = y;
     }
   }
   return ground;
-}
-
-/**
- * A map without terrain: the heights as Fill3DManager.bake gives them there.
- * `position` gets its final y (ground walls come up to the map, a rigid model
- * stays as built), `aoh` each vertex's height above the ground in decimetres.
- */
-export function bakeFlat(
-  position: Float32Array | undefined,
-  aoh: Int16Array | undefined,
-  baseY: Float32Array,
-  table: FlatSpans,
-  column: ArrayLike<number>,
-  columns: number,
-) {
-  const rigidGround = aoh ? flatGroundOfRigid(table, column, baseY, columns) : undefined;
-  for (let i = 0; i < table.start.length; i++) {
-    const rigid = table.rigid[i] === 1;
-    for (let v = table.start[i], end = v + table.count[i]; v < end; v++) {
-      const rel = baseY[v];
-      const y = rigid ? rel : Math.max(rel, 0);
-      if (position) position[v * 3 + 1] = y;
-      if (!aoh) continue;
-      const aboveGround = rigid ? (rigidGround ? rel - rigidGround[column[v]] : rel) : y;
-      aoh[v] = Math.max(-32766, Math.min(32766, Math.round(aboveGround * 10)));
-    }
-  }
 }
 
 /** A bounding sphere as three.js computes it: around the bounding box's centre. x, y, z, radius. */
@@ -1074,32 +1048,36 @@ export function boundingSphere(position: Float32Array): Float32Array {
   return new Float32Array([cx, cy, cz, Math.sqrt(r2)]);
 }
 
-/** A skirt on the flat map: its heights and its bounding sphere. */
-export function flatSkirt(skirt: SkirtResult): Float32Array {
-  for (let i = 1; i < skirt.position.length; i += 3) skirt.position[i] = SKIRT_LIFT_M;
-  return boundingSphere(skirt.position);
-}
-
 /**
  * Do on the worker what the main thread did per vertex when a tile arrived
  * (see {@link TilePrep}); changes `result` in place: its `features` are emptied
- * (the spans go as columns), and with `prep.flat` its heights are final.
+ * (the spans go as columns).
  */
 export function prepare(result: Omit<TileResult, 'key'>, prep: TilePrep): Prepared {
   const vertexCount = result.position.length / 3;
   const table = featureTable(result.features);
   const properties = result.features.map((f) => f.properties);
-  const baseY = new Float32Array(vertexCount);
-  for (let v = 0; v < vertexCount; v++) baseY[v] = result.position[v * 3 + 1];
   const paint = paintOf(prep);
   const colors = vertexColors(vertexCount, table, properties, paint.color, paint.opacity, prep.zoom, prep.globalState);
-  const prepared: Prepared = { baseY, color: colors.color, translucent: colors.translucent, table };
-  if (prep.properties) prepared.properties = properties;
-  if (prep.flat && vertexCount) {
-    bakeFlat(result.position, result.aoh.length ? result.aoh : undefined, baseY, table, result.column, result.columnXZ.length / 2);
-    prepared.flat = { sphere: boundingSphere(result.position) };
-    if (result.skirt) prepared.flat.skirtSphere = flatSkirt(result.skirt);
+  const feature = table.start.length <= 65536 ? new Uint16Array(vertexCount) : new Uint32Array(vertexCount);
+  const needed = new Uint8Array(result.columnXZ.length / 2);
+  const { position, column } = result;
+  for (let i = 0; i < table.start.length; i++) {
+    const start = table.start[i];
+    const end = start + table.count[i];
+    feature.fill(i, start, end);
+    const rigid = table.rigid[i] === 1;
+    for (let v = start; v < end; v++) {
+      const rel = position[v * 3 + 1];
+      if (rel < prep.aoReach || (!rigid && rel <= BASE_EPSILON_M)) needed[column[v]] = 1;
+    }
   }
+  if (result.anchors) for (let i = 0; i < result.anchors.column.length; i++) needed[result.anchors.column[i]] = 1;
+  const prepared: Prepared = { color: colors.color, translucent: colors.translucent, table, feature, needed, sphere: boundingSphere(result.position) };
+  if (prep.properties) prepared.properties = properties;
+  if (result.skirt) prepared.skirtSphere = boundingSphere(result.skirt.position);
+  const rigidGround = flatGroundOfRigid(table, result.column, result.position, result.columnXZ.length / 2);
+  if (rigidGround) prepared.rigidGround = rigidGround;
   result.features = [];
   return prepared;
 }
@@ -1847,15 +1825,9 @@ function emitFace(out: MeshBuilder, face: Face) {
     normal[3 * v + 1] = n1;
     normal[3 * v + 2] = n2;
     column[v] = columns.at(x, z);
-    if (out.ao) out.aoh[v] = dm(y);
     flat2D.push(x * x0 + y * x1 + z * x2, x * y0 + y * y1 + z * y2);
   }
   out.addTriangles(face.count === 3 ? ONE_TRIANGLE : earcut(flat2D, face.holes, 2), first);
-}
-
-/** Metres → decimetres, clamped into Int16. */
-function dm(m: number): number {
-  return Math.max(-32766, Math.min(32766, Math.round(m * 10)));
 }
 
 /** A wall's edges at the building's foot, for the ground skirt. */

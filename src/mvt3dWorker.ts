@@ -1,5 +1,5 @@
-import { bakeFlat, emitAo, emitTile, flatSkirt, parseTile, prepare, readTile } from './mvt3dGeometry';
-import type { AoResult, FlatSpans, ParsedTile, TileRequest, TileResult } from './mvt3dGeometry';
+import { boundingSphere, emitAo, emitTile, parseTile, prepare, readTile } from './mvt3dGeometry';
+import type { AoResult, ParsedTile, TileRequest, TileResult } from './mvt3dGeometry';
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
 
@@ -19,8 +19,6 @@ interface Waiting {
   seq: number;
   skirtRadius: number;
   aoRadius: number;
-  /** A map without terrain: what the heights above ground are computed from (see bakeFlat). */
-  flat?: { baseY: Float32Array; spans: FlatSpans };
 }
 const waiting = new Map<string, Waiting>();
 let scheduled = false;
@@ -39,17 +37,13 @@ function aoStep() {
   if (next.done) return;
   const [id, w] = next.value;
   waiting.delete(id);
-  const { column, ...r } = emitAo(w.parsed, w.skirtRadius, w.aoRadius);
+  // The columns of the vertices are those of the geometry pass: not sent again.
+  const { column: _column, ...r } = emitAo(w.parsed, w.skirtRadius, w.aoRadius);
   const result: AoResult = { key: w.key, consumer: w.consumer, seq: w.seq, phase: 'ao', ...r };
   const transfer: ArrayBuffer[] = [r.aoFace.buffer as ArrayBuffer, r.aoUV.buffer as ArrayBuffer, r.columnXZ.buffer as ArrayBuffer];
-  if (w.flat) {
-    result.aoh = new Int16Array(w.flat.baseY.length);
-    bakeFlat(undefined, result.aoh, w.flat.baseY, w.flat.spans, column, r.columnXZ.length / 2);
-    transfer.push(result.aoh.buffer as ArrayBuffer);
-    if (r.skirt) {
-      result.skirtSphere = flatSkirt(r.skirt);
-      transfer.push(result.skirtSphere.buffer as ArrayBuffer);
-    }
+  if (r.skirt) {
+    result.skirtSphere = boundingSphere(r.skirt.position);
+    transfer.push(result.skirtSphere.buffer as ArrayBuffer);
   }
   if (r.aoTables) {
     const t = r.aoTables;
@@ -82,18 +76,10 @@ ctx.onmessage = (e: MessageEvent<TileRequest | { cancel: string; consumer: numbe
     const built = later ? emitTile(parsed, 0, false, undefined, c.aoRadius) : emitTile(parsed, c.skirtRadius, c.ao, undefined, c.aoRadius);
     const result: TileResult = { key, consumer: c.consumer, seq: c.seq, ...built };
     const drawn = result.index.length > 0;
-    let flat: Waiting['flat'];
-    if (drawn) {
-      const prepared = (result.prepared = prepare(result, c.prep));
-      // The AO pass computes the heights above ground from these (they are about to be transferred).
-      if (later && c.prep.flat) {
-        flat = { baseY: prepared.baseY.slice(), spans: { start: prepared.table.start.slice(), count: prepared.table.count.slice(), rigid: prepared.table.rigid.slice() } };
-      }
-    }
+    if (drawn) result.prepared = prepare(result, c.prep);
     const transfer: ArrayBuffer[] = [
       result.position.buffer as ArrayBuffer,
       result.normal.buffer as ArrayBuffer,
-      result.aoh.buffer as ArrayBuffer,
       result.aoFace.buffer as ArrayBuffer,
       result.aoUV.buffer as ArrayBuffer,
       result.index.buffer as ArrayBuffer,
@@ -104,8 +90,10 @@ ctx.onmessage = (e: MessageEvent<TileRequest | { cancel: string; consumer: numbe
       const p = result.prepared;
       const t = p.table;
       transfer.push(
-        p.baseY.buffer as ArrayBuffer,
         p.color.buffer as ArrayBuffer,
+        p.feature.buffer as ArrayBuffer,
+        p.needed.buffer as ArrayBuffer,
+        p.sphere.buffer as ArrayBuffer,
         t.start.buffer as ArrayBuffer,
         t.count.buffer as ArrayBuffer,
         t.lng.buffer as ArrayBuffer,
@@ -114,10 +102,8 @@ ctx.onmessage = (e: MessageEvent<TileRequest | { cancel: string; consumer: numbe
         t.base.buffer as ArrayBuffer,
         t.rigid.buffer as ArrayBuffer,
       );
-      if (p.flat) {
-        transfer.push(p.flat.sphere.buffer as ArrayBuffer);
-        if (p.flat.skirtSphere) transfer.push(p.flat.skirtSphere.buffer as ArrayBuffer);
-      }
+      if (p.skirtSphere) transfer.push(p.skirtSphere.buffer as ArrayBuffer);
+      if (p.rigidGround) transfer.push(p.rigidGround.buffer as ArrayBuffer);
     }
     if (result.anchors) {
       const a = result.anchors;
@@ -137,7 +123,7 @@ ctx.onmessage = (e: MessageEvent<TileRequest | { cancel: string; consumer: numbe
     }
     ctx.postMessage(result, transfer);
     if (later && drawn) {
-      waiting.set(waitingKey(c.consumer, key), { key, consumer: c.consumer, parsed, seq: c.seq, skirtRadius: c.skirtRadius, aoRadius: c.aoRadius, flat });
+      waiting.set(waitingKey(c.consumer, key), { key, consumer: c.consumer, parsed, seq: c.seq, skirtRadius: c.skirtRadius, aoRadius: c.aoRadius });
       scheduleAo();
     }
   }
