@@ -6,6 +6,7 @@ import { compileColor, compileOpacity } from './paint';
 import type { PaintValue } from './paint';
 import { compileNumber } from './expression';
 import { whenIdle } from './idle';
+import { acquireRenderer, releaseRenderer } from './sharedRenderer';
 import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
 import type { ExtrusionRequest } from './mvt3dGeometry';
 
@@ -140,6 +141,7 @@ export class Fill3DLayer implements CustomLayerInterface {
   private camera!: THREE.Camera;
   private scene!: THREE.Scene;
   private renderer!: THREE.WebGLRenderer;
+  private gl?: WebGL2RenderingContext;
   private manager?: Fill3DManager;
 
   // Reused every frame to avoid per-frame allocations.
@@ -198,12 +200,8 @@ export class Fill3DLayer implements CustomLayerInterface {
     // No scene lights: the meshes use a custom shader that replicates MapLibre's
     // fill-extrusion directional lighting (see Fill3DManager).
 
-    this.renderer = new THREE.WebGLRenderer({
-      canvas: map.getCanvas(),
-      context: gl,
-      antialias: true,
-    });
-    this.renderer.autoClear = false;
+    this.gl = gl;
+    this.renderer = acquireRenderer(map.getCanvas(), gl);
 
     this.manager = new Fill3DManager(
       map,
@@ -301,6 +299,7 @@ export class Fill3DLayer implements CustomLayerInterface {
 
   onRemove() {
     this.manager?.dispose();
-    this.renderer?.dispose();
+    if (this.gl) releaseRenderer(this.gl);
+    this.gl = undefined;
   }
 }

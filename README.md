@@ -683,6 +683,10 @@ style change. With terrain, many of them during an animation cost frames.
 MapLibre GL JS **≥6** and three.js **≥0.160**, both peer dependencies. No special
 bundler or worker configuration is needed.
 
+All layers of this library on a map draw with one three.js renderer on the map's
+WebGL context: the shader programs and the light environment of the glTF
+materials are made once per map, not once per layer.
+
 ## Limitations
 
 **`Fill3DLayer`**
