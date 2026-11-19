@@ -62,7 +62,8 @@ export interface GltfLayerOptions {
   minzoom?: number;
   /** Hide the layer at and above this zoom. */
   maxzoom?: number;
-  /** raster-dem source id for elevation; defaults to the map's active terrain. */
+  /** raster-dem source id for elevation; defaults to the map's terrain, also one
+   *  that is switched on or changed after the layer was added. */
   terrainSourceId?: string;
   /**
    * Upper bound on instances per rebuild (default `20000`). Denser data is
@@ -226,7 +227,6 @@ export class GltfLayer implements CustomLayerInterface {
 
   onAdd(map: Map, gl: WebGL2RenderingContext) {
     this.map = map;
-    const terrainSourceId = this.options.terrainSourceId ?? map.getTerrain()?.source ?? '';
 
     this.camera = new THREE.Camera();
     this.scene = new THREE.Scene();
@@ -252,7 +252,7 @@ export class GltfLayer implements CustomLayerInterface {
       map,
       this.scene,
       LngLat.convert(map.getCenter()), // initial anchor; re-anchors itself on move
-      terrainSourceId,
+      this.options.terrainSourceId,
       {
         sourceId: this.options.source,
         sourceLayer: this.options['source-layer'],

@@ -641,7 +641,9 @@ export class Fill3DManager implements TileConsumer {
   /** Ground skirts; drawn in the colour pass only, after the buildings' depth. */
   private readonly skirtGroup: THREE.Group;
   private readonly skirtMaterial: THREE.ShaderMaterial;
-  private readonly terrainSourceId: string;
+  /** The layer's `terrainSourceId`; without one the map's terrain is followed (see onTerrain). */
+  private readonly terrainSourceOption?: string;
+  private terrainSourceId: string;
   private hub?: TileHub;
   private consumerId = 0;
   /** The view's tiles are being loaded: the source and the zoom levels of its layers are known. */
@@ -717,12 +719,13 @@ export class Fill3DManager implements TileConsumer {
     map: Map,
     scene: THREE.Scene,
     sceneOrigin: LngLat,
-    terrainSourceId: string,
+    terrainSourceOption: string | undefined,
     config: Fill3DConfig,
   ) {
     this.map = map;
     this.scene = scene;
-    this.terrainSourceId = terrainSourceId;
+    this.terrainSourceOption = terrainSourceOption;
+    this.terrainSourceId = terrainSourceOption ?? map.getTerrain()?.source ?? '';
     this.config = config;
     this.cacheBytes = config.cacheBytes;
     this.origin = toOrigin(sceneOrigin);
@@ -780,8 +783,11 @@ export class Fill3DManager implements TileConsumer {
       this.update();
     };
     // Terrain switched on, off or re-set: the heights are stale, and without
-    // terrain the sunk wall bases must come up to the map (see bake).
+    // terrain the sunk wall bases must come up to the map (see bake). It may be
+    // another source now, or the first terrain since the layer was added: its
+    // DEM tiles are the ones to follow from here on (see onData).
     this.onTerrain = () => {
+      this.terrainSourceId = this.terrainSourceOption ?? map.getTerrain()?.source ?? '';
       this.terrainEpoch++;
       this.rebakeAll();
     };

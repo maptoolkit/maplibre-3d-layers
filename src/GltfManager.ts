@@ -406,7 +406,11 @@ export class GltfManager {
   private readonly map: Map;
   private readonly group: THREE.Group;
   private readonly scene: THREE.Scene;
-  private readonly terrainSourceId: string;
+  /** The layer's `terrainSourceId`; without one the map's terrain is followed (see onTerrain). */
+  private readonly terrainSourceOption?: string;
+  private terrainSourceId: string;
+  /** The terrain the instances were last built for, to tell a change from a repeated `setTerrain`. */
+  private terrainKey: string;
   private readonly config: GltfConfig;
   private readonly models = new globalThis.Map<string, ModelEntry>();
   private readonly batches = new globalThis.Map<string, Batch>();
@@ -438,6 +442,7 @@ export class GltfManager {
 
   private readonly onData: (ev: unknown) => void;
   private readonly onMoveEnd: () => void;
+  private readonly onTerrain: () => void;
   private readonly unwatchGlobalState: (() => void)[];
   /** When the last `moveend` came and when one last made the layer refresh (ms). */
   private lastMoveEnd = -Infinity;
@@ -491,12 +496,14 @@ export class GltfManager {
     map: Map,
     scene: THREE.Scene,
     sceneOrigin: LngLat,
-    terrainSourceId: string,
+    terrainSourceOption: string | undefined,
     config: GltfConfig,
   ) {
     this.map = map;
     this.scene = scene;
-    this.terrainSourceId = terrainSourceId;
+    this.terrainSourceOption = terrainSourceOption;
+    this.terrainSourceId = terrainSourceOption ?? map.getTerrain()?.source ?? '';
+    this.terrainKey = terrainKeyOf(map);
     this.config = config;
     this.origin = toOrigin(sceneOrigin);
     const compiledFilter = featureFilter(config.filter, 'filter');
@@ -563,8 +570,20 @@ export class GltfManager {
         if (!this.builtView || !sameView(this.builtView, viewState(map))) refreshForView();
       }, MOVE_SERIES_MS);
     };
+    // Terrain switched on, off or changed (another source, another exaggeration):
+    // the instances stand on the old heights until they are built again, and the
+    // DEM tiles to follow may be another source's (see onData). MapLibre fires
+    // `terrain` on every setTerrain, also with the same options: no rebuild then.
+    this.onTerrain = () => {
+      this.terrainSourceId = this.terrainSourceOption ?? map.getTerrain()?.source ?? '';
+      const key = terrainKeyOf(map);
+      if (key === this.terrainKey) return;
+      this.terrainKey = key;
+      this.schedule(false, true);
+    };
     map.on('data', this.onData);
     map.on('moveend', this.onMoveEnd);
+    map.on('terrain', this.onTerrain);
 
     // `["global-state", …]`. Colour/alpha are rewritten in place; anything that
     // decides placement or transforms needs a rebuild, which a move does anyway
@@ -1779,6 +1798,7 @@ export class GltfManager {
     this.disposed = true;
     this.map.off('data', this.onData);
     this.map.off('moveend', this.onMoveEnd);
+    this.map.off('terrain', this.onTerrain);
     if (this.rafId !== undefined) cancelAnimationFrame(this.rafId);
     if (this.buildRaf !== undefined) cancelAnimationFrame(this.buildRaf);
     if (this.paintRafId !== undefined) cancelAnimationFrame(this.paintRafId);
@@ -2055,6 +2075,12 @@ interface ViewState {
   pitch: number;
   width: number;
   height: number;
+}
+
+/** Source and exaggeration of the map's terrain, `''` without one. */
+function terrainKeyOf(map: Map): string {
+  const terrain = map.getTerrain();
+  return terrain ? `${terrain.source}|${terrain.exaggeration ?? 1}` : '';
 }
 
 function viewState(map: Map): ViewState {

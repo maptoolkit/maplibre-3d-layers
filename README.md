@@ -146,7 +146,7 @@ own way, see [Landmarks](#landmarks-models-in-the-tiles).
 | `source` | ✅ | id of a vector source already added to the map |
 | `source-layer` | ✅ | vector-tile layer to read (e.g. `buildings3d`) |
 | `filter` | — | MapLibre filter expression; features that fail are dropped |
-| `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's active terrain |
+| `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's terrain, also one switched on or changed after the layer was added |
 | `workers` | — | at most this many tile workers (default: half the logical processors, at least 1, at most 4). They start as tiles queue up; the layers of one source share them |
 | `tileCache` | — | megabytes of tiles to keep, hidden, after they left the view (default `64`; `0` keeps nothing). See [Loading](#loading) |
 | `layout.visibility` | — | `'visible'` (default) / `'none'` |
@@ -431,7 +431,7 @@ models as billboards — see [Performance and density](#performance-and-density)
 | `filter` | — | MapLibre filter expression; features that fail are dropped |
 | `minzoom` / `maxzoom` | — | hidden below `minzoom` and at/above `maxzoom`; outside the range the layer costs nothing |
 | `maxInstances` | — | instance budget (default `20000`); denser data is thinned out, far away first, see [Performance and density](#performance-and-density) |
-| `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's active terrain |
+| `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's terrain, also one switched on or changed after the layer was added |
 | `doubleSided` | — | `false` draws front faces only, `true` both; default: automatic — front faces only for closed meshes, both for open ones such as leaf cards |
 | `lighting` | — | `{ ambient, directional, environment }`, see [Lighting](#lighting) |
 | `layout.visibility` | — | `'visible'` (default) / `'none'` |
@@ -611,6 +611,9 @@ rebuild on every frame: while `moveend`s come less than 500 ms apart, the layer
 rebuilds at most every 500 ms, only when the view shows something new (the centre
 moved by more than 5 % of the canvas, the bearing by about 3°, the zoom by 0.07,
 the pitch by 2°), and once more when they stop.
+A terrain that is switched on, off or changed (another source, another
+exaggeration) rebuilds the instances on the new heights; the same terrain set
+again does not.
 A rebuild does not block the frame it starts in: it takes at most 3 ms of a frame
 and goes on in the next ones; the instances on screen stay until the new ones are
 complete. The features of a tiled source are read once per tile, not on every

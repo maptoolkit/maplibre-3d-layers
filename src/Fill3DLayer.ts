@@ -39,7 +39,8 @@ export interface Fill3DLayerOptions {
   'source-layer': string;
   /** MapLibre filter expression; features that fail are not rendered. */
   filter?: FilterSpecification;
-  /** raster-dem source id for elevation; defaults to the map's active terrain. */
+  /** raster-dem source id for elevation; defaults to the map's terrain, also one
+   *  that is switched on or changed after the layer was added. */
   terrainSourceId?: string;
   /**
    * At most this many tile workers. Default: half the logical
@@ -188,9 +189,6 @@ export class Fill3DLayer implements CustomLayerInterface {
   }
 
   onAdd(map: Map, gl: WebGL2RenderingContext) {
-    // Use the explicit terrain source, else the map's active terrain, else none.
-    const terrainSourceId = this.terrainSourceIdOption ?? map.getTerrain()?.source ?? '';
-
     this.camera = new THREE.Camera();
     this.scene = new THREE.Scene();
     // three.js is y-up / z-toward-viewer; rotate + mirror so the scene frame is
@@ -207,7 +205,7 @@ export class Fill3DLayer implements CustomLayerInterface {
       map,
       this.scene,
       LngLat.convert(map.getCenter()), // initial anchor; re-anchors itself on pan
-      terrainSourceId,
+      this.terrainSourceIdOption,
       {
         color: this.colorEval,
         opacity: this.opacityEval,
