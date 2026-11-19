@@ -13,10 +13,10 @@ import {
   fromUnitX,
   fromUnitY,
   hash32,
-  lineLength,
   mercatorScale,
+  mercLines,
+  mercPolygons,
   placeAlongLine,
-  polygonArea,
   positionKey,
   scatterInPolygon,
   toMercX,
@@ -24,7 +24,7 @@ import {
   unitX,
   unitY,
 } from './placement';
-import type { Accept, MercBounds, PlacedPoint, RowSpan } from './placement';
+import type { Accept, MercBounds, MercLines, MercPolygons, PlacedPoint, RowSpan } from './placement';
 
 const D2R = Math.PI / 180;
 
@@ -253,6 +253,9 @@ interface RawFeature {
   mode?: Placement | null;
   /** A point feature's points, made once (see pointsFor). */
   points?: OwnPoint[];
+  /** A line or polygon feature's geometry in mercator metres, made once (see linesFor, polygonsFor). */
+  lines?: MercLines;
+  polygons?: MercPolygons;
   /** What the placement expressions gave for a point feature (see placedFor). */
   placed?: Placed;
 }
@@ -1073,12 +1076,12 @@ export class GltfManager {
             }
             break;
           case 'line':
-            if (!placeAlongLine(linesOf(f.geometry), spacing, clip, seen, (pt) => add(f, pt))) {
+            if (!placeAlongLine(linesFor(f).lines, spacing, clip, seen, (pt) => add(f, pt))) {
               break outer;
             }
             break;
           case 'fill':
-            if (!scatterInPolygon(polysOf(f.geometry), spacing, clip, seen, (pt) => add(f, pt), keep, rowSpan, accept)) {
+            if (!scatterInPolygon(polygonsFor(f).polygons, spacing, clip, seen, (pt) => add(f, pt), keep, rowSpan, accept)) {
               break outer;
             }
             break;
@@ -1300,8 +1303,8 @@ export class GltfManager {
       const cell = spacing * mercatorScale((f.bbox.south + f.bbox.north) / 2);
       estimate +=
         mode === 'fill'
-          ? (polygonArea(polysOf(f.geometry)) / (cell * cell)) * inView(f.bbox, view)
-          : lineLength(linesOf(f.geometry)) / cell;
+          ? (polygonsFor(f).area / (cell * cell)) * inView(f.bbox, view)
+          : linesFor(f).length / cell;
     }
 
     if (estimate <= max) return { cells, keep: 1 };
@@ -1988,6 +1991,14 @@ function pointsFor(f: RawFeature): OwnPoint[] {
     key: positionKey(toMercX(lng), toMercY(lat)),
     spare,
   })));
+}
+
+/** A line or polygon feature's geometry as a rebuild needs it (see MercLines). */
+function linesFor(f: RawFeature): MercLines {
+  return (f.lines ??= mercLines(linesOf(f.geometry)));
+}
+function polygonsFor(f: RawFeature): MercPolygons {
+  return (f.polygons ??= mercPolygons(polysOf(f.geometry)));
 }
 
 /**
