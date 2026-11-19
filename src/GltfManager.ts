@@ -13,10 +13,10 @@ import {
   fromUnitX,
   fromUnitY,
   hash32,
-  lineLength,
   mercatorScale,
+  mercLines,
+  mercPolygons,
   placeAlongLine,
-  polygonArea,
   positionKey,
   scatterInPolygon,
   toMercX,
@@ -24,7 +24,7 @@ import {
   unitX,
   unitY,
 } from './placement';
-import type { Accept, MercBounds, PlacedPoint, RowSpan } from './placement';
+import type { Accept, MercBounds, MercLines, MercPolygons, PlacedPoint, RowSpan } from './placement';
 
 const D2R = Math.PI / 180;
 
@@ -113,6 +113,21 @@ const DATA_SETTLE_MS = 150;
 const MOVE_SERIES_MS = 500;
 
 /**
+ * A rebuild of the instances takes at most this much main-thread time per
+ * frame (ms) and goes on in the next frames; the instances on screen stay until
+ * it is complete. In one piece it blocked a camera in motion for a frame or
+ * three, about twice a second (Vienna, 2026-11-18: 22 ms on average, every
+ * tenth time over 50 ms).
+ */
+const BUILD_SLICE_MS = 3;
+/**
+ * … or this share of the time since the slice before, where frames take longer
+ * than a sixtieth of a second: on a slow device (or in software rendering) 3 ms
+ * a frame would stretch a rebuild over seconds.
+ */
+const BUILD_SLICE_SHARE = BUILD_SLICE_MS / (1000 / 60);
+
+/**
  * "Shifted noticeably" since the last build: the instances are built for the
  * frame plus FRAME_PAD on each side, so a shift well inside that pad shows
  * nothing new. The centre in shares of the smaller canvas side, the bearing as
@@ -122,6 +137,9 @@ const SHIFT_CENTER = FRAME_PAD / 2;
 const SHIFT_BEARING_DEG = (FRAME_PAD / 2) * (180 / Math.PI);
 const SHIFT_ZOOM = 0.07;
 const SHIFT_PITCH_DEG = 2;
+
+/** While a rebuild collects point features, it takes a step (see BUILD_SLICE_MS) after this many of them. */
+const POINT_STEP = 512;
 
 /** Headroom on the last build's thinning scale when pre-filtering candidates. */
 const THIN_HINT_SLACK = 1.5;
@@ -231,6 +249,46 @@ interface RawFeature {
   bbox: GeoBounds;
   props: Record<string, unknown>;
   id?: string | number;
+  /** How it is placed (see placementFor; null: not at all), looked up once. */
+  mode?: Placement | null;
+  /** A point feature's points, made once (see pointsFor). */
+  points?: OwnPoint[];
+  /** A line or polygon feature's geometry in mercator metres, made once (see linesFor, polygonsFor). */
+  lines?: MercLines;
+  polygons?: MercPolygons;
+  /** What the placement expressions gave for a point feature (see placedFor). */
+  placed?: Placed;
+}
+
+/**
+ * A point of a point feature with what every rebuild needs of it: its position
+ * in mercator units (0..1), its de-duplication key and its part in distance
+ * thinning (see survivalSpare). A feature stays as long as its tile, a camera
+ * in motion rebuilds twice a second: computed per rebuild, this was a fifth of it.
+ */
+interface OwnPoint extends PlacedPoint {
+  ux: number;
+  uy: number;
+  key: number;
+  spare: number;
+}
+
+/**
+ * What the placement expressions give for an instance. A point feature's
+ * instances carry its id and properties, a generated one its own id and its
+ * feature's properties (see generatedFor): either way the values hold until
+ * what the expressions read besides those changes (`epoch`, see GltfManager.evalEpoch).
+ */
+interface Placed {
+  epoch: number;
+  /** The properties it was evaluated with: a generated instance is looked up by its id alone. */
+  props: Record<string, unknown>;
+  modelId: string;
+  rot: Vec3;
+  scl: Vec3;
+  tr: Vec3;
+  color?: Rgba;
+  alpha?: number;
 }
 
 /** Everything needed to (re)compute one instance's matrix. */
@@ -348,7 +406,11 @@ export class GltfManager {
   private readonly map: Map;
   private readonly group: THREE.Group;
   private readonly scene: THREE.Scene;
-  private readonly terrainSourceId: string;
+  /** The layer's `terrainSourceId`; without one the map's terrain is followed (see onTerrain). */
+  private readonly terrainSourceOption?: string;
+  private terrainSourceId: string;
+  /** The terrain the instances were last built for, to tell a change from a repeated `setTerrain`. */
+  private terrainKey: string;
   private readonly config: GltfConfig;
   private readonly models = new globalThis.Map<string, ModelEntry>();
   private readonly batches = new globalThis.Map<string, Batch>();
@@ -380,6 +442,7 @@ export class GltfManager {
 
   private readonly onData: (ev: unknown) => void;
   private readonly onMoveEnd: () => void;
+  private readonly onTerrain: () => void;
   private readonly unwatchGlobalState: (() => void)[];
   /** When the last `moveend` came and when one last made the layer refresh (ms). */
   private lastMoveEnd = -Infinity;
@@ -388,9 +451,33 @@ export class GltfManager {
   private moveTimer?: ReturnType<typeof setTimeout>;
   /** The view the instances were last built for. */
   private builtView?: ViewState;
+  /**
+   * What the per-instance expressions read besides the feature: whether any reads
+   * the zoom, and the global-state keys. `evalEpoch` counts their changes (see Placed).
+   */
+  private readonly evalReadsZoom: boolean;
+  private readonly evalStateRefs: string[];
+  private evalKey = '';
+  private evalEpoch = 0;
+  /** What the placement expressions gave for the generated instances the last rebuild placed, by instance id (see generatedFor). */
+  private generated = new globalThis.Map<number, Placed>();
   private paintRafId?: number;
   private needsRead = false;
   private needsBuild = false;
+  /** A rebuild in progress (see buildSteps); `needsBuild` stays set until it is complete. */
+  private building?: Generator<void, void, void>;
+  private buildRaf?: number;
+  /** A rebuild was asked for while one was in progress. */
+  private buildAgain = false;
+  /** The rebuild to come reads the tiled source first (see workSteps). */
+  private readPending = false;
+  /**
+   * A tiled source's features per tile, as read once (see readLoadedTiles):
+   * `stamp` is the tile's data, `zoom` the zoom its filter was evaluated at.
+   */
+  private tileFeatures = new globalThis.Map<unknown, { stamp: unknown; zoom: number; features: RawFeature[] }>();
+  /** The filter reads neither the zoom nor global state: a tile's features depend on its data alone. */
+  private readonly filterIsStatic: { zoom: boolean; state: boolean };
   private pendingDemRegions: GeoBounds[] = [];
   private rafId?: number;
   private settleTimer?: ReturnType<typeof setTimeout>;
@@ -409,15 +496,27 @@ export class GltfManager {
     map: Map,
     scene: THREE.Scene,
     sceneOrigin: LngLat,
-    terrainSourceId: string,
+    terrainSourceOption: string | undefined,
     config: GltfConfig,
   ) {
     this.map = map;
     this.scene = scene;
-    this.terrainSourceId = terrainSourceId;
+    this.terrainSourceOption = terrainSourceOption;
+    this.terrainSourceId = terrainSourceOption ?? map.getTerrain()?.source ?? '';
+    this.terrainKey = terrainKeyOf(map);
     this.config = config;
     this.origin = toOrigin(sceneOrigin);
-    this.filter = featureFilter(config.filter, 'filter').filter as typeof this.filter;
+    const compiledFilter = featureFilter(config.filter, 'filter');
+    this.filter = compiledFilter.filter as typeof this.filter;
+    this.filterIsStatic = {
+      zoom: !JSON.stringify(config.filter ?? null).includes('"zoom"'),
+      state: [...compiledFilter.getGlobalStateRefs()].length === 0,
+    };
+
+    const perInstance = [config.modelId, config.rotation, config.scale, config.translation, config.color,
+      this.instanceOpacity ? config.opacity : undefined].filter((e) => e !== undefined);
+    this.evalReadsZoom = perInstance.some((e) => !e.zoomConstant);
+    this.evalStateRefs = [...new Set(perInstance.flatMap((e) => [...e.globalStateRefs]))];
 
     this.group = new THREE.Group();
     scene.add(this.group);
@@ -471,8 +570,20 @@ export class GltfManager {
         if (!this.builtView || !sameView(this.builtView, viewState(map))) refreshForView();
       }, MOVE_SERIES_MS);
     };
+    // Terrain switched on, off or changed (another source, another exaggeration):
+    // the instances stand on the old heights until they are built again, and the
+    // DEM tiles to follow may be another source's (see onData). MapLibre fires
+    // `terrain` on every setTerrain, also with the same options: no rebuild then.
+    this.onTerrain = () => {
+      this.terrainSourceId = this.terrainSourceOption ?? map.getTerrain()?.source ?? '';
+      const key = terrainKeyOf(map);
+      if (key === this.terrainKey) return;
+      this.terrainKey = key;
+      this.schedule(false, true);
+    };
     map.on('data', this.onData);
     map.on('moveend', this.onMoveEnd);
+    map.on('terrain', this.onTerrain);
 
     // `["global-state", …]`. Colour/alpha are rewritten in place; anything that
     // decides placement or transforms needs a rebuild, which a move does anyway
@@ -543,6 +654,18 @@ export class GltfManager {
     }, DATA_SETTLE_MS);
   }
 
+  /**
+   * Whether the instances are those of the view as it is: nothing to read or
+   * rebuild, no rebuild in progress or due, all models loaded.
+   */
+  isIdle(): boolean {
+    if (this.disposed) return true;
+    if (this.needsRead || this.needsBuild || this.building || this.rafId !== undefined || this.paintRafId !== undefined) return false;
+    if (this.settleTimer !== undefined || this.moveTimer !== undefined || this.pendingDemRegions.length > 0) return false;
+    for (const model of this.models.values()) if (model.state === 'loading') return false;
+    return !this.needsImpostors();
+  }
+
   /** Re-read the source and rebuild all instances (coalesced to one frame). */
   refresh() {
     this.schedule(true, true);
@@ -551,6 +674,11 @@ export class GltfManager {
   private schedule(read = false, build = false) {
     if (this.disposed) return;
     this.needsRead ||= read;
+    if (this.building) {
+      // The rebuild in progress is for an older state: its end takes this up.
+      this.buildAgain ||= build || read;
+      return;
+    }
     this.needsBuild ||= build;
     if (this.rafId !== undefined) return;
     this.rafId = requestAnimationFrame(() => {
@@ -560,7 +688,7 @@ export class GltfManager {
   }
 
   private async flush() {
-    if (this.disposed) return;
+    if (this.disposed || this.building) return;
     // Out of the zoom range: drop everything and don't even read the source.
     // MapLibre already skips render(), but the instances would still be built.
     if (this.hidden()) {
@@ -576,14 +704,13 @@ export class GltfManager {
     if (this.needsRead) {
       this.needsRead = false;
       if (this.wholeDataset) await this.readGeoJson();
-      else this.features = this.readTiles();
+      else this.readPending = true; // tile by tile, in the slices of the rebuild
       if (this.disposed) return;
       this.needsBuild = true;
     }
     if (this.needsBuild) {
-      this.needsBuild = false;
       this.pendingDemRegions.length = 0; // a build bakes fresh elevations anyway
-      this.build();
+      this.runBuild();
       return;
     }
     const regions = this.pendingDemRegions;
@@ -606,8 +733,23 @@ export class GltfManager {
 
   // ---------------------------------------------------------------- features
 
-  /** Vector (and other tiled) sources: whatever is loaded for the viewport. */
-  private readTiles(): RawFeature[] {
+  /**
+   * Vector (and other tiled) sources: whatever is loaded for the viewport, read
+   * tile by tile with a step after each tile that had to be read (after a jump
+   * all tiles are new: in one piece that blocked for up to 75 ms).
+   */
+  private *readTilesSteps(): Generator<void, void, void> {
+    const perTile = yield* this.readLoadedTiles();
+    if (perTile) {
+      if (perTile.length === 0) this.warnIfUnconsumed();
+      this.features = perTile;
+    } else {
+      this.features = this.readTilesFromMap();
+    }
+  }
+
+  /** The same through `map.querySourceFeatures`, where MapLibre's internals are not as readLoadedTiles expects. */
+  private readTilesFromMap(): RawFeature[] {
     // NB: tile pieces of one line/polygon all carry the same feature id, so
     // de-duplication cannot happen here — it happens per generated position.
     const out: RawFeature[] = [];
@@ -626,13 +768,74 @@ export class GltfManager {
       if (!bbox) continue; // unsupported geometry
       out.push({ geometry: f.geometry, bbox, props: f.properties ?? {}, id: f.id });
     }
-    if (features.length === 0 && this.map.isSourceLoaded(this.config.sourceId)) {
-      this.warnOnce(
-        'empty',
-        `GltfLayer: source '${this.config.sourceId}' returned no features — a vector source only loads tiles while a style layer consumes it`,
-      );
-    }
+    if (features.length === 0) this.warnIfUnconsumed();
     return out;
+  }
+
+  /** No features although the source has loaded: most likely no style layer makes MapLibre load its tiles. */
+  private warnIfUnconsumed() {
+    if (!this.map.isSourceLoaded(this.config.sourceId)) return;
+    this.warnOnce(
+      'empty',
+      `GltfLayer: source '${this.config.sourceId}' returned no features — a vector source only loads tiles while a style layer consumes it`,
+    );
+  }
+
+  /**
+   * The same as `map.querySourceFeatures` gives, but read tile by tile and
+   * each tile only once: MapLibre converts every feature of every loaded tile
+   * anew on each call (in a Vienna view 15 ms for the trees, on every rebuild),
+   * while a camera in motion changes a tile or two at a time. Goes through
+   * MapLibre's internals as its own querySourceFeatures does (the source's
+   * renderable tiles, one per data tile, `tile.querySourceFeatures`); undefined
+   * where they are not as expected — the caller then asks the map. Yields after
+   * each tile it had to read.
+   */
+  private *readLoadedTiles(): Generator<void, RawFeature[] | undefined, void> {
+    if (!this.filterIsStatic.state) return undefined;
+    interface LoadedTile {
+      tileID: { canonical: { key: unknown }; overscaledZ: number };
+      latestFeatureIndex?: unknown;
+      querySourceFeatures(result: GeoJSONFeature[], params: unknown): void;
+    }
+    interface TileManager {
+      getRenderableIds(): unknown[];
+      getTileByID(id: unknown): LoadedTile | undefined;
+    }
+    try {
+      const style = (this.map as unknown as { style?: { tileManagers?: Record<string, TileManager>; sourceCaches?: Record<string, TileManager> } }).style;
+      const manager = (style?.tileManagers ?? style?.sourceCaches)?.[this.config.sourceId];
+      if (typeof manager?.getRenderableIds !== 'function' || typeof manager.getTileByID !== 'function') return undefined;
+      const params = { sourceLayer: this.config.sourceLayer, filter: this.config.filter, validate: false, globalState: globalStateOf(this.map) };
+      const next: GltfManager['tileFeatures'] = new globalThis.Map();
+      const out: RawFeature[] = [];
+      for (const id of manager.getRenderableIds()) {
+        const tile = manager.getTileByID(id);
+        if (!tile) continue; // gone since the list was made (the read goes over several frames)
+        if (typeof tile.querySourceFeatures !== 'function') return undefined;
+        const key = tile.tileID.canonical.key;
+        if (next.has(key)) continue; // several tiles (overzoomed, wrapped) of the same data
+        let entry = this.tileFeatures.get(key);
+        const zoom = this.filterIsStatic.zoom ? 0 : tile.tileID.overscaledZ;
+        if (!entry || entry.stamp !== tile.latestFeatureIndex || entry.zoom !== zoom) {
+          const features: GeoJSONFeature[] = [];
+          tile.querySourceFeatures(features, params);
+          entry = { stamp: tile.latestFeatureIndex, zoom, features: [] };
+          for (const f of features) {
+            const bbox = bboxOf(f.geometry);
+            if (!bbox) continue; // unsupported geometry
+            entry.features.push({ geometry: f.geometry, bbox, props: f.properties ?? {}, id: f.id });
+          }
+          yield;
+        }
+        next.set(key, entry);
+        for (const f of entry.features) out.push(f);
+      }
+      this.tileFeatures = next;
+      return out;
+    } catch {
+      return undefined;
+    }
   }
 
   /** GeoJSON sources: the full dataset, filtered here. */
@@ -667,13 +870,61 @@ export class GltfManager {
 
   // ------------------------------------------------------------------- build
 
-  /** Re-anchor the origin and rebuild every instance from the cached features. */
-  private build() {
+  /**
+   * Rebuild the instances (see workSteps) in slices of BUILD_SLICE_MS per
+   * frame, the first right away.
+   */
+  private runBuild() {
+    const steps = this.workSteps();
+    this.building = steps;
+    let before: number | undefined;
+    const slice = () => {
+      this.buildRaf = undefined;
+      if (this.disposed) return;
+      let done = this.hidden(); // out of the zoom range meanwhile: flush drops everything
+      const t0 = performance.now();
+      const budget = before === undefined ? BUILD_SLICE_MS : Math.max(BUILD_SLICE_MS, (t0 - before) * BUILD_SLICE_SHARE);
+      before = t0;
+      while (!done && performance.now() - t0 < budget) done = steps.next().done === true;
+      if (!done) {
+        this.buildRaf = requestAnimationFrame(slice);
+        return;
+      }
+      this.building = undefined;
+      this.needsBuild = this.buildAgain;
+      this.buildAgain = false;
+      if (this.needsRead || this.needsBuild || this.pendingDemRegions.length || this.hidden()) this.schedule();
+    };
+    slice();
+  }
+
+  /** A rebuild's steps: reading the tiled source where that is due, then building the instances. */
+  private *workSteps(): Generator<void, void, void> {
+    if (this.readPending) {
+      this.readPending = false;
+      yield* this.readTilesSteps();
+    }
+    yield* this.buildSteps();
+  }
+
+  /**
+   * Re-anchor the origin and rebuild every instance from the cached features —
+   * as steps that can be spread over frames: collecting the candidates and
+   * evaluating the survivors yield in between, the instances on screen (and the
+   * origin they stand on) stay until the last step swaps in the new ones.
+   */
+  private *buildSteps(): Generator<void, void, void> {
     this.builtView = viewState(this.map);
     const zoom = this.map.getZoom();
     const state = globalStateOf(this.map);
+    const evalKey = `${this.evalReadsZoom ? zoom : ''}|${this.evalStateRefs.map((k) => JSON.stringify(state[k])).join()}`;
+    if (evalKey !== this.evalKey) {
+      this.evalKey = evalKey;
+      this.evalEpoch++;
+    }
     const om = MercatorCoordinate.fromLngLat(this.map.getCenter(), 0);
-    this.origin = { x: om.x, y: om.y, z: om.z, s: om.meterInMercatorCoordinateUnits() };
+    // The new origin: `this.origin` is what the instances on screen stand on, until the swap.
+    const origin: SceneOrigin = { x: om.x, y: om.y, z: om.z, s: om.meterInMercatorCoordinateUnits() };
 
     let view = paddedBounds(this.map);
     // `model-thinning-distance`: full density up to it, halving every further
@@ -690,9 +941,8 @@ export class GltfManager {
     // any pitch: a circle around the map centre through the (padded) screen
     // corners. Tilting moves the camera behind the centre, so the camera
     // distance alone would turn the far half of that area into billboards.
-    const canvas = this.map.getCanvas();
-    const topDownRadius =
-      (Math.hypot(canvas.clientWidth, canvas.clientHeight) / 2) * (1 + FRAME_PAD) / (512 * 2 ** zoom);
+    const [width, height] = viewSize(this.map);
+    const topDownRadius = (Math.hypot(width, height) / 2) * (1 + FRAME_PAD) / (512 * 2 ** zoom);
     if (cam) {
       const nw = new MercatorCoordinate(cam.x - maxMerc, cam.y - maxMerc).toLngLat();
       const se = new MercatorCoordinate(cam.x + maxMerc, cam.y + maxMerc).toLngLat();
@@ -713,7 +963,8 @@ export class GltfManager {
     // Large models reach far beyond their anchor (a 2 km bridge, a 300 m tower
     // whose foot is below the screen): grow the pre-filter by the farthest reach.
     const reachMax = this.maxReach(zoom, state);
-    const visible = this.features.filter((f) => overlaps(growBounds(view, reachMax), f.bbox));
+    const reachView = growBounds(view, reachMax);
+    const visible = this.features.filter((f) => overlaps(reachView, f.bbox));
     // The budget is enforced on the collected on-screen candidates at the end;
     // the bbox-based pre-thinning only guards against runaway candidate counts.
     const max = this.config.maxInstances;
@@ -739,33 +990,56 @@ export class GltfManager {
     // overlapping tile pieces AND between features that place on the same spot.
     const seen = new Set<number>();
     const limit = Math.round(this.config.maxInstances * HARD_STOP_FACTOR);
-    let placed = 0;
+    let count = 0;
     // Per candidate: `need` is the smallest factor on the thinning distance at
     // which it survives (0 without distance thinning); see survivalScale().
-    const candidates: { f: RawFeature; point: PlacedPoint; x: number; y: number; need: number }[] = [];
+    // `own`: a point of a point feature (an OwnPoint), whose expression values are kept (see placedFor).
+    const candidates: { f: RawFeature; point: PlacedPoint; x: number; y: number; need: number; own: boolean }[] = [];
+
+    // Whether any model is culled by its extent (see reachOf): a layer of small models (trees) then asks for
+    // no extent per candidate, which for generated instances evaluated `model-id` once more for each. Models
+    // load between the steps, so this is looked up again after each.
+    const anyLarge = (): boolean => {
+      for (const model of this.models.values()) if (model.extent && !isSmall(model.extent)) return true;
+      return false;
+    };
+    let large = anyLarge();
 
     const groups = new globalThis.Map<string, { recs: Rec[]; colors?: Rgba[]; alphas?: number[] }>();
-    const add = (f: RawFeature, point: PlacedPoint): boolean => {
-      const x = point.x !== undefined ? unitX(point.x) : mercX(point.lng);
-      const y = point.y !== undefined ? unitY(point.y) : mercY(point.lat);
+    // The generated instances this rebuild places, for the next one (see generatedFor).
+    const generated = new globalThis.Map<number, Placed>();
+    const add = (f: RawFeature, point: PlacedPoint): boolean =>
+      consider(f, point, point.x !== undefined ? unitX(point.x) : mercX(point.lng), point.y !== undefined ? unitY(point.y) : mercY(point.lat), false);
+    const consider = (f: RawFeature, point: PlacedPoint, x: number, y: number, own: boolean): boolean => {
       // A pitched, rotated view's lng/lat bbox is mostly off-screen — don't
       // spend the budget there. A model counts as on screen while any part of
       // its extent is (the anchor alone where the extent or matrix is unknown).
-      const reach = boxInFrame ? this.reachOf(f, point.id, zoom, state) : undefined;
+      const reach = boxInFrame && large ? this.reachOf(f, point.id, zoom, state, own ? this.placedFor(f, zoom, state) : undefined) : undefined;
       if (reach && boxInFrame) {
-        const s = this.origin.s;
+        const s = origin.s;
         if (!boxInFrame(x, y, reach.radius * s, (ground + reach.bottom) * s, (ground + reach.top) * s)) return true;
       } else if (inFrame && !inFrame(x, y)) return true;
+      // A point feature that two tiles carry (their buffers overlap) is placed once.
+      // Looked up for what is on screen only: with every point of every loaded
+      // tile it was a quarter of a rebuild.
+      if (own) {
+        const key = (point as OwnPoint).key;
+        if (seen.has(key)) return true;
+        seen.add(key);
+      }
       // Distance thinning measures to the model's nearest side, not its anchor.
       const near = reach && cam ? Math.max(0, Math.hypot(x - cam.x, y - cam.y) - reach.radius * cam.s) : 0;
-      const need = cam ? survivalScale((reach ? near : Math.hypot(x - cam.x, y - cam.y)) / cam.s, thin, point.id) : 0;
+      const need = cam
+        ? (reach ? near : Math.hypot(x - cam.x, y - cam.y)) / cam.s / (thin * (own ? (point as OwnPoint).spare : survivalSpare(point.id)))
+        : 0;
       if (need >= cutoff) return true;
-      candidates.push({ f, point, x, y, need });
+      candidates.push({ f, point, x, y, need, own });
       return candidates.length < budget;
     };
-    const place = (f: RawFeature, point: PlacedPoint, x: number, y: number): boolean => {
+    const place = (f: RawFeature, point: PlacedPoint, x: number, y: number, own: boolean): boolean => {
       const id = point.id;
-      const modelId = this.config.modelId(zoom, f.props, id, state);
+      const placed = own ? this.placedFor(f, zoom, state) : this.generatedFor(f, id, zoom, state);
+      const modelId = placed.modelId;
       const model = this.models.get(modelId);
       if (!model) {
         this.warnOnce(
@@ -780,7 +1054,7 @@ export class GltfManager {
       const far =
         impostorCam !== undefined &&
         Math.hypot(x - impostorCam.x, y - impostorCam.y) / impostorCam.s >= impostorDistance &&
-        Math.hypot(x - this.origin.x, y - this.origin.y) > topDownRadius;
+        Math.hypot(x - origin.x, y - origin.y) > topDownRadius;
       const key = far && this.models.get(impostorKey(modelId))?.state === 'ready' ? impostorKey(modelId) : modelId;
 
       let g = groups.get(key);
@@ -797,43 +1071,48 @@ export class GltfManager {
       g.recs.push({
         lng: point.lng,
         lat: point.lat,
-        east: (x - this.origin.x) / this.origin.s,
-        north: (this.origin.y - y) / this.origin.s,
-        rot: [...this.config.rotation(zoom, f.props, id, state)] as Vec3,
-        scl: [...this.config.scale(zoom, f.props, id, state)] as Vec3,
-        tr: [...this.config.translation(zoom, f.props, id, state)] as Vec3,
+        east: (x - origin.x) / origin.s,
+        north: (origin.y - y) / origin.s,
+        rot: placed.rot,
+        scl: placed.scl,
+        tr: placed.tr,
         props: f.props,
         id,
       });
-      g.colors?.push(this.config.color!(zoom, f.props, id, state));
-      g.alphas?.push(this.config.opacity!(zoom, f.props, id, state));
-      return ++placed < limit;
+      g.colors?.push(placed.color!);
+      g.alphas?.push(placed.alpha!);
+      if (!own) generated.set(id, placed);
+      return ++count < limit;
     };
 
-    const collect = () => {
+    const collect = function* (this: GltfManager) {
       seen.clear();
       candidates.length = 0;
+      let points = 0;
       outer: for (let i = 0; i < visible.length; i++) {
         const f = visible[i];
         const spacing = cells[i];
-        switch (this.placementFor(f)) {
+        const mode = this.placementFor(f);
+        // A step after each line or polygon (placing along one can take long) and after every POINT_STEP point features.
+        if (i && (mode !== 'point' || ++points % POINT_STEP === 0)) {
+          yield;
+          large = anyLarge();
+        }
+        switch (mode) {
           case 'point':
-            for (const [lng, lat] of pointsOf(f.geometry)) {
-              // Points keep their SOURCE id, so `['id']` still addresses the OSM
-              // feature; generated instances get a synthetic one instead.
-              const key = positionKey(toMercX(lng), toMercY(lat));
-              if (seen.has(key)) continue;
-              seen.add(key);
-              if (!add(f, { lng, lat, id: f.id as number })) break outer;
+            // Points keep their SOURCE id, so `['id']` still addresses the OSM
+            // feature; generated instances get a synthetic one instead.
+            for (const point of pointsFor(f)) {
+              if (!consider(f, point, point.ux, point.uy, true)) break outer;
             }
             break;
           case 'line':
-            if (!placeAlongLine(linesOf(f.geometry), spacing, clip, seen, (pt) => add(f, pt))) {
+            if (!placeAlongLine(linesFor(f).lines, spacing, clip, seen, (pt) => add(f, pt))) {
               break outer;
             }
             break;
           case 'fill':
-            if (!scatterInPolygon(polysOf(f.geometry), spacing, clip, seen, (pt) => add(f, pt), keep, rowSpan, accept)) {
+            if (!scatterInPolygon(polygonsFor(f).polygons, spacing, clip, seen, (pt) => add(f, pt), keep, rowSpan, accept)) {
               break outer;
             }
             break;
@@ -841,11 +1120,11 @@ export class GltfManager {
             break;
         }
       }
-    };
-    collect();
+    }.bind(this);
+    yield* collect();
     if (cutoff < 1 && candidates.length <= max) {
       cutoff = 1;
-      collect();
+      yield* collect();
     }
 
     if (candidates.length) {
@@ -864,12 +1143,18 @@ export class GltfManager {
             `zoom-driven model-spacing or set model-thinning-distance`,
         );
       }
+      let evaluated = 0;
       for (const c of candidates) {
         if (cam ? c.need >= scale : survivalHash(c.point.id) >= share) continue;
-        if (!place(c.f, c.point, c.x, c.y)) break;
+        if (!place(c.f, c.point, c.x, c.y, c.own)) break;
+        if (++evaluated % 128 === 0) yield;
       }
     }
 
+    // The swap, in one step: the new origin with the instances that stand on it.
+    yield;
+    this.origin = origin;
+    this.generated = generated;
     for (const [modelId, batch] of this.batches) {
       if (!groups.has(modelId)) this.disposeBatch(modelId, batch);
     }
@@ -890,13 +1175,13 @@ export class GltfManager {
    * while the model isn't loaded, and for small models (SMALL_MODEL). A tilted instance (roll or pitch) may point
    * any way, so its reach then covers all directions.
    */
-  private reachOf(f: RawFeature, id: number, zoom: number, state: Record<string, unknown>): ModelExtent | undefined {
-    const extent = this.models.get(this.config.modelId(zoom, f.props, id, state))?.extent;
+  private reachOf(f: RawFeature, id: number, zoom: number, state: Record<string, unknown>, placed?: Placed): ModelExtent | undefined {
+    const extent = this.models.get(placed ? placed.modelId : this.config.modelId(zoom, f.props, id, state))?.extent;
     // Small models (vegetation, street furniture) keep the cheap anchor test.
     if (!extent || isSmall(extent)) return undefined;
-    const scl = this.config.scale(zoom, f.props, id, state);
-    const tr = this.config.translation(zoom, f.props, id, state);
-    const rot = this.config.rotation(zoom, f.props, id, state);
+    const scl = placed ? placed.scl : this.config.scale(zoom, f.props, id, state);
+    const tr = placed ? placed.tr : this.config.translation(zoom, f.props, id, state);
+    const rot = placed ? placed.rot : this.config.rotation(zoom, f.props, id, state);
     const h = Math.max(Math.abs(scl[0]), Math.abs(scl[2]));
     const a = extent.bottom * scl[1];
     const b = extent.top * scl[1];
@@ -909,6 +1194,46 @@ export class GltfManager {
       top = Math.max(top, radius);
     }
     return { radius, bottom, top };
+  }
+
+  /**
+   * The placement expressions' values for a point feature, evaluated once per
+   * feature and state of what they read besides it (see Placed): per instance and
+   * rebuild they were a quarter of a rebuild — the trees of a view stay the same
+   * trees while the camera moves.
+   */
+  private placedFor(f: RawFeature, zoom: number, state: GlobalState): Placed {
+    const p = f.placed;
+    if (p && p.epoch === this.evalEpoch) return p;
+    return (f.placed = this.evaluate(f, f.id as number, zoom, state));
+  }
+
+  /**
+   * The same for an instance generated along a line or inside a polygon: its id
+   * is a hash of its position, so the values hold for that id and the feature's
+   * properties. Kept from one rebuild to the next (a camera in motion places
+   * mostly the trees it placed before) and only for the instances the last
+   * rebuild placed, at most maxInstances x HARD_STOP_FACTOR: evaluated per
+   * instance and rebuild they were a sixth to a third of a rebuild of woods.
+   */
+  private generatedFor(f: RawFeature, id: number, zoom: number, state: GlobalState): Placed {
+    const p = this.generated.get(id);
+    return p && p.epoch === this.evalEpoch && p.props === f.props ? p : this.evaluate(f, id, zoom, state);
+  }
+
+  /** What the placement expressions give for an instance of `f` with the id `id`, as of now. */
+  private evaluate(f: RawFeature, id: number, zoom: number, state: GlobalState): Placed {
+    const c = this.config;
+    return {
+      epoch: this.evalEpoch,
+      props: f.props,
+      modelId: c.modelId(zoom, f.props, id, state),
+      rot: [...c.rotation(zoom, f.props, id, state)] as Vec3,
+      scl: [...c.scale(zoom, f.props, id, state)] as Vec3,
+      tr: [...c.translation(zoom, f.props, id, state)] as Vec3,
+      color: c.color?.(zoom, f.props, id, state),
+      alpha: this.instanceOpacity ? c.opacity!(zoom, f.props, id, state) : undefined,
+    };
   }
 
   /**
@@ -938,6 +1263,11 @@ export class GltfManager {
 
   /** Which placement mode a feature uses: the configured one, or by geometry. */
   private placementFor(f: RawFeature): Placement | undefined {
+    if (f.mode === undefined) f.mode = this.placementOf(f) ?? null;
+    return f.mode ?? undefined;
+  }
+
+  private placementOf(f: RawFeature): Placement | undefined {
     const type = f.geometry.type;
     const wanted =
       this.config.placement !== 'auto'
@@ -995,7 +1325,7 @@ export class GltfManager {
       }
       if (mode === 'point') {
         cells[i] = 0;
-        estimate += pointsOf(f.geometry).length;
+        estimate += f.geometry.type === 'Point' ? 1 : (f.geometry.coordinates as unknown[]).length;
         continue;
       }
       const spacing = Math.max(MIN_SPACING_M, this.config.spacing(zoom, f.props, f.id, state));
@@ -1004,8 +1334,8 @@ export class GltfManager {
       const cell = spacing * mercatorScale((f.bbox.south + f.bbox.north) / 2);
       estimate +=
         mode === 'fill'
-          ? (polygonArea(polysOf(f.geometry)) / (cell * cell)) * inView(f.bbox, view)
-          : lineLength(linesOf(f.geometry)) / cell;
+          ? (polygonsFor(f).area / (cell * cell)) * inView(f.bbox, view)
+          : linesFor(f).length / cell;
     }
 
     if (estimate <= max) return { cells, keep: 1 };
@@ -1099,11 +1429,23 @@ export class GltfManager {
   /** Write per-instance colours / alphas (either may be absent). */
   private writePaint(batch: Batch, colors?: Rgba[], alphas?: number[]) {
     const n = batch.recs.length;
+    // Instances mostly share their colour (often one constant for the layer):
+    // converted once per run of the same colour.
+    let last: Rgba | undefined;
     for (let i = 0; i < n; i++) {
       const color = colors?.[i];
       if (color) {
-        this.sColor.setRGB(color[0], color[1], color[2], THREE.SRGBColorSpace);
-        for (const mesh of batch.meshes) mesh.setColorAt(i, this.sColor);
+        if (color !== last && !(last && color[0] === last[0] && color[1] === last[1] && color[2] === last[2])) {
+          this.sColor.setRGB(color[0], color[1], color[2], THREE.SRGBColorSpace);
+        }
+        last = color;
+        for (const mesh of batch.meshes) {
+          const a = mesh.instanceColor?.array;
+          if (!a) continue;
+          a[i * 3] = this.sColor.r;
+          a[i * 3 + 1] = this.sColor.g;
+          a[i * 3 + 2] = this.sColor.b;
+        }
       }
       const alpha = alphas?.[i];
       if (alpha !== undefined && batch.alphaAttr) batch.alphaAttr.setX(i, alpha);
@@ -1456,7 +1798,9 @@ export class GltfManager {
     this.disposed = true;
     this.map.off('data', this.onData);
     this.map.off('moveend', this.onMoveEnd);
+    this.map.off('terrain', this.onTerrain);
     if (this.rafId !== undefined) cancelAnimationFrame(this.rafId);
+    if (this.buildRaf !== undefined) cancelAnimationFrame(this.buildRaf);
     if (this.paintRafId !== undefined) cancelAnimationFrame(this.paintRafId);
     for (const unwatch of this.unwatchGlobalState) unwatch();
     if (this.settleTimer !== undefined) clearTimeout(this.settleTimer);
@@ -1657,7 +2001,36 @@ function survivalHash(id: number): number {
  * every scale above this value.
  */
 function survivalScale(d: number, full: number, id: number): number {
-  return d / (full * (1 - Math.log2(survivalHash(id))));
+  return d / (full * survivalSpare(id));
+}
+
+/** The instance's own part of {@link survivalScale}: 1 - log2 u. */
+function survivalSpare(id: number): number {
+  return 1 - Math.log2(survivalHash(id));
+}
+
+/** A point feature's points as a rebuild needs them (see OwnPoint). */
+function pointsFor(f: RawFeature): OwnPoint[] {
+  if (f.points) return f.points;
+  const id = f.id as number;
+  const spare = survivalSpare(id);
+  return (f.points = pointsOf(f.geometry).map(([lng, lat]) => ({
+    lng,
+    lat,
+    id,
+    ux: mercX(lng),
+    uy: mercY(lat),
+    key: positionKey(toMercX(lng), toMercY(lat)),
+    spare,
+  })));
+}
+
+/** A line or polygon feature's geometry as a rebuild needs it (see MercLines). */
+function linesFor(f: RawFeature): MercLines {
+  return (f.lines ??= mercLines(linesOf(f.geometry)));
+}
+function polygonsFor(f: RawFeature): MercPolygons {
+  return (f.polygons ??= mercPolygons(polysOf(f.geometry)));
 }
 
 /**
@@ -1704,11 +2077,30 @@ interface ViewState {
   height: number;
 }
 
+/** Source and exaggeration of the map's terrain, `''` without one. */
+function terrainKeyOf(map: Map): string {
+  const terrain = map.getTerrain();
+  return terrain ? `${terrain.source}|${terrain.exaggeration ?? 1}` : '';
+}
+
 function viewState(map: Map): ViewState {
   const c = MercatorCoordinate.fromLngLat(map.getCenter(), 0);
+  const [width, height] = viewSize(map);
+  return { x: c.x, y: c.y, zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch(), width, height };
+}
+
+/**
+ * The map's size in CSS pixels, from MapLibre's (internal) transform: the
+ * canvas's `clientWidth` is a layout read, and viewState runs on every
+ * `moveend` — with a camera set every frame that was 0.1 ms per layer and frame.
+ */
+function viewSize(map: Map): [number, number] {
+  type T = { width?: number; height?: number };
+  const m = map as unknown as { transform?: T; _camera?: { transform?: T } };
+  const t = m.transform ?? m._camera?.transform;
+  if (t?.width && t.height) return [t.width, t.height];
   const canvas = map.getCanvas();
-  return { x: c.x, y: c.y, zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch(),
-    width: canvas.clientWidth, height: canvas.clientHeight };
+  return [canvas.clientWidth, canvas.clientHeight];
 }
 
 /** Smallest turn between two bearings, degrees. */

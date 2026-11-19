@@ -69,6 +69,30 @@ export type Keep = number;
 /** Flat `[x0, y0, x1, y1, …]` in mercator metres. */
 export type MercRing = number[];
 
+/**
+ * A line or polygon feature's geometry as placing needs it: in mercator metres,
+ * with its length or area for the budget. Made once per feature — a feature
+ * stays as long as its tile, a camera in motion rebuilds twice a second, and
+ * converting every vertex on each rebuild (twice for a polygon: for its area
+ * and for its rows) was a fifth of a rebuild of woods with many vertices.
+ */
+export interface MercLines {
+  lines: MercRing[];
+  /** Total length in mercator metres. */
+  length: number;
+}
+export interface MercPolygons {
+  polygons: MercPolygon[];
+  /** Total area in mercator m², holes subtracted. */
+  area: number;
+}
+/** A polygon's rings (the exterior first, then its holes) and the range of y they span. */
+export interface MercPolygon {
+  rings: MercRing[];
+  minY: number;
+  maxY: number;
+}
+
 // ----------------------------------------------------------------- mercator
 
 export const toMercX = (lng: number): number => R * lng * D2R;
@@ -118,6 +142,27 @@ export function toMerc(coords: number[][]): MercRing {
   return out;
 }
 
+/** A GeoJSON (multi)line as {@link MercLines}. */
+export function mercLines(lines: number[][][]): MercLines {
+  const merc = lines.map(toMerc);
+  return { lines: merc, length: lineLength(merc) };
+}
+
+/** A GeoJSON (multi)polygon as {@link MercPolygons}. */
+export function mercPolygons(polygons: number[][][][]): MercPolygons {
+  const merc = polygons.map((rings) => {
+    const polygon: MercPolygon = { rings: rings.map(toMerc), minY: Infinity, maxY: -Infinity };
+    for (const ring of polygon.rings) {
+      for (let i = 1; i < ring.length; i += 2) {
+        if (ring[i] < polygon.minY) polygon.minY = ring[i];
+        if (ring[i] > polygon.maxY) polygon.maxY = ring[i];
+      }
+    }
+    return polygon;
+  });
+  return { polygons: merc, area: polygonArea(merc) };
+}
+
 // --------------------------------------------------------------------- hash
 
 /** 32-bit integer hash (xxHash-style finaliser). Same input → same output. */
@@ -160,15 +205,14 @@ function emitAt(px: number, py: number, seen: Set<number>, emit: Emit, accept?: 
  * Returns false if `emit` asked to stop.
  */
 export function placeAlongLine(
-  lines: number[][][],
+  lines: MercRing[],
   spacing: number,
   clip: MercBounds,
   seen: Set<number>,
   emit: Emit,
 ): boolean {
-  for (const line of lines) {
-    if (line.length < 2) continue;
-    const m = toMerc(line);
+  for (const m of lines) {
+    if (m.length < 4) continue;
     const cell0 = bandAt(m[1], spacing).cell;
     const h = hash32(Math.round(m[0] / cell0), Math.round(m[1] / cell0));
     let next = ((h & 0xffff) / 65536) * cell0;
@@ -212,7 +256,7 @@ export function placeAlongLine(
  * containment test.
  */
 export function scatterInPolygon(
-  polygons: number[][][][],
+  polygons: MercPolygon[],
   spacing: number,
   clip: MercBounds,
   seen: Set<number>,
@@ -223,18 +267,10 @@ export function scatterInPolygon(
 ): boolean {
   const crossings: number[] = [];
 
-  for (const rings of polygons) {
-    const merc = rings.map(toMerc);
-    let minY = Infinity;
-    let maxY = -Infinity;
-    for (const ring of merc) {
-      for (let i = 1; i < ring.length; i += 2) {
-        if (ring[i] < minY) minY = ring[i];
-        if (ring[i] > maxY) maxY = ring[i];
-      }
-    }
-    minY = Math.max(minY, clip.minY);
-    maxY = Math.min(maxY, clip.maxY);
+  for (const polygon of polygons) {
+    const merc = polygon.rings;
+    const minY = Math.max(polygon.minY, clip.minY);
+    const maxY = Math.min(polygon.maxY, clip.maxY);
     if (minY > maxY) continue;
 
     const firstBand = Math.floor(minY / BAND_H);
@@ -291,11 +327,11 @@ export function scatterInPolygon(
 // ------------------------------------------------------------------ budget
 
 /** Total area of a (multi)polygon in mercator m², holes subtracted. */
-export function polygonArea(polygons: number[][][][]): number {
+function polygonArea(polygons: MercPolygon[]): number {
   let total = 0;
-  for (const rings of polygons) {
+  for (const { rings } of polygons) {
     for (let r = 0; r < rings.length; r++) {
-      const m = toMerc(rings[r]);
+      const m = rings[r];
       let twice = 0;
       for (let i = 0, j = m.length - 2; i < m.length; j = i, i += 2) {
         twice += m[j] * m[i + 1] - m[i] * m[j + 1];
@@ -308,10 +344,9 @@ export function polygonArea(polygons: number[][][][]): number {
 }
 
 /** Total length of a (multi)line in mercator metres. */
-export function lineLength(lines: number[][][]): number {
+function lineLength(lines: MercRing[]): number {
   let total = 0;
-  for (const line of lines) {
-    const m = toMerc(line);
+  for (const m of lines) {
     for (let i = 2; i < m.length; i += 2) {
       total += Math.hypot(m[i] - m[i - 2], m[i + 1] - m[i - 1]);
     }

@@ -12,15 +12,18 @@ import type { PbfReader as Pbf } from 'pbf';
  * bounding box (two corner points), not real geometry — callers skip it.
  */
 
-export interface Vertex3D {
-  x: number;
-  y: number;
-  z: number;
+/**
+ * A 3D feature's geometry, flat: a tile has millions of vertices, and an object
+ * per vertex costs more than decoding it. Ring r is the vertices `ringEnd[r - 1]`
+ * (0 for the first) up to `ringEnd[r]`, polygon p the rings `polygonEnd[p - 1]`
+ * up to `polygonEnd[p]` — its outline first, then its holes.
+ */
+export interface Geometry3D {
+  /** x, y, z per vertex in tile units (z: decimetres). */
+  xyz: Float64Array;
+  ringEnd: number[];
+  polygonEnd: number[];
 }
-
-/** A polygon is a list of rings; a ring is a list of vertices. */
-export type Ring = Vertex3D[];
-export type Polygon = Ring[];
 
 export class VectorTileFeature {
   properties: Record<string, number | string | boolean> = {};
@@ -47,7 +50,7 @@ export class VectorTileFeature {
     pbf.readFields(readFeature, this, end);
   }
 
-  loadGeometry(): Polygon[] {
+  loadGeometry(): Geometry3D {
     const pbf = this._pbf;
     pbf.pos = this._geometry;
 
@@ -57,9 +60,13 @@ export class VectorTileFeature {
     let x = 0;
     let y = 0;
     let z = 0;
-    let polygon: Polygon = [];
-    let ring: Ring | null = null;
-    const polygons: Polygon[] = [];
+    // A vertex is three varints of at least a byte each: room for all of them.
+    const xyz = new Float64Array(end - pbf.pos);
+    /** Values written, and where the ring being read starts. */
+    let n = 0;
+    let ringStart = 0;
+    const ringEnd: number[] = [];
+    const polygonEnd: number[] = [];
 
     while (pbf.pos < end) {
       if (length <= 0) {
@@ -70,27 +77,30 @@ export class VectorTileFeature {
       length--;
 
       if (cmd === 1 || cmd === 2) {
-        if (cmd === 1) ring = []; // moveTo
+        if (cmd === 1) n = ringStart; // moveTo
         x += pbf.readSVarint();
         y += pbf.readSVarint();
         z += pbf.readSVarint();
-        ring!.push({ x, y, z });
+        xyz[n++] = x;
+        xyz[n++] = y;
+        xyz[n++] = z;
       } else if (cmd === 7) {
+        ringEnd.push(n / 3);
+        ringStart = n;
         // start a new polygon…
         if (length) {
-          polygon.push(ring!);
-          polygons.push(polygon);
-          polygon = [];
+          polygonEnd.push(ringEnd.length);
           length--;
           // …or add an inner ring (hole) to the previous polygon
         } else {
-          polygons[polygons.length - 1].push(ring!);
+          if (!polygonEnd.length) throw new Error('inner ring without a polygon');
+          polygonEnd[polygonEnd.length - 1] = ringEnd.length;
         }
       } else {
         throw new Error(`unknown command ${cmd}`);
       }
     }
-    return polygons;
+    return { xyz: xyz.slice(0, n), ringEnd, polygonEnd };
   }
 
   /**

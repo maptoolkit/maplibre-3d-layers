@@ -134,7 +134,8 @@ source also sinks the walls standing on a building's base 10 m below it as a
 reserve for slopes (buildings3d `MTK_BUILDINGS3D_GROUND_DEPTH`); the terrain
 surface hides that reserve. Without terrain the meshes sit on the flat map,
 which hides nothing below it, so the reserve is cut off at the base. Switching
-the terrain on or off re-bakes the loaded tiles. Landmarks are placed in their
+the terrain on or off puts the loaded tiles onto the new ground (see
+[Loading](#loading)); nothing is loaded again. Landmarks are placed in their
 own way, see [Landmarks](#landmarks-models-in-the-tiles).
 
 ### Options
@@ -145,8 +146,9 @@ own way, see [Landmarks](#landmarks-models-in-the-tiles).
 | `source` | ✅ | id of a vector source already added to the map |
 | `source-layer` | ✅ | vector-tile layer to read (e.g. `buildings3d`) |
 | `filter` | — | MapLibre filter expression; features that fail are dropped |
-| `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's active terrain |
-| `workers` | — | at most this many tile workers (default: half the logical processors, at least 1, at most 4). They start as tiles queue up |
+| `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's terrain, also one switched on or changed after the layer was added |
+| `workers` | — | at most this many tile workers (default: half the logical processors, at least 1, at most 4). They start as tiles queue up; the layers of one source share them |
+| `tileCache` | — | megabytes of tiles to keep, hidden, after they left the view (default `64`; `0` keeps nothing). See [Loading](#loading) |
 | `layout.visibility` | — | `'visible'` (default) / `'none'` |
 | `paint['fill-3d-color']` | — | colour, constant or expression (default white) |
 | `paint['fill-3d-opacity']` | — | `0..1`, constant or expression (default `1`) |
@@ -155,9 +157,72 @@ Colour and opacity are evaluated per feature against its properties, the
 current zoom and the map's [global state](#global-state). An opacity that is the
 same for every feature (zoom and global state only) is evaluated every frame.
 
+### Loading
+
 Tiles are parsed and triangulated in web workers, several side by side (see
 `workers`): each tile goes to an idle worker, or to a new one while the pool
 may grow, else to the one with the least to do.
+
+- **From the start.** A layer asks for the tiles of the view as soon as the
+  source's TileJSON has been read; it does not wait for the tiles MapLibre itself
+  loads from that source.
+- **One load per tile.** All `Fill3DLayer`s on a source (the buildings and the
+  landmarks, say) share a tile's fetch and its pass through a worker, which reads
+  the tile once and builds each layer's geometry from it.
+- **Only the zoom levels that hold something.** In a pitched view MapLibre covers
+  the distance with tiles of lower zoom levels. The layer leaves out the levels
+  where it has nothing to draw: where the source's TileJSON (`vector_layers`) does
+  not list its `source-layer`, and where its `filter` cannot pass (comparisons of
+  `["zoom"]` with a number, also inside `["all", …]`); likewise for `extrusion`.
+  With `buildings3d` at zoom 15 only, that is about half of the tiles.
+- **Prepared in the worker.** Colours and bounds come ready from the worker; the
+  main thread wraps the buffers and never walks the vertices. Arriving tiles are put on the map one
+  per frame — more where frames take longer than a sixtieth of a second, so a
+  slow device does not wait a frame per tile.
+- **Memory.** Every vertex buffer goes to the GPU once and is not held in memory
+  after its upload (positions, normals, colours, AO attributes and tables,
+  indices). What stays are small tables per tile: its ground points, its wall
+  feet, its features. A Vienna view of 2.7 million vertices holds 10 MB of
+  arrays instead of 129 MB.
+- **Tiles are kept.** A tile that leaves the view stays in memory, hidden, within
+  `tileCache` megabytes (oldest given up first), and is on screen without loading
+  when the view comes back — after a pan back, a turn, a zoom out and in again.
+  `layer.setTileCache(megabytes)` changes the size later. Tiles that turned out
+  to hold nothing for the layer are remembered and not loaded again.
+- **On terrain, tile by tile.** Where a vertex stands is worked out in the vertex
+  shader: from its height as the tile gives it (above its building's base) and
+  two small tables per tile — the terrain height at each of the tile's ground
+  points, and the height each building's base goes to. Putting a tile onto the
+  terrain means sampling the terrain and writing those tables; no vertex is
+  walked or uploaded again. When terrain data arrives under a tile, the terrain
+  is sampled again and compared, exactly; only a change rewrites the tables.
+  Tiles are looked at one per frame, the nearest to the map centre first, also
+  after the terrain was switched on or off.
+- **Loading ahead.** `layer.preload({ center, zoom, pitch, bearing, padding })`
+  loads the tiles that camera would show, without showing them; when the map
+  gets there (a jump, the end of a flight) they are on screen at once. The next
+  call replaces the view loaded ahead; it may exceed `tileCache` until it has been
+  shown. Returns the number of tiles it asked for (0 with `tileCache: 0`). It
+  uses MapLibre internals (a copy of the map's transform); where they are missing
+  it does nothing.
+
+  ```js
+  // a tour: while the camera circles one stop, load the next
+  for (const layer of fill3dLayers) layer.preload({ center: next.center, zoom: 16.5, pitch: 60, bearing: 120 });
+  ```
+- **Done loading?** `layer.isIdle()` tells whether the layer shows its view
+  completely and nothing of it is still changing: every tile loaded, its ambient
+  occlusion in and faded in, everything on the terrain as it is. `await
+  layer.whenIdle()` waits for that (it looks once per frame). Both speak for the
+  layer alone, not for the rest of the map (see the map's `idle` event), and not
+  for tiles loaded ahead.
+
+  ```js
+  // a still frame of a view: wait for the map and for the 3D layers
+  map.jumpTo(view);
+  await map.once('idle');
+  await Promise.all(layers3d.map((layer) => layer.whenIdle()));
+  ```
 
 ### Landmarks: models in the tiles
 
@@ -369,7 +434,7 @@ models as billboards — see [Performance and density](#performance-and-density)
 | `filter` | — | MapLibre filter expression; features that fail are dropped |
 | `minzoom` / `maxzoom` | — | hidden below `minzoom` and at/above `maxzoom`; outside the range the layer costs nothing |
 | `maxInstances` | — | instance budget (default `20000`); denser data is thinned out, far away first, see [Performance and density](#performance-and-density) |
-| `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's active terrain |
+| `terrainSourceId` | — | raster-dem source for elevation; defaults to the map's terrain, also one switched on or changed after the layer was added |
 | `doubleSided` | — | `false` draws front faces only, `true` both; default: automatic — front faces only for closed meshes, both for open ones such as leaf cards |
 | `lighting` | — | `{ ambient, directional, environment }`, see [Lighting](#lighting) |
 | `layout.visibility` | — | `'visible'` (default) / `'none'` |
@@ -549,6 +614,28 @@ rebuild on every frame: while `moveend`s come less than 500 ms apart, the layer
 rebuilds at most every 500 ms, only when the view shows something new (the centre
 moved by more than 5 % of the canvas, the bearing by about 3°, the zoom by 0.07,
 the pitch by 2°), and once more when they stop.
+A terrain that is switched on, off or changed (another source, another
+exaggeration) rebuilds the instances on the new heights; the same terrain set
+again does not.
+A rebuild does not block the frame it starts in: it takes at most 3 ms of a frame
+and goes on in the next ones; the instances on screen stay until the new ones are
+complete. The features of a tiled source are read once per tile, not on every
+rebuild, and a newly loaded tile per slice (via MapLibre internals; where they
+are missing, through `map.querySourceFeatures` as before). For point features
+(single trees, say) a rebuild only decides which of them are on screen: where
+they stand and what `model-id`, `model-rotation`, `model-scale`,
+`model-translation`, `model-color` and a per-feature `model-opacity` give for
+them is worked out once per feature and kept while its tile is loaded —
+evaluated anew when the global state these expressions read changes, or the
+zoom if one of them reads it. Instances generated along lines and inside
+polygons (rows of trees, woods) are placed anew on every rebuild — which of
+them a view shows depends on the view — but what the expressions give for an
+instance is kept from one rebuild to the next, and a feature's geometry is
+converted once.
+`layer.isIdle()` tells whether the instances are those of the view as it is (the
+models loaded, no rebuild due or in progress), `await layer.whenIdle()` waits for
+that. Both speak for the layer alone: source tiles the map is still loading bring
+more to place, so wait for the map's `idle` first.
 Positions jump straight to their new location — there is no interpolation between
 updates. `paint`, `layout` and `visibility` are read once when the layer is added;
 custom layers have no `setPaintProperty`.
@@ -605,6 +692,10 @@ style change. With terrain, many of them during an animation cost frames.
 
 MapLibre GL JS **≥6** and three.js **≥0.160**, both peer dependencies. No special
 bundler or worker configuration is needed.
+
+All layers of this library on a map draw with one three.js renderer on the map's
+WebGL context: the shader programs and the light environment of the glTF
+materials are made once per map, not once per layer.
 
 ## Limitations
 

@@ -1,16 +1,33 @@
 import { LngLat } from 'maplibre-gl';
 import type { Map, CustomLayerInterface, CustomRenderMethodInput } from 'maplibre-gl';
 import * as THREE from 'three';
-import { ElevationCache } from './ElevationCache';
 import { Fill3DManager } from './Fill3DManager';
 import { compileColor, compileOpacity } from './paint';
 import type { PaintValue } from './paint';
 import { compileNumber } from './expression';
+import { whenIdle } from './idle';
+import { acquireRenderer, releaseRenderer } from './sharedRenderer';
 import type { FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
 import type { ExtrusionRequest } from './mvt3dGeometry';
 
+/** `tileCache` when the option is not given (megabytes). */
+const DEFAULT_TILE_CACHE_MB = 64;
+
+function megabytes(mb: number): number {
+  return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 0;
+}
+
 /** Neutral colour used when no `fill-3d-color` is given (white → material shows). */
 const NEUTRAL_COLOR: [number, number, number, number] = [1, 1, 1, 1];
+
+/** A camera whose view can be loaded ahead (see {@link Fill3DLayer.preload}). */
+export interface PreloadCamera {
+  center: { lng: number; lat: number } | [number, number];
+  zoom: number;
+  pitch?: number;
+  bearing?: number;
+  padding?: { top?: number; bottom?: number; left?: number; right?: number };
+}
 
 export interface Fill3DLayerOptions {
   /** Layer id (required). */
@@ -22,13 +39,21 @@ export interface Fill3DLayerOptions {
   'source-layer': string;
   /** MapLibre filter expression; features that fail are not rendered. */
   filter?: FilterSpecification;
-  /** raster-dem source id for elevation; defaults to the map's active terrain. */
+  /** raster-dem source id for elevation; defaults to the map's terrain, also one
+   *  that is switched on or changed after the layer was added. */
   terrainSourceId?: string;
   /**
    * At most this many tile workers. Default: half the logical
    * processors, at least 1 and at most 4. They start as tiles queue up.
    */
   workers?: number;
+  /**
+   * Megabytes of tiles to keep, hidden, after they left the view (and of
+   * views loaded ahead with `preload`): what comes back into view is on screen
+   * without loading. Default 64; 0 keeps nothing. Each kept megabyte is
+   * graphics memory.
+   */
+  tileCache?: number;
   /**
    * EXPERIMENTAL: also draw a layer of 2D footprints from the same tiles as
    * extruded prisms (instead of a native `fill-extrusion`), so they get the
@@ -110,12 +135,14 @@ export class Fill3DLayer implements CustomLayerInterface {
   private readonly transparent: boolean;
   private readonly extrusion?: ExtrusionRequest;
   private readonly workers: number;
+  private readonly paint: NonNullable<Fill3DLayerOptions['paint']>;
+  private cacheBytes: number;
   private readonly ao: { intensity: ReturnType<typeof compileNumber>; radius: number; groundRadius: number };
 
   private camera!: THREE.Camera;
   private scene!: THREE.Scene;
   private renderer!: THREE.WebGLRenderer;
-  private elevation?: ElevationCache;
+  private gl?: WebGL2RenderingContext;
   private manager?: Fill3DManager;
 
   // Reused every frame to avoid per-frame allocations.
@@ -138,6 +165,8 @@ export class Fill3DLayer implements CustomLayerInterface {
     this.visible = options.layout?.visibility !== 'none';
 
     const paint = options.paint ?? {};
+    this.paint = paint;
+    this.cacheBytes = megabytes(options.tileCache ?? DEFAULT_TILE_CACHE_MB);
     this.colorEval = compileColor(paint['fill-3d-color'], NEUTRAL_COLOR);
     this.opacityEval = compileOpacity(paint['fill-3d-opacity'], 1);
     // A transparent material is only needed if opacity may drop below 1.
@@ -160,9 +189,6 @@ export class Fill3DLayer implements CustomLayerInterface {
   }
 
   onAdd(map: Map, gl: WebGL2RenderingContext) {
-    // Use the explicit terrain source, else the map's active terrain, else none.
-    const terrainSourceId = this.terrainSourceIdOption ?? map.getTerrain()?.source ?? '';
-
     this.camera = new THREE.Camera();
     this.scene = new THREE.Scene();
     // three.js is y-up / z-toward-viewer; rotate + mirror so the scene frame is
@@ -172,20 +198,14 @@ export class Fill3DLayer implements CustomLayerInterface {
     // No scene lights: the meshes use a custom shader that replicates MapLibre's
     // fill-extrusion directional lighting (see Fill3DManager).
 
-    this.renderer = new THREE.WebGLRenderer({
-      canvas: map.getCanvas(),
-      context: gl,
-      antialias: true,
-    });
-    this.renderer.autoClear = false;
+    this.gl = gl;
+    this.renderer = acquireRenderer(map.getCanvas(), gl);
 
-    this.elevation = new ElevationCache(map, terrainSourceId);
     this.manager = new Fill3DManager(
       map,
       this.scene,
       LngLat.convert(map.getCenter()), // initial anchor; re-anchors itself on pan
-      this.elevation,
-      terrainSourceId,
+      this.terrainSourceIdOption,
       {
         color: this.colorEval,
         opacity: this.opacityEval,
@@ -198,6 +218,9 @@ export class Fill3DLayer implements CustomLayerInterface {
         // The strongest-shade-wins skirt keeps its shade in the framebuffer's alpha.
         skirtMax: gl.getContextAttributes()?.alpha !== false,
         workers: this.workers,
+        colorSpec: this.paint['fill-3d-color'],
+        opacitySpec: this.paint['fill-3d-opacity'],
+        cacheBytes: this.cacheBytes,
       },
     );
     if (this.visible) this.manager.update();
@@ -240,9 +263,41 @@ export class Fill3DLayer implements CustomLayerInterface {
     // nothing changes. Tile loads and DEM rebakes request their own.
   }
 
+  /**
+   * Load the tiles a camera would show, without showing them: when the map
+   * gets there (a jump, the end of a flight), they are on screen at once. The
+   * next call replaces the view loaded ahead. Returns how many tiles it asked
+   * for; 0 also before the layer has started loading, with `tileCache: 0`, and
+   * where MapLibre's internals this needs are missing.
+   */
+  preload(camera: PreloadCamera): number {
+    return this.visible ? (this.manager?.preload(camera) ?? 0) : 0;
+  }
+
+  /**
+   * Whether the layer shows its view completely and nothing of it is still
+   * changing: all tiles loaded, their ambient occlusion in, everything on the
+   * terrain as it is. Says nothing about the rest of the map (see the map's own
+   * `idle` event) and nothing about tiles loaded ahead (see {@link preload}).
+   */
+  isIdle(): boolean {
+    return !this.visible || (this.manager?.isIdle() ?? true);
+  }
+
+  /** Resolves once {@link isIdle} holds (looked at once per frame). */
+  whenIdle(): Promise<void> {
+    return whenIdle(() => this.isIdle());
+  }
+
+  /** Change `tileCache` (megabytes); less gives up kept tiles at once. */
+  setTileCache(megabytesToKeep: number) {
+    this.cacheBytes = megabytes(megabytesToKeep);
+    this.manager?.setCacheBytes(this.cacheBytes);
+  }
+
   onRemove() {
     this.manager?.dispose();
-    this.elevation?.dispose();
-    this.renderer?.dispose();
+    if (this.gl) releaseRenderer(this.gl);
+    this.gl = undefined;
   }
 }

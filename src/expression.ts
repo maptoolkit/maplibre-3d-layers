@@ -23,6 +23,8 @@ export interface Evaluator<T> {
   readonly featureConstant: boolean;
   /** Global-state keys the value reads; a change to one of them needs a re-evaluation. */
   readonly globalStateRefs: ReadonlySet<string>;
+  /** The value does not depend on the zoom: for a feature it changes with the global state only. */
+  readonly zoomConstant: boolean;
 }
 
 /** MVT geometry type used when evaluating (`['geometry-type']` depends on it). */
@@ -68,13 +70,14 @@ function evaluator<T>(
   fn: (zoom: number, props: Record<string, unknown>, id?: string | number, globalState?: GlobalState) => T,
   featureConstant: boolean,
   globalStateRefs: ReadonlySet<string> = NO_REFS,
+  zoomConstant = false,
 ): Evaluator<T> {
-  return Object.assign(fn, { featureConstant, globalStateRefs });
+  return Object.assign(fn, { featureConstant, globalStateRefs, zoomConstant });
 }
 
 /** An evaluator that always returns `value`. */
 function constant<T>(value: T): Evaluator<T> {
-  return evaluator(() => value, true);
+  return evaluator(() => value, true, NO_REFS, true);
 }
 
 /** Wrap a compiled expression; `read` post-processes its raw result. */
@@ -88,6 +91,7 @@ function fromCompiled<T>(
       read(expr.evaluate({ zoom, globalState } as GlobalProperties, makeFeature(geometryType, props, id))),
     expr.kind === 'constant' || expr.kind === 'camera',
     expr.globalStateRefs ?? NO_REFS,
+    expr.kind === 'constant' || expr.kind === 'source',
   );
 }
 
@@ -201,6 +205,7 @@ export function compileVec3(
       },
       parts.every((p) => p.featureConstant),
       new Set(parts.flatMap((p) => [...p.globalStateRefs])),
+      parts.every((p) => p.zoomConstant),
     );
   }
 

@@ -1,11 +1,12 @@
 import { LngLat } from 'maplibre-gl';
 import type { Map, CustomLayerInterface, CustomRenderMethodInput } from 'maplibre-gl';
 import * as THREE from 'three';
-import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { GltfManager } from './GltfManager';
 import type { ImpostorLight } from './GltfManager';
 import { compileColor, compileNumber, compileString, compileVec3 } from './expression';
 import type { StyleValue, Vec3 } from './expression';
+import { whenIdle } from './idle';
+import { acquireRenderer, releaseRenderer, sharedEnvironment } from './sharedRenderer';
 import type { ExpressionSpecification, FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
 
 /** How a feature turns into models. `'auto'` picks by geometry type. */
@@ -61,7 +62,8 @@ export interface GltfLayerOptions {
   minzoom?: number;
   /** Hide the layer at and above this zoom. */
   maxzoom?: number;
-  /** raster-dem source id for elevation; defaults to the map's active terrain. */
+  /** raster-dem source id for elevation; defaults to the map's terrain, also one
+   *  that is switched on or changed after the layer was added. */
   terrainSourceId?: string;
   /**
    * Upper bound on instances per rebuild (default `20000`). Denser data is
@@ -184,6 +186,7 @@ export class GltfLayer implements CustomLayerInterface {
   private camera!: THREE.Camera;
   private scene!: THREE.Scene;
   private renderer!: THREE.WebGLRenderer;
+  private gl?: WebGL2RenderingContext;
   private ambient!: THREE.HemisphereLight;
   private sun!: THREE.DirectionalLight;
   private manager?: GltfManager;
@@ -224,7 +227,6 @@ export class GltfLayer implements CustomLayerInterface {
 
   onAdd(map: Map, gl: WebGL2RenderingContext) {
     this.map = map;
-    const terrainSourceId = this.options.terrainSourceId ?? map.getTerrain()?.source ?? '';
 
     this.camera = new THREE.Camera();
     this.scene = new THREE.Scene();
@@ -239,12 +241,8 @@ export class GltfLayer implements CustomLayerInterface {
     this.sun = new THREE.DirectionalLight(0xffffff, this.lighting.directional);
     this.scene.add(this.ambient, this.sun, this.sun.target);
 
-    this.renderer = new THREE.WebGLRenderer({
-      canvas: map.getCanvas(),
-      context: gl,
-      antialias: true,
-    });
-    this.renderer.autoClear = false;
+    this.gl = gl;
+    this.renderer = acquireRenderer(map.getCanvas(), gl);
 
     const paint = this.options.paint ?? {};
     const layout = this.options.layout ?? {};
@@ -254,7 +252,7 @@ export class GltfLayer implements CustomLayerInterface {
       map,
       this.scene,
       LngLat.convert(map.getCenter()), // initial anchor; re-anchors itself on move
-      terrainSourceId,
+      this.options.terrainSourceId,
       {
         sourceId: this.options.source,
         sourceLayer: this.options['source-layer'],
@@ -406,19 +404,29 @@ export class GltfLayer implements CustomLayerInterface {
   /** Synthetic IBL — without one, metallic glTF materials render near-black. */
   private buildEnvironment() {
     this.environmentDone = true;
-    if (this.lighting.environment <= 0) return;
-    const pmrem = new THREE.PMREMGenerator(this.renderer);
-    const room = new RoomEnvironment();
-    this.scene.environment = pmrem.fromScene(room, 0.04).texture;
+    if (this.lighting.environment <= 0 || !this.gl) return;
+    this.scene.environment = sharedEnvironment(this.gl) ?? null;
     this.scene.environmentIntensity = this.lighting.environment;
-    room.dispose();
-    pmrem.dispose();
-    this.renderer.resetState(); // PMREM rendered into the shared context
+  }
+
+  /**
+   * Whether the layer shows the instances of the view as it is: its models are
+   * loaded and no rebuild is due or in progress. Says nothing about the map's
+   * own loading (see its `idle` event): tiles of the source that are still to
+   * come bring more to place.
+   */
+  isIdle(): boolean {
+    return !this.visible || (this.manager?.isIdle() ?? true);
+  }
+
+  /** Resolves once {@link isIdle} holds (looked at once per frame). */
+  whenIdle(): Promise<void> {
+    return whenIdle(() => this.isIdle());
   }
 
   onRemove() {
     this.manager?.dispose();
-    this.scene?.environment?.dispose();
-    this.renderer?.dispose();
+    if (this.gl) releaseRenderer(this.gl); // with the last layer the shared environment goes too
+    this.gl = undefined;
   }
 }
