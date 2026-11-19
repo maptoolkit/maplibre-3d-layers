@@ -621,7 +621,11 @@ they stand and what `model-id`, `model-rotation`, `model-scale`,
 `model-translation`, `model-color` and a per-feature `model-opacity` give for
 them is worked out once per feature and kept while its tile is loaded —
 evaluated anew when the global state these expressions read changes, or the
-zoom if one of them reads it.
+zoom if one of them reads it. Instances generated along lines and inside
+polygons (rows of trees, woods) are placed anew on every rebuild — which of
+them a view shows depends on the view — but what the expressions give for an
+instance is kept from one rebuild to the next, and a feature's geometry is
+converted once.
 `layer.isIdle()` tells whether the instances are those of the view as it is (the
 models loaded, no rebuild due or in progress), `await layer.whenIdle()` waits for
 that. Both speak for the layer alone: source tiles the map is still loading bring

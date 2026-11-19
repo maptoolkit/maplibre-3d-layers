@@ -977,6 +977,15 @@ export class GltfManager {
     // `own`: a point of a point feature (an OwnPoint), whose expression values are kept (see placedFor).
     const candidates: { f: RawFeature; point: PlacedPoint; x: number; y: number; need: number; own: boolean }[] = [];
 
+    // Whether any model is culled by its extent (see reachOf): a layer of small models (trees) then asks for
+    // no extent per candidate, which for generated instances evaluated `model-id` once more for each. Models
+    // load between the steps, so this is looked up again after each.
+    const anyLarge = (): boolean => {
+      for (const model of this.models.values()) if (model.extent && !isSmall(model.extent)) return true;
+      return false;
+    };
+    let large = anyLarge();
+
     const groups = new globalThis.Map<string, { recs: Rec[]; colors?: Rgba[]; alphas?: number[] }>();
     // The generated instances this rebuild places, for the next one (see generatedFor).
     const generated = new globalThis.Map<number, Placed>();
@@ -986,7 +995,7 @@ export class GltfManager {
       // A pitched, rotated view's lng/lat bbox is mostly off-screen — don't
       // spend the budget there. A model counts as on screen while any part of
       // its extent is (the anchor alone where the extent or matrix is unknown).
-      const reach = boxInFrame ? this.reachOf(f, point.id, zoom, state, own ? this.placedFor(f, zoom, state) : undefined) : undefined;
+      const reach = boxInFrame && large ? this.reachOf(f, point.id, zoom, state, own ? this.placedFor(f, zoom, state) : undefined) : undefined;
       if (reach && boxInFrame) {
         const s = origin.s;
         if (!boxInFrame(x, y, reach.radius * s, (ground + reach.bottom) * s, (ground + reach.top) * s)) return true;
@@ -1066,7 +1075,10 @@ export class GltfManager {
         const spacing = cells[i];
         const mode = this.placementFor(f);
         // A step after each line or polygon (placing along one can take long) and after every POINT_STEP point features.
-        if (i && (mode !== 'point' || ++points % POINT_STEP === 0)) yield;
+        if (i && (mode !== 'point' || ++points % POINT_STEP === 0)) {
+          yield;
+          large = anyLarge();
+        }
         switch (mode) {
           case 'point':
             // Points keep their SOURCE id, so `['id']` still addresses the OSM
