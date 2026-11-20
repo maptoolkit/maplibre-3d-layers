@@ -4,7 +4,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { featureFilter } from '@maplibre/maplibre-gl-style-spec';
 import type { FilterSpecification, GlobalProperties } from '@maplibre/maplibre-gl-style-spec';
-import { createElevationSampler, tileBounds } from './ElevationCache';
+import { createElevationSampler, exaggerationOf, terrainKeyOf, tileBounds } from './ElevationCache';
 import type { GeoBounds } from './ElevationCache';
 import type { Evaluator, GlobalState, Rgba, Vec3 } from './expression';
 import { globalStateOf, watchGlobalState } from './globalState';
@@ -220,7 +220,8 @@ const IMPOSTOR_ELEVATION = 20;
 // Cylindrical billboard: the quad turns about the vertical axis to face the
 // camera (mtkRight = the view's horizontal right vector, in the instance frame)
 // and keeps its base on the ground. Only the instance's position and per-axis
-// scale are used, so the instance matrix can stay the full-model one.
+// scale are used, so the instance matrix can stay the full-model one. Raised by
+// the terrain's exaggeration like the models (see GROUND_PROJECT_VERTEX).
 const IMPOSTOR_PARS_VERTEX = /* glsl */ `
 uniform vec3 mtkRight;
 #include <common>
@@ -231,7 +232,8 @@ vec4 mvPosition = vec4( transformed, 1.0 );
   mvPosition = vec4(
     instanceMatrix[ 3 ].xyz
       + mtkRight * transformed.x * length( instanceMatrix[ 0 ].xyz )
-      + vec3( 0.0, transformed.y * length( instanceMatrix[ 1 ].xyz ), 0.0 ),
+      + vec3( 0.0, transformed.y * length( instanceMatrix[ 1 ].xyz ), 0.0 )
+      + vec3( 0.0, ( mtkExaggeration - 1.0 ) * instanceGround, 0.0 ),
     1.0
   );
 #endif
@@ -320,6 +322,13 @@ interface Batch {
   recs: Rec[];
   bounds: GeoBounds;
   alphaAttr?: THREE.InstancedBufferAttribute;
+  /** Per instance: the terrain height under it (exaggeration 1), which the exaggeration of the frame scales (see GROUND_PROJECT_VERTEX). */
+  groundAttr: THREE.InstancedBufferAttribute;
+  /** The meshes' bounding spheres at exaggeration 1, the instances' lowest and highest ground, and the exaggeration the spheres are placed for. */
+  spheres: THREE.Sphere[];
+  groundLow: number;
+  groundHigh: number;
+  boundsAt: number;
 }
 
 // Patches three's built-in materials so per-instance colour AND per-instance
@@ -333,7 +342,30 @@ const PARS_VERTEX = /* glsl */ `
   attribute float instanceAlpha;
   varying float vInstanceAlpha;
 #endif
+#ifdef USE_INSTANCING
+  attribute float instanceGround; // the terrain height under the instance (m, exaggeration 1)
+  uniform float mtkExaggeration;  // the terrain's exaggeration in this frame
+#endif
 `;
+
+// An instance matrix stands the model on the terrain at exaggeration 1; the
+// exaggeration of the frame raises or lowers it with the ground under it, so a
+// terrain whose exaggeration changes (an animation that sets the terrain once
+// per frame) moves the models in the same frame as its surface, without a
+// rebuild. three's own chunk with one line added after the instance matrix.
+const GROUND_PROJECT_VERTEX = (() => {
+  const chunk = THREE.ShaderChunk.project_vertex;
+  const at = 'mvPosition = instanceMatrix * mvPosition;';
+  const raise = 'mvPosition.y += ( mtkExaggeration - 1.0 ) * instanceGround;';
+  if (chunk.includes(at)) return chunk.replace(at, `${at}\n\t${raise}`);
+  // Another three: the same, after its chunk.
+  return `${chunk}
+#ifdef USE_INSTANCING
+  mvPosition += modelViewMatrix * vec4( 0.0, ( mtkExaggeration - 1.0 ) * instanceGround, 0.0, 0.0 );
+  gl_Position = projectionMatrix * mvPosition;
+#endif
+`;
+})();
 
 const BODY_VERTEX = /* glsl */ `
 #include <color_vertex>
@@ -431,6 +463,8 @@ export class GltfManager {
   private readonly ownTransparent = new WeakMap<THREE.Material, boolean>();
   /** `model-opacity` when it's the same for every instance, shared by all shaders. */
   private readonly opacityUniform = { value: 1 };
+  /** The terrain's exaggeration in this frame, shared by all shaders (see syncExaggeration). */
+  private readonly exaggerationUniform = { value: 1 };
   /** Some instance alpha < 1 (per-instance opacity) / the uniform opacity < 1. */
   private instanceFading = false;
   private uniformFading = false;
@@ -570,14 +604,19 @@ export class GltfManager {
         if (!this.builtView || !sameView(this.builtView, viewState(map))) refreshForView();
       }, MOVE_SERIES_MS);
     };
-    // Terrain switched on, off or changed (another source, another exaggeration):
-    // the instances stand on the old heights until they are built again, and the
-    // DEM tiles to follow may be another source's (see onData). MapLibre fires
-    // `terrain` on every setTerrain, also with the same options: no rebuild then.
+    // Terrain switched on, off or to another source: the instances stand on the
+    // old heights until they are built again, and the DEM tiles to follow may be
+    // another source's (see onData). MapLibre fires `terrain` on every
+    // setTerrain: the same source again — with another exaggeration, or the
+    // same — needs no rebuild, the vertex shader applies the exaggeration per
+    // frame (see syncExaggeration).
     this.onTerrain = () => {
       this.terrainSourceId = this.terrainSourceOption ?? map.getTerrain()?.source ?? '';
       const key = terrainKeyOf(map);
-      if (key === this.terrainKey) return;
+      if (key === this.terrainKey) {
+        map.triggerRepaint();
+        return;
+      }
       this.terrainKey = key;
       this.schedule(false, true);
     };
@@ -1371,6 +1410,7 @@ export class GltfManager {
     if (this.instanceOpacity) {
       alphaAttr = new THREE.InstancedBufferAttribute(new Float32Array(capacity), 1);
     }
+    const groundAttr = new THREE.InstancedBufferAttribute(new Float32Array(capacity), 1);
     for (const proto of model.protos) {
       const mesh = new THREE.InstancedMesh(proto.geometry, proto.material, capacity);
       mesh.frustumCulled = true;
@@ -1378,6 +1418,7 @@ export class GltfManager {
         mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(capacity * 3), 3);
       }
       if (alphaAttr) proto.geometry.setAttribute('instanceAlpha', alphaAttr);
+      proto.geometry.setAttribute('instanceGround', groundAttr);
       meshes.push(mesh);
       this.group.add(mesh);
     }
@@ -1389,20 +1430,35 @@ export class GltfManager {
       recs: [],
       bounds: { west: 0, east: 0, south: 0, north: 0 },
       alphaAttr,
+      groundAttr,
+      spheres: [],
+      groundLow: 0,
+      groundHigh: 0,
+      boundsAt: 1,
     };
     this.batches.set(modelId, batch);
     return batch;
   }
 
-  /** (Re)compute a batch's instance matrices (and colours) against current terrain. */
+  /**
+   * (Re)compute a batch's instance matrices (and colours) against current
+   * terrain: at exaggeration 1, the exaggeration of the frame is the vertex
+   * shader's (see GROUND_PROJECT_VERTEX, placeBounds).
+   */
   private writeInstances(batch: Batch, colors?: Rgba[], alphas?: number[]) {
     const n = batch.recs.length;
     const elevationAt = createElevationSampler(this.map);
+    const grounds = batch.groundAttr.array as Float32Array;
+    let groundLow = Infinity;
+    let groundHigh = -Infinity;
     for (let i = 0; i < n; i++) {
       const rec = batch.recs[i];
       // Sampled per build rather than cached: point features move, so a cache
       // keyed by position would grow without bound.
       const ele = elevationAt(rec.lng, rec.lat);
+      grounds[i] = ele;
+      if (ele < groundLow) groundLow = ele;
+      if (ele > groundHigh) groundHigh = ele;
       // Scene frame is (x=east, y=up, z=north); style vectors are [east, north, up].
       this.sPos.set(rec.east + rec.tr[0], ele + rec.tr[2], rec.north + rec.tr[1]);
       // rot = [around east, around north, around up]; order YXZ applies roll,
@@ -1418,12 +1474,46 @@ export class GltfManager {
       }
     }
 
-    for (const mesh of batch.meshes) {
+    batch.groundAttr.needsUpdate = true;
+    batch.groundLow = groundLow <= groundHigh ? groundLow : 0;
+    batch.groundHigh = groundLow <= groundHigh ? groundHigh : 0;
+    batch.spheres = batch.meshes.map((mesh) => {
       mesh.count = n;
       mesh.instanceMatrix.needsUpdate = true;
       mesh.computeBoundingSphere();
-    }
+      return mesh.boundingSphere!.clone();
+    });
+    this.placeBounds(batch, exaggerationOf(this.map));
     this.writePaint(batch, colors, alphas);
+  }
+
+  /**
+   * The meshes' bounding spheres at the exaggeration `e`: each instance moves
+   * up by (e − 1) × its ground, so the sphere at 1 moves by that of the middle
+   * ground and grows by half the spread — at 1 it is three's own.
+   */
+  private placeBounds(batch: Batch, e: number) {
+    batch.boundsAt = e;
+    const shift = (e - 1) * ((batch.groundLow + batch.groundHigh) / 2);
+    const grow = Math.abs(e - 1) * ((batch.groundHigh - batch.groundLow) / 2);
+    batch.meshes.forEach((mesh, m) => {
+      const base = batch.spheres[m];
+      if (!base || !mesh.boundingSphere) return;
+      mesh.boundingSphere.center.set(base.center.x, base.center.y + shift, base.center.z);
+      mesh.boundingSphere.radius = base.radius + grow;
+    });
+  }
+
+  /**
+   * The terrain's exaggeration for this frame (call each frame, before drawing):
+   * the vertex shaders raise the instances by it, the culling bounds follow.
+   */
+  syncExaggeration() {
+    const e = exaggerationOf(this.map);
+    this.exaggerationUniform.value = e;
+    for (const batch of this.batches.values()) {
+      if (batch.boundsAt !== e) this.placeBounds(batch, e);
+    }
   }
 
   /** Write per-instance colours / alphas (either may be absent). */
@@ -1770,9 +1860,12 @@ export class GltfManager {
     material.onBeforeCompile = (shader, renderer) => {
       previous?.call(material, shader, renderer);
       if (this.uniformOpacity) shader.uniforms.mtkOpacity = this.opacityUniform;
+      shader.uniforms.mtkExaggeration = this.exaggerationUniform;
+      // A billboard has its own projection (see IMPOSTOR_PROJECT_VERTEX): no chunk left to replace there.
       shader.vertexShader = shader.vertexShader
         .replace('#include <color_pars_vertex>', PARS_VERTEX)
-        .replace('#include <color_vertex>', BODY_VERTEX);
+        .replace('#include <color_vertex>', BODY_VERTEX)
+        .replace('#include <project_vertex>', GROUND_PROJECT_VERTEX);
       shader.fragmentShader = shader.fragmentShader
         .replace('#include <color_pars_fragment>', PARS_FRAGMENT)
         .replace('#include <color_fragment>', BODY_FRAGMENT)
@@ -2075,12 +2168,6 @@ interface ViewState {
   pitch: number;
   width: number;
   height: number;
-}
-
-/** Source and exaggeration of the map's terrain, `''` without one. */
-function terrainKeyOf(map: Map): string {
-  const terrain = map.getTerrain();
-  return terrain ? `${terrain.source}|${terrain.exaggeration ?? 1}` : '';
 }
 
 function viewState(map: Map): ViewState {

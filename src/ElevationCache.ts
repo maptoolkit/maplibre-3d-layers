@@ -1,7 +1,7 @@
 import { LngLat } from 'maplibre-gl';
 import type { Map } from 'maplibre-gl';
 
-/** Terrain elevation (m) at a point. */
+/** Terrain elevation (m) at a point, without the terrain's exaggeration (see createElevationSampler). */
 export type ElevationSampler = (lng: number, lat: number) => number;
 
 /** The bits of MapLibre's (internal) `Terrain` the sampler needs. */
@@ -29,6 +29,11 @@ const MAX_TILE_COORD = EXTENT * (1 - 1e-12);
  * is ~0.5 ms — seconds for a few thousand trees. Here that fallback zoom is
  * resolved once per sampler, so create one per pass and drop it afterwards.
  *
+ * The heights come WITHOUT the terrain's exaggeration, as the DEM has them: the
+ * layers' vertex shaders multiply them by the exaggeration of the frame they
+ * draw, so a terrain whose exaggeration changes (an animation that sets the
+ * terrain once per frame) needs no sampling again.
+ *
  * Mirrors MapLibre internals (`Terrain.getElevationForLngLat`); falls back to
  * `queryTerrainElevation` when they are missing.
  */
@@ -50,8 +55,12 @@ export function createMercatorElevationSampler(map: Map): (mx: number, my: numbe
   if (!terrain) return () => 0;
   const toLngLat = (mx: number, my: number) =>
     new LngLat(mx * 360 - 180, (360 / Math.PI) * Math.atan(Math.exp(((180 - my * 360) * Math.PI) / 180)) - 90);
-  const byZoom = terrain.getElevationForLngLatZoom?.bind(terrain);
-  if (!byZoom) return (mx, my) => map.queryTerrainElevation(toLngLat(mx, my)) ?? 0;
+  // MapLibre's own lookups include the exaggeration: taken out again. At an
+  // exaggeration of 0 they know nothing of the ground and give 0.
+  const unexaggerate = terrain.exaggeration > 0 ? 1 / terrain.exaggeration : 0;
+  const exaggerated = terrain.getElevationForLngLatZoom?.bind(terrain);
+  const byZoom = exaggerated && ((lngLat: LngLat, zoom: number) => exaggerated(lngLat, zoom) * unexaggerate);
+  if (!byZoom) return (mx, my) => (map.queryTerrainElevation(toLngLat(mx, my)) ?? 0) * unexaggerate;
 
   const index = terrain.getCoverageIndex?.() ?? null;
   let fallbackZoom: number | undefined;
@@ -108,7 +117,7 @@ export function createMercatorElevationSampler(map: Map): (mx: number, my: numbe
               Math.min((sx - tx) * EXTENT, MAX_TILE_COORD),
               Math.min((sy - ty) * EXTENT, MAX_TILE_COORD),
               EXTENT,
-            ) * terrain.exaggeration;
+            );
           }
           break; // covered, but its DEM isn't loaded → fallback
         }
@@ -148,4 +157,18 @@ export function tileBounds(x: number, y: number, z: number): GeoBounds {
     north: latOf(y), // y grows southward → y is the northern edge
     south: latOf(y + 1),
   };
+}
+
+/**
+ * The map's terrain source, `''` without terrain: what the layers' heights
+ * depend on besides the DEM data. The exaggeration is not part of it — the
+ * samplers above leave it out and the vertex shaders apply it per frame.
+ */
+export function terrainKeyOf(map: Map): string {
+  return map.getTerrain()?.source ?? '';
+}
+
+/** The exaggeration the map's terrain draws with in this frame (1 without terrain). */
+export function exaggerationOf(map: Map): number {
+  return (map.terrain as unknown as TerrainInternals | null | undefined)?.exaggeration ?? 1;
 }

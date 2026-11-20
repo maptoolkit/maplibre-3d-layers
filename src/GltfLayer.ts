@@ -316,6 +316,7 @@ export class GltfLayer implements CustomLayerInterface {
       this.renderer.resetState();
     }
     this.manager!.setViewBearing(this.map.getBearing());
+    this.manager!.syncExaggeration(); // the terrain's, this frame: before culling and drawing
     this.renderer.render(this.scene, this.camera);
     // No triggerRepaint() here: that re-renders the map every frame even when
     // nothing changes. Builds, model loads and DEM updates request their own.
