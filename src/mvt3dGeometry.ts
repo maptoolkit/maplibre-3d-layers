@@ -777,7 +777,7 @@ export function parseTile(
     const features = reader.featuresOf(sourceLayer);
     for (let i = 0; i < features.length; i++) {
       const feature = features[i];
-      if (feature.type !== 0) continue; // only the custom 3D geometry
+      if (feature.type !== 0 && feature.type !== 4) continue; // only the custom 3D geometry (commands or point table)
       if (ff && !ff.filter(globals, feature as unknown as Feature)) continue;
 
       const geometry = feature.loadGeometry();
