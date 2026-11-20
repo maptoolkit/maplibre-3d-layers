@@ -10,6 +10,17 @@ import type { PbfReader as Pbf } from 'pbf';
  *
  * The 3D features have `type === 0` (Unknown); their first polygon is a
  * bounding box (two corner points), not real geometry — callers skip it.
+ *
+ * `type === 4` is the same geometry as a point table (vts buildings3d,
+ * `MTK_BUILDINGS3D_INDEXED_GEOMETRY`): every vertex of the feature once, the
+ * rings as lists of vertex numbers — a wall shares its corners with the walls
+ * next to it, so a tile is about a fifth smaller. Varints, zig-zag where signed:
+ *  - the box: 6 deltas, the first corner from (0, 0, 0), the second from the first,
+ *  - V, then V vertices of 3 deltas each, the first from the box's second corner,
+ *  - R, then per ring `length * 2 + 1` for an outline (a new polygon) or
+ *    `length * 2` for a hole of the polygon before, and `length` deltas of
+ *    vertex numbers, each from the number before (the first from 0).
+ * `loadGeometry` returns the same {@link Geometry3D} for both.
  */
 
 /**
@@ -28,7 +39,7 @@ export interface Geometry3D {
 export class VectorTileFeature {
   properties: Record<string, number | string | boolean> = {};
   extent: number;
-  type: 0 | 1 | 2 | 3 = 0;
+  type: 0 | 1 | 2 | 3 | 4 = 0;
   id: number | undefined = undefined;
 
   private _pbf: Pbf;
@@ -51,6 +62,7 @@ export class VectorTileFeature {
   }
 
   loadGeometry(): Geometry3D {
+    if (this.type === 4) return this.loadIndexed();
     const pbf = this._pbf;
     pbf.pos = this._geometry;
 
@@ -103,6 +115,73 @@ export class VectorTileFeature {
     return { xyz: xyz.slice(0, n), ringEnd, polygonEnd };
   }
 
+  /** The point table (`type === 4`, see the top of this file) as {@link Geometry3D}. */
+  private loadIndexed(): Geometry3D {
+    const pbf = this._pbf;
+    pbf.pos = this._geometry;
+    const end = pbf.readVarint() + pbf.pos;
+
+    // The box, as the first ring and polygon - like the box in the command encoding.
+    const box = new Float64Array(6);
+    let x = pbf.readSVarint();
+    let y = pbf.readSVarint();
+    let z = pbf.readSVarint();
+    box[0] = x;
+    box[1] = y;
+    box[2] = z;
+    x += pbf.readSVarint();
+    y += pbf.readSVarint();
+    z += pbf.readSVarint();
+    box[3] = x;
+    box[4] = y;
+    box[5] = z;
+    const vertexCount = pbf.readVarint();
+    const vertices = new Float64Array(vertexCount * 3);
+    for (let i = 0; i < vertexCount * 3; i += 3) {
+      x += pbf.readSVarint();
+      y += pbf.readSVarint();
+      z += pbf.readSVarint();
+      vertices[i] = x;
+      vertices[i + 1] = y;
+      vertices[i + 2] = z;
+    }
+
+    // The vertex numbers first (each a varint of at least a byte: room for all of
+    // them), then the vertices they name, into an array of exactly that size.
+    const numbers = new Int32Array(end - pbf.pos);
+    const heads: number[] = [];
+    let count = 0;
+    let at = 0;
+    for (let r = 0, rings = pbf.readVarint(); r < rings; r++) {
+      const head = pbf.readVarint();
+      heads.push(head);
+      for (let k = head >> 1; k > 0; k--) {
+        at += pbf.readSVarint();
+        if (at < 0 || at >= vertexCount) throw new Error(`point table: vertex ${at} of ${vertexCount}`);
+        numbers[count++] = at;
+      }
+    }
+    const xyz = new Float64Array(6 + count * 3);
+    xyz.set(box);
+    for (let i = 0, o = 6; i < count; i++, o += 3) {
+      const v = numbers[i] * 3;
+      xyz[o] = vertices[v];
+      xyz[o + 1] = vertices[v + 1];
+      xyz[o + 2] = vertices[v + 2];
+    }
+    const ringEnd: number[] = [2];
+    const polygonEnd: number[] = [1];
+    let points = 2;
+    for (const head of heads) {
+      points += head >> 1;
+      ringEnd.push(points);
+      if (head & 1) polygonEnd.push(ringEnd.length);
+      else polygonEnd[polygonEnd.length - 1] = ringEnd.length; // a hole of the polygon before, as in loadGeometry
+    }
+    if (pbf.pos !== end) throw new Error('point table: length mismatch');
+    return { xyz, ringEnd, polygonEnd };
+  }
+
   /**
    * A standard 2D MVT geometry (`buildings2d` polygons, two varints per point,
    * command 7 = ClosePath) as rings, NOT closed by a repeated first point.
@@ -150,7 +229,7 @@ export class VectorTileFeature {
 function readFeature(tag: number, feature: VectorTileFeature, pbf: Pbf) {
   if (tag === 1) feature.id = pbf.readVarint();
   else if (tag === 2) readTag(pbf, feature);
-  else if (tag === 3) feature.type = pbf.readVarint() as 0 | 1 | 2 | 3;
+  else if (tag === 3) feature.type = pbf.readVarint() as 0 | 1 | 2 | 3 | 4;
   // @ts-expect-error deliberately writing a private field
   else if (tag === 4) feature._geometry = pbf.pos;
 }

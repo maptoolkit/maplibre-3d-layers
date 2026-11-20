@@ -114,6 +114,14 @@ map.on('load', () => {
 > Put the `fill-extrusion` on `buildings2d`, **never** on `buildings3d` — a
 > native style layer cannot render the 3D source-layer and will produce garbage.
 
+The 3D features come in one of two encodings, and the layer reads both (from
+0.8.0): geometry type 0 with a third delta (the height) per vertex, and type 4,
+the same geometry as a point table — every vertex of a feature once, the faces
+as lists of vertex numbers, about a fifth smaller since a wall shares its
+corners with its neighbours. The format is described at the top of
+[`src/vectorTile3d.ts`](src/vectorTile3d.ts). Up to 0.7.0 the layer reads type
+0 only and draws nothing of type 4.
+
 The layer fetches the source's original tiles itself (above `maxzoom` MapLibre
 would only hand it re-encoded, overzoomed ones). Those requests go through the
 map's `transformRequest` like MapLibre's own, so credentials and headers set
