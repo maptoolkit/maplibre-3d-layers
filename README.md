@@ -135,7 +135,10 @@ reserve for slopes (buildings3d `MTK_BUILDINGS3D_GROUND_DEPTH`); the terrain
 surface hides that reserve. Without terrain the meshes sit on the flat map,
 which hides nothing below it, so the reserve is cut off at the base. Switching
 the terrain on or off puts the loaded tiles onto the new ground (see
-[Loading](#loading)); nothing is loaded again. Landmarks are placed in their
+[Loading](#loading)); nothing is loaded again. A new exaggeration of the same
+terrain (one `setTerrain` per frame, say, to let the relief grow) moves the
+buildings in the same frame as the terrain surface, with no work besides the
+draw: see [Loading](#loading). Landmarks are placed in their
 own way, see [Landmarks](#landmarks-models-in-the-tiles).
 
 ### Options
@@ -197,7 +200,14 @@ may grow, else to the one with the least to do.
   walked or uploaded again. When terrain data arrives under a tile, the terrain
   is sampled again and compared, exactly; only a change rewrites the tables.
   Tiles are looked at one per frame, the nearest to the map centre first, also
-  after the terrain was switched on or off.
+  after the terrain was switched on or off or to another source. The tables
+  hold the terrain without its exaggeration, which the vertex shader applies in
+  every frame: a new exaggeration alone rewrites nothing. The ground scales
+  with it, a building's base moves with the ground it stands on. For a group of
+  touching buildings that is the ground under the wall foot that decides the
+  group's fit at exaggeration 1 — exact at 1; at another exaggeration the
+  group stands off the median of its feet by a fraction of the ground's rise
+  across the group.
 - **Loading ahead.** `layer.preload({ center, zoom, pitch, bearing, padding })`
   loads the tiles that camera would show, without showing them; when the map
   gets there (a jump, the end of a flight) they are on screen at once. The next
@@ -614,9 +624,11 @@ rebuild on every frame: while `moveend`s come less than 500 ms apart, the layer
 rebuilds at most every 500 ms, only when the view shows something new (the centre
 moved by more than 5 % of the canvas, the bearing by about 3°, the zoom by 0.07,
 the pitch by 2°), and once more when they stop.
-A terrain that is switched on, off or changed (another source, another
-exaggeration) rebuilds the instances on the new heights; the same terrain set
-again does not.
+A terrain that is switched on, off or to another source rebuilds the instances
+on the new heights. A new exaggeration of the same terrain rebuilds nothing: the
+instances stand on the terrain at exaggeration 1, and the vertex shader raises
+or lowers each with the ground under it in every frame, in step with the
+terrain surface.
 A rebuild does not block the frame it starts in: it takes at most 3 ms of a frame
 and goes on in the next ones; the instances on screen stay until the new ones are
 complete. The features of a tiled source are read once per tile, not on every

@@ -1,7 +1,7 @@
 import { MercatorCoordinate, LngLat } from 'maplibre-gl';
 import type { CoveringTilesOptions, Map } from 'maplibre-gl';
 import * as THREE from 'three';
-import { createElevationSampler, createMercatorElevationSampler, tileBounds } from './ElevationCache';
+import { createElevationSampler, createMercatorElevationSampler, exaggerationOf, terrainKeyOf, tileBounds } from './ElevationCache';
 import type { GeoBounds } from './ElevationCache';
 import type { ExtrusionRequest, TileResult, TileSpec, AoResult, SkirtResult, FeatureTable, AoTables, TerrainAnchors } from './mvt3dGeometry';
 import {
@@ -78,11 +78,19 @@ const AO_FADE_MS = 500;
 // terrain height per ground column, and per feature the height its base goes to.
 // So new terrain data means sampling the terrain and writing those tables, not
 // walking and uploading every vertex of the tile again.
+//
+// The tables hold the terrain WITHOUT its exaggeration; the exaggeration of the
+// frame comes as a uniform. A terrain whose exaggeration changes (an animation
+// that sets the terrain once per frame) moves every vertex in the same frame as
+// the terrain surface, without writing a table.
 const HEIGHT_VERTEX = /* glsl */ `
   attribute float column;  // the vertex's ground column
   attribute float feature;
-  uniform highp sampler2D u_ground;   // per column: the terrain height (m); on the flat map the ground under rigid models
-  uniform highp sampler2D u_features; // per feature: (the height its base goes to, 1 for a rigid model)
+  uniform highp sampler2D u_ground;   // per column: the terrain height (m, exaggeration 1); on the flat map the ground under rigid models
+  // Per feature: (the height its base goes to at exaggeration 1, 1 for a rigid model,
+  // the terrain height (exaggeration 1) the base moves with when the exaggeration changes).
+  uniform highp sampler2D u_features;
+  uniform float u_exaggeration;       // the terrain's exaggeration in this frame
   uniform float u_flat;               // 1: this tile stands on a map without terrain
   uniform float u_ao_reach;           // metres above its base up to which a vertex needs its height above the ground
   ivec2 heightTexel(float i) {
@@ -93,16 +101,19 @@ const HEIGHT_VERTEX = /* glsl */ `
   vec2 heights() {
     highp float rel = position.y;
     highp float ground = texelFetch(u_ground, heightTexel(column), 0).r;
-    highp vec2 f = texelFetch(u_features, heightTexel(feature), 0).rg;
+    highp vec3 f = texelFetch(u_features, heightTexel(feature), 0).rgb;
     bool rigid = f.y > 0.5;
     if (u_flat > 0.5) {
       // No terrain covers the wall feet sunk below the base: they come up to the map. A rigid model stays as built.
       highp float y = rigid ? rel : max(rel, 0.0);
       return vec2(y, rigid ? rel - ground : y);
     }
+    // The ground scales with the exaggeration, a base moves with the ground it follows (exact at 1, see Fill3DManager.bake).
+    ground *= u_exaggeration;
+    highp float base = f.x + (u_exaggeration - 1.0) * f.z;
     // A vertex at the base follows the ground down where it drops below the base's height.
     bool foot = !rigid && rel <= ${BASE_EPSILON_M.toFixed(2)};
-    highp float y = foot ? min(f.x, ground) + rel : rel + f.x;
+    highp float y = foot ? min(base, ground) + rel : rel + base;
     return vec2(y, foot || rel < u_ao_reach ? y - ground : rel);
   }
 `;
@@ -257,13 +268,14 @@ const SKIRT_VERTEX = /* glsl */ `
   attribute vec2 coord; // in skirt radii: beyond a free end of the strip, out from the wall foot
   attribute float column; // the vertex's ground column, as in HEIGHT_VERTEX
   uniform highp sampler2D u_ground;
+  uniform float u_exaggeration;
   uniform float u_flat;
   varying vec2 v_coord;
   void main() {
     v_coord = coord;
     int k = int(column + 0.5);
     // On the ground, lifted a little against z-fighting.
-    float ground = u_flat > 0.5 ? 0.0 : texelFetch(u_ground, ivec2(k & ${AO_TEXTURE_WIDTH - 1}, k >> ${AO_TEXTURE_SHIFT}), 0).r;
+    float ground = u_flat > 0.5 ? 0.0 : texelFetch(u_ground, ivec2(k & ${AO_TEXTURE_WIDTH - 1}, k >> ${AO_TEXTURE_SHIFT}), 0).r * u_exaggeration;
     gl_Position = projectionMatrix * modelViewMatrix * vec4(position.x, ground + ${SKIRT_LIFT_M.toFixed(2)}, position.z, 1.0);
   }
 `;
@@ -399,9 +411,12 @@ function emptyAoTextures(): AoTextures {
 
 /** Where a tile's vertices stand: the tables its vertex shader reads (see HEIGHT_VERTEX), written by Fill3DManager.bake. */
 interface Heights {
-  /** Per ground column: the terrain height; on the flat map the ground under rigid models, 0 elsewhere. */
+  /** Per ground column: the terrain height (exaggeration 1); on the flat map the ground under rigid models, 0 elsewhere. */
   ground: THREE.DataTexture;
-  /** Per feature: the height its base goes to, and 1 for a rigid model. */
+  /**
+   * Per feature, four floats: the height its base goes to at exaggeration 1, 1 for a rigid model,
+   * the terrain height (exaggeration 1) the base moves with when the exaggeration changes, unused.
+   */
   features: THREE.DataTexture;
   /** Written for a map without terrain. */
   flat: boolean;
@@ -414,10 +429,10 @@ function texels(n: number): number {
   return Math.max(1, Math.ceil(n / AO_TEXTURE_WIDTH)) * AO_TEXTURE_WIDTH;
 }
 
-/** A table of floats (1 or 2 per entry) as a texture of AO_TEXTURE_WIDTH-texel rows, read with texelFetch. */
-function heightTexture(data: Float32Array, channels: 1 | 2): THREE.DataTexture {
-  const tex = new THREE.DataTexture(data, AO_TEXTURE_WIDTH, data.length / channels / AO_TEXTURE_WIDTH, channels === 1 ? THREE.RedFormat : THREE.RGFormat, THREE.FloatType);
-  tex.internalFormat = channels === 1 ? 'R32F' : 'RG32F';
+/** A table of floats (1 or 4 per entry) as a texture of AO_TEXTURE_WIDTH-texel rows, read with texelFetch. */
+function heightTexture(data: Float32Array, channels: 1 | 4): THREE.DataTexture {
+  const tex = new THREE.DataTexture(data, AO_TEXTURE_WIDTH, data.length / channels / AO_TEXTURE_WIDTH, channels === 1 ? THREE.RedFormat : THREE.RGBAFormat, THREE.FloatType);
+  tex.internalFormat = channels === 1 ? 'R32F' : 'RGBA32F';
   tex.minFilter = THREE.NearestFilter;
   tex.magFilter = THREE.NearestFilter;
   tex.generateMipmaps = false;
@@ -427,12 +442,18 @@ function heightTexture(data: Float32Array, channels: 1 | 2): THREE.DataTexture {
 
 /** What the height samplers are bound to while no tile is: one row of zeros each. */
 function emptyHeights(): Heights {
-  return { ground: heightTexture(new Float32Array(texels(1)), 1), features: heightTexture(new Float32Array(texels(1) * 2), 2), flat: true, columns: 0 };
+  return { ground: heightTexture(new Float32Array(texels(1)), 1), features: heightTexture(new Float32Array(texels(1) * 4), 4), flat: true, columns: 0 };
 }
 
-/** The uniforms of HEIGHT_VERTEX; the tables and `u_flat` are swapped per tile (bindTile). */
+/** The uniforms of HEIGHT_VERTEX; the tables and `u_flat` are swapped per tile (bindTile), `u_exaggeration` set per frame (syncExaggeration). */
 function heightUniforms(none: Heights, aoReach: number) {
-  return { u_ground: { value: none.ground }, u_features: { value: none.features }, u_flat: { value: 1 }, u_ao_reach: { value: aoReach } };
+  return {
+    u_ground: { value: none.ground },
+    u_features: { value: none.features },
+    u_exaggeration: { value: 1 },
+    u_flat: { value: 1 },
+    u_ao_reach: { value: aoReach },
+  };
 }
 
 function createFill3DMaterial(transparent: boolean, ao: AoTextures, heights: ReturnType<typeof heightUniforms>): THREE.ShaderMaterial {
@@ -481,6 +502,7 @@ function createSkirtMaterial(none: Heights): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     uniforms: {
       u_ground: { value: none.ground }, // per tile, like u_flat and u_ao_tile (see bindSkirt)
+      u_exaggeration: { value: 1 }, // per frame (see syncExaggeration)
       u_flat: { value: 1 },
       u_ao_intensity: { value: 0 },
       u_ao_tile: { value: 0 }, // per tile, see bindSkirt
@@ -603,6 +625,32 @@ interface TileEntry {
   properties?: Record<string, unknown>[];
   /** The wall feet per group of touching buildings (see anchorFits). */
   anchors?: TerrainAnchors;
+  /** What its bounding spheres are placed from, for any exaggeration (see placeBounds). */
+  rise?: Rise;
+}
+
+/**
+ * How far a tile's vertices go up from the heights the tile gives them, in
+ * terms of the terrain's exaggeration `e` (see bake, placeBounds). A base goes
+ * to `to + (e − 1) · follows` (see HEIGHT_VERTEX): over the features the lowest
+ * of those is concave in `e` and the highest convex, so between 0 and 1 they
+ * stay on the safe side of the line between their values at 0 and at 1, and
+ * beyond 1 of the line from 1 with the steepest and flattest `follows`.
+ */
+interface Rise {
+  /** Over the features: the lowest and highest height a base goes to at exaggeration 0 and 1. */
+  low0: number;
+  high0: number;
+  low1: number;
+  high1: number;
+  /** Over the features: the lowest and highest terrain height (exaggeration 1) a base moves with. */
+  followsLow: number;
+  followsHigh: number;
+  /** The lowest and highest terrain height (exaggeration 1) under the tile's ground columns. */
+  groundLow: number;
+  groundHigh: number;
+  /** The exaggeration the spheres were placed for. */
+  at: number;
 }
 
 /**
@@ -621,7 +669,9 @@ interface TileEntry {
  * per ground column and where each feature's base goes: per group of touching
  * buildings fitted to their wall feet, else to the terrain at the feature's
  * centre. The tables are written anew when new DEM tiles under a tile change
- * its ground, or the map's terrain is switched. Without terrain the meshes sit
+ * its ground, or the map's terrain is switched on, off or to another source;
+ * they hold the terrain without its exaggeration, which the vertex shader
+ * applies per frame, so a new exaggeration alone writes nothing. Without terrain the meshes sit
  * on the flat map, nothing below it: the source sinks ground walls 10 m for
  * slopes (see bake).
  *
@@ -644,6 +694,8 @@ export class Fill3DManager implements TileConsumer {
   /** The layer's `terrainSourceId`; without one the map's terrain is followed (see onTerrain). */
   private readonly terrainSourceOption?: string;
   private terrainSourceId: string;
+  /** The map's terrain source the tiles were baked for ('' without terrain), to tell a switch from a new exaggeration (see onTerrain). */
+  private terrainKey: string;
   private hub?: TileHub;
   private consumerId = 0;
   /** The view's tiles are being loaded: the source and the zoom levels of its layers are known. */
@@ -726,6 +778,7 @@ export class Fill3DManager implements TileConsumer {
     this.scene = scene;
     this.terrainSourceOption = terrainSourceOption;
     this.terrainSourceId = terrainSourceOption ?? map.getTerrain()?.source ?? '';
+    this.terrainKey = terrainKeyOf(map);
     this.config = config;
     this.cacheBytes = config.cacheBytes;
     this.origin = toOrigin(sceneOrigin);
@@ -782,11 +835,20 @@ export class Fill3DManager implements TileConsumer {
       this.maybeRebase();
       this.update();
     };
-    // Terrain switched on, off or re-set: the heights are stale, and without
-    // terrain the sunk wall bases must come up to the map (see bake). It may be
-    // another source now, or the first terrain since the layer was added: its
-    // DEM tiles are the ones to follow from here on (see onData).
+    // Terrain switched on, off or to another source: the heights are stale, and
+    // without terrain the sunk wall bases must come up to the map (see bake). It
+    // may be the first terrain since the layer was added: its DEM tiles are the
+    // ones to follow from here on (see onData). The same source set again — with
+    // another exaggeration, or the same — leaves the tables as they are: they
+    // hold the terrain without its exaggeration, the vertex shader applies it
+    // per frame (see syncExaggeration). MapLibre does not reload the DEM tiles then.
     this.onTerrain = () => {
+      const key = terrainKeyOf(map);
+      if (key && key === this.terrainKey) {
+        map.triggerRepaint();
+        return;
+      }
+      this.terrainKey = key;
       this.terrainSourceId = this.terrainSourceOption ?? map.getTerrain()?.source ?? '';
       this.terrainEpoch++;
       this.rebakeAll();
@@ -1443,6 +1505,21 @@ export class Fill3DManager implements TileConsumer {
   }
 
   /**
+   * The terrain's exaggeration for this frame (call each frame, before drawing):
+   * the vertex shaders scale the heights by it, and the bounding spheres of the
+   * tiles in view follow it, so a frame's culling sees where the vertices are.
+   */
+  syncExaggeration() {
+    const e = exaggerationOf(this.map);
+    this.material.uniforms.u_exaggeration.value = e;
+    this.depthMaterial.uniforms.u_exaggeration.value = e;
+    this.skirtMaterial.uniforms.u_exaggeration.value = e;
+    for (const entry of this.tiles.values()) {
+      if (entry.rise && entry.rise.at !== e) this.placeBounds(entry, e);
+    }
+  }
+
+  /**
    * Sync the shader light with the map's style light + bearing (call each frame).
    * Mirrors MapLibre's fill-extrusion: `sphericalToCartesian(light.position)` in
    * (east, south, up); for anchor 'viewport' rotate the horizontal part by the
@@ -1523,6 +1600,15 @@ export class Fill3DManager implements TileConsumer {
    * the terrain height at that anchor as one body, like a GltfLayer model: its
    * feet reach below the ground on purpose, nothing follows the ground down.
    *
+   * All of it for the terrain at exaggeration 1; the vertex shader applies the
+   * exaggeration of the frame. The ground scales with it. A base at a centre or
+   * an anchor scales with the terrain there, exactly. A group's fit is a median
+   * over its wall feet, which another exaggeration can hand to another foot: the
+   * base moves with the ground under the foot that decides it at 1 — exact at 1,
+   * off by a fraction of the ground's rise across the group in between. So an
+   * animated exaggeration needs no bake, and a still one other than 1 stands as
+   * close to the median as that.
+   *
    * The source itself sinks the walls standing on a building's base 10 m below
    * it as a reserve for slopes (buildings3d `MTK_BUILDINGS3D_GROUND_DEPTH`): the
    * only vertices below the base. The terrain surface covers that reserve. The
@@ -1548,7 +1634,7 @@ export class Fill3DManager implements TileConsumer {
     // The tables; the ground's grows with the columns.
     let h = entry.heights;
     const keep = how !== 'fresh' && !flat && h !== undefined && !h.flat;
-    const columnsOnly = keep && how === 'columns';
+    const columnsOnly = keep && how === 'columns' && entry.rise !== undefined;
     const known = keep ? Math.min(h!.columns, columns) : 0;
     if (!h || (h.ground.image.data as Float32Array).length < columns) {
       const grown = new Float32Array(texels(columns));
@@ -1558,7 +1644,7 @@ export class Fill3DManager implements TileConsumer {
       }
       h = entry.heights = {
         ground: heightTexture(grown, 1),
-        features: h?.features ?? heightTexture(new Float32Array(texels(count) * 2), 2),
+        features: h?.features ?? heightTexture(new Float32Array(texels(count) * 4), 4),
         flat,
         columns,
       };
@@ -1568,18 +1654,20 @@ export class Fill3DManager implements TileConsumer {
     const ground = h.ground.image.data as Float32Array;
     const features = h.features.image.data as Float32Array;
 
-    // How far the vertices go up from the heights they came with (for the bounds), and the ground's range.
-    let low = 0;
-    let high = 0;
-    let groundLow = 0;
-    let groundHigh = 0;
+    // How far the vertices go up from the heights they came with (for the bounds), and the ground's range;
+    // with only new columns the features' part stays as it was.
+    const rise: Rise = columnsOnly
+      ? entry.rise!
+      : { low0: 0, high0: 0, low1: 0, high1: 0, followsLow: 0, followsHigh: 0, groundLow: 0, groundHigh: 0, at: NaN };
+    rise.groundLow = rise.groundHigh = 0;
     const needed = entry.needed;
     if (flat) {
       ground.fill(0);
       if (entry.rigidGround) ground.set(entry.rigidGround);
       for (let i = 0; i < count; i++) {
-        features[i * 2] = 0;
-        features[i * 2 + 1] = table.rigid[i];
+        features[i * 4] = 0;
+        features[i * 4 + 1] = table.rigid[i];
+        features[i * 4 + 2] = 0;
       }
     } else {
       // The terrain under a vertex, sampled once per ground column: a wall's top
@@ -1596,39 +1684,76 @@ export class Fill3DManager implements TileConsumer {
       let centres = entry.centreCache;
       if (!keep || !centres) centres = entry.centreCache = new Float32Array(count).fill(NaN);
       const elevationAt = createElevationSampler(this.map);
-      const fits = entry.anchors && !columnsOnly ? anchorFits(entry.anchors, ground) : undefined;
-      low = groundLow = Infinity;
-      high = groundHigh = -Infinity;
-      for (let i = 0; i < count && !columnsOnly; i++) {
-        const fit = fits && !table.rigid[i] && table.anchor[i] >= 0 ? fits[table.anchor[i]] : NaN;
-        if (fit === fit) {
-          features[i * 2] = table.base[i] + fit;
-        } else {
-          // The terrain at the feature's centre (its anchor, for a rigid model).
-          if (centres[i] !== centres[i]) centres[i] = elevationAt(table.lng[i], table.lat[i]);
-          features[i * 2] = centres[i];
+      if (!columnsOnly) {
+        const fits = entry.anchors ? anchorFits(entry.anchors, ground) : undefined;
+        let low0 = Infinity;
+        let high0 = -Infinity;
+        let low1 = Infinity;
+        let high1 = -Infinity;
+        let followsLow = Infinity;
+        let followsHigh = -Infinity;
+        for (let i = 0; i < count; i++) {
+          const a = fits && !table.rigid[i] && table.anchor[i] >= 0 ? table.anchor[i] * 2 : -1;
+          const fit = a >= 0 ? fits![a] : NaN;
+          if (fit === fit) {
+            // The group's fit, and the ground under the foot that decides it.
+            features[i * 4] = table.base[i] + fit;
+            features[i * 4 + 2] = fits![a + 1];
+          } else {
+            // The terrain at the feature's centre (its anchor, for a rigid model).
+            if (centres[i] !== centres[i]) centres[i] = elevationAt(table.lng[i], table.lat[i]);
+            features[i * 4] = features[i * 4 + 2] = centres[i];
+          }
+          features[i * 4 + 1] = table.rigid[i];
+          const to = features[i * 4];
+          const follows = features[i * 4 + 2];
+          const to0 = to - follows;
+          if (to < low1) low1 = to;
+          if (to > high1) high1 = to;
+          if (to0 < low0) low0 = to0;
+          if (to0 > high0) high0 = to0;
+          if (follows < followsLow) followsLow = follows;
+          if (follows > followsHigh) followsHigh = follows;
         }
-        features[i * 2 + 1] = table.rigid[i];
-        const to = features[i * 2];
-        if (to < low) low = to;
-        if (to > high) high = to;
+        if (low1 <= high1) Object.assign(rise, { low0, high0, low1, high1, followsLow, followsHigh });
       }
+      let groundLow = Infinity;
+      let groundHigh = -Infinity;
       for (let c = 0; c < columns; c++) {
         if (needed && c < needed.length && !needed[c]) continue;
         const g = ground[c];
         if (g < groundLow) groundLow = g;
         if (g > groundHigh) groundHigh = g;
       }
-      if (!(low <= high)) low = high = 0;
-      if (!(groundLow <= groundHigh)) groundLow = groundHigh = 0;
+      if (groundLow <= groundHigh) Object.assign(rise, { groundLow, groundHigh });
     }
     h.ground.needsUpdate = true;
     if (!columnsOnly) h.features.needsUpdate = true;
+    entry.rise = rise;
+    this.placeBounds(entry, exaggerationOf(this.map));
+  }
 
-    // The bounds: the tile's own, raised by where its vertices go (a foot may follow the ground below its base's height).
-    if (!columnsOnly) geometry.boundingSphere = lifted(sphere, Math.min(low, groundLow), high);
+  /**
+   * The bounds of a tile at the exaggeration `e`: its own, raised by where its
+   * vertices go (a foot may follow the ground below its base's height); see Rise.
+   * At 1 they are those of the base heights as written.
+   */
+  private placeBounds(entry: TileEntry, e: number) {
+    const { geometry, sphere, rise: r } = entry;
+    if (!geometry || !sphere || !r) return;
+    r.at = e;
+    const low = e <= 1 ? (1 - e) * r.low0 + e * r.low1 : r.low1 + (e - 1) * r.followsLow;
+    const high = e <= 1 ? (1 - e) * r.high0 + e * r.high1 : r.high1 + (e - 1) * r.followsHigh;
+    const groundLow = e * r.groundLow;
+    const groundHigh = e * r.groundHigh;
+    geometry.boundingSphere = lifted(sphere, Math.min(low, groundLow), high, geometry.boundingSphere);
     if (entry.skirtGeometry && entry.skirtSphere) {
-      entry.skirtGeometry.boundingSphere = lifted(entry.skirtSphere, groundLow + SKIRT_LIFT_M, groundHigh + SKIRT_LIFT_M);
+      entry.skirtGeometry.boundingSphere = lifted(
+        entry.skirtSphere,
+        groundLow + SKIRT_LIFT_M,
+        groundHigh + SKIRT_LIFT_M,
+        entry.skirtGeometry.boundingSphere,
+      );
     }
   }
 
@@ -1781,10 +1906,14 @@ export class Fill3DManager implements TileConsumer {
  * stands for. The source's heights fit the terrain up to this offset (the
  * height datum) and what the terrain model misses of the ground's shape; the
  * median ignores feet where it misses most.
+ *
+ * Two floats per group: the fit (NaN for a group without feet on the ground)
+ * and the terrain height at the foot that decides it — the base moves with that
+ * ground when the exaggeration changes (see HEIGHT_VERTEX).
  */
 function anchorFits(anchors: TerrainAnchors, ground: Float32Array): Float32Array {
   const groups = anchors.start.length - 1;
-  const fits = new Float32Array(groups);
+  const fits = new Float32Array(groups * 2);
   const diff = new Float32Array(anchors.column.length);
   for (let i = 0; i < diff.length; i++) diff[i] = ground[anchors.column[i]] - anchors.height[i];
   const bits = new Uint32Array(diff.buffer);
@@ -1844,16 +1973,19 @@ function anchorFits(anchors: TerrainAnchors, ground: Float32Array): Float32Array
       }
     }
     let fit = NaN; // a group without feet: its buildings go to their centres
+    let at = NaN;
     let sum = 0;
     for (let k = 0; k < n; k++) {
       const i = order[k];
       sum += anchors.weight[i];
       if (sum >= total / 2) {
         fit = diff[i];
+        at = ground[anchors.column[i]];
         break;
       }
     }
-    fits[g] = fit;
+    fits[g * 2] = fit;
+    fits[g * 2 + 1] = at;
   }
   return fits;
 }
@@ -1871,8 +2003,11 @@ const FIT_INSERTION_MAX = 32;
  * A bounding sphere the worker computed (x, y, z, radius) for the heights as a
  * tile gives them, around vertices that stand between `low` and `high` metres higher.
  */
-function lifted(s: Float32Array, low: number, high: number): THREE.Sphere {
-  return new THREE.Sphere(new THREE.Vector3(s[0], s[1] + (low + high) / 2, s[2]), s[3] + (high - low) / 2);
+function lifted(s: Float32Array, low: number, high: number, into?: THREE.Sphere | null): THREE.Sphere {
+  const sphere = into ?? new THREE.Sphere();
+  sphere.center.set(s[0], s[1] + (low + high) / 2, s[2]);
+  sphere.radius = s[3] + (high - low) / 2;
+  return sphere;
 }
 
 const NO_PROPERTIES: Record<string, unknown>[] = new Proxy([], { get: () => EMPTY_PROPERTIES }) as never;

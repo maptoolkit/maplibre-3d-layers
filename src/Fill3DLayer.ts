@@ -242,6 +242,7 @@ export class Fill3DLayer implements CustomLayerInterface {
     if (this.manager!.syncOpacity() <= 0) return;
     this.manager!.syncLight(); // match fill-extrusion shading (light follows bearing)
     this.manager!.syncAo();
+    this.manager!.syncExaggeration(); // the terrain's, this frame: before culling and drawing
     this.camera.projectionMatrix.multiplyMatrices(this.mainMat, this.originMat);
     this.renderer.resetState();
     // A transparent layer: depth pre-pass, then the colour pass — only the
