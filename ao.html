@@ -39,8 +39,9 @@
     Intensity is live (a global-state expression); radius, skirt, the extrusion
     and the opacity switch re-create the layer.
     Opacity: the buildings' zoom/pitch fade of the style's 3D scene (metadata
-    `maptoolkit:scene3d`: `fill3d` for the meshes, `lod1` for the native
-    extrusions) — a transparent layer, which draws with a depth pre-pass; off,
+    `maptoolkit:scene3d`: `building_3d` for the meshes, `building_extruded` for
+    the native extrusions; `fill3d` / `lod1` before style-family-js 2.7.0) — a
+    transparent layer, which draws with a depth pre-pass; off,
     the layer is opaque and draws in one pass.
   -->
   <script type="module">
@@ -64,17 +65,20 @@
     const WALL = '#f2efe9';
     const ROOF = '#cdc5b9';
 
-    /** A building opacity of the style's 3D scene (`fill3d` / `lod1`), if the switch is on and the style has one. */
+    /** A building opacity of the style's 3D scene (`building_3d` / `building_extruded`; `fill3d` / `lod1` before
+     *  style-family-js 2.7.0), if the switch is on and the style has one. */
     function styleOpacity(part, property) {
       if (!$('opacity').checked) return undefined;
-      return map.getStyle().metadata?.['maptoolkit:scene3d']?.[part]?.paint?.[property];
+      const scene = map.getStyle().metadata?.['maptoolkit:scene3d'];
+      const before = { building_extruded: 'lod1', building_3d: 'fill3d' }[part];
+      return (scene?.[part] ?? scene?.[before])?.paint?.[property];
     }
 
     function addFill3D() {
       if (map.getLayer('fill-3d')) map.removeLayer('fill-3d');
       const ext = $('ext').checked;
       map.setLayoutProperty('buildings-lod1', 'visibility', ext ? 'none' : 'visible');
-      map.setPaintProperty('buildings-lod1', 'fill-extrusion-opacity', styleOpacity('lod1', 'fill-extrusion-opacity') ?? 1);
+      map.setPaintProperty('buildings-lod1', 'fill-extrusion-opacity', styleOpacity('building_extruded', 'fill-extrusion-opacity') ?? 1);
       const paint = {
         'fill-3d-color': ['match', ['get', 'type'], 'roof', ROOF, WALL],
         'fill-3d-ambient-occlusion-intensity': ['global-state', 'aoIntensity'],
@@ -82,7 +86,7 @@
         'fill-3d-ambient-occlusion-ground-radius': +$('ground').value,
       };
       // Only when set: the property alone makes the layer transparent.
-      const opacity = styleOpacity('fill3d', 'fill-3d-opacity');
+      const opacity = styleOpacity('building_3d', 'fill-3d-opacity');
       if (opacity !== undefined) paint['fill-3d-opacity'] = opacity;
       const layer = new Fill3DLayer({
         id: 'fill-3d',
@@ -112,7 +116,7 @@
 
     map.on('load', () => {
       // Replace the style's own OSM 3D buildings — else they z-fight our meshes.
-      for (const id of ['building_3d', 'building_3d_multicolored']) {
+      for (const id of ['building_extruded', 'building_extruded_multicolored', 'building_3d', 'building_3d_multicolored']) {
         if (map.getLayer(id)) map.removeLayer(id);
       }
       map.addSource('mtk-terrain', {
