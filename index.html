@@ -37,7 +37,7 @@
 
     map.on('load', () => {
       // Replace the style's own OSM 3D buildings — else they z-fight our meshes.
-      for (const id of ['building_3d', 'building_3d_multicolored']) {
+      for (const id of ['building_extruded', 'building_extruded_multicolored', 'building_3d', 'building_3d_multicolored']) {
         if (map.getLayer(id)) map.removeLayer(id);
       }
 
